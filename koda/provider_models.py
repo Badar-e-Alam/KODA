@@ -1,0 +1,272 @@
+"""Generic LLM provider model discovery with daily caching.
+
+Each provider is defined as a ``ProviderSpec`` — a small struct that says
+*where* to fetch models, *how* to parse the response, and *what* fallback
+list to use when the server is unreachable.
+
+Adding a new provider is one dict entry — no new modules, no subclasses.
+
+Cache lives in ``~/.koda/models/<provider>.json`` with a configurable TTL
+(default 24 h).  On startup KODA reads from cache (instant) and refreshes
+stale entries in a background thread.
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+import os
+import time
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any, Callable
+from urllib.error import URLError
+from urllib.request import Request, urlopen
+
+_log = logging.getLogger("koda.providers")
+
+_CACHE_DIR = Path.home() / ".koda" / "models"
+_DEFAULT_TTL = 86400  # 24 hours
+
+
+# ── Provider spec ─────────────────────────────────────────────────────
+
+@dataclass(frozen=True)
+class ProviderSpec:
+    """Everything KODA needs to discover models from one provider."""
+
+    name: str
+    """Provider key used in ``provider:model`` strings (e.g. ``"ollama"``)."""
+
+    default_url: str
+    """Base URL when no env override is set."""
+
+    endpoint: str
+    """Path appended to base URL (e.g. ``"/api/tags"``, ``"/models"``)."""
+
+    parse: Callable[[dict[str, Any]], list[str]]
+    """Extract a sorted model-name list from the JSON response body."""
+
+    env_urls: tuple[str, ...] = ()
+    """Env vars checked (in order) to override *default_url*."""
+
+    auth_env: str | None = None
+    """Env var holding a Bearer token / API key.  ``None`` = no auth."""
+
+    fallback: tuple[str, ...] = ()
+    """Models shown when the server is unreachable and no cache exists."""
+
+    needs_key: bool = False
+    """If ``True`` and *auth_env* is unset, skip this provider entirely."""
+
+    ttl: int = _DEFAULT_TTL
+    """Cache time-to-live in seconds."""
+
+
+# ── Response parsers (reusable across many providers) ─────────────────
+
+def _parse_ollama(data: dict[str, Any]) -> list[str]:
+    """``GET /api/tags`` → ``{models: [{name: "llama3.1:latest"}]}``."""
+    seen: set[str] = set()
+    out: list[str] = []
+    for entry in data.get("models", []):
+        name = entry.get("name", "").removesuffix(":latest")
+        if name and name not in seen:
+            seen.add(name)
+            out.append(name)
+    out.sort()
+    return out
+
+
+def _parse_openai_compat(data: dict[str, Any]) -> list[str]:
+    """``GET /v1/models`` → ``{data: [{id: "gpt-4o"}]}``."""
+    seen: set[str] = set()
+    out: list[str] = []
+    for entry in data.get("data", []):
+        name = entry.get("id", "")
+        if name and name not in seen:
+            seen.add(name)
+            out.append(name)
+    out.sort()
+    return out
+
+
+# ── Built-in provider specs ──────────────────────────────────────────
+#
+# To add a provider: insert one entry here.  That's it.
+
+PROVIDERS: dict[str, ProviderSpec] = {
+    "ollama": ProviderSpec(
+        name="ollama",
+        env_urls=("OLLAMA_HOST", "OLLAMA_BASE_URL"),
+        default_url="http://localhost:11434",
+        endpoint="/api/tags",
+        auth_env="OLLAMA_API_KEY",
+        parse=_parse_ollama,
+        fallback=(
+            "codellama", "deepseek-coder-v2", "gemma2",
+            "llama3.1", "llama3.2", "mistral", "phi3", "qwen2.5-coder",
+        ),
+        needs_key=False,
+    ),
+    "lmstudio": ProviderSpec(
+        name="lmstudio",
+        env_urls=("LMSTUDIO_BASE_URL",),
+        default_url="http://localhost:1234/v1",
+        endpoint="/models",
+        parse=_parse_openai_compat,
+        needs_key=False,
+    ),
+    "openrouter": ProviderSpec(
+        name="openrouter",
+        env_urls=("OPENROUTER_BASE_URL",),
+        default_url="https://openrouter.ai/api",
+        endpoint="/v1/models",
+        auth_env="OPENROUTER_API_KEY",
+        parse=_parse_openai_compat,
+        needs_key=True,
+    ),
+}
+
+
+# ── Generic fetch / cache / inject ───────────────────────────────────
+
+def _resolve_url(spec: ProviderSpec) -> str:
+    for var in spec.env_urls:
+        val = os.environ.get(var)
+        if val:
+            return val.rstrip("/")
+    return spec.default_url.rstrip("/")
+
+
+def _cache_path(provider: str) -> Path:
+    return _CACHE_DIR / f"{provider}.json"
+
+
+def _read_cache(provider: str, ttl: int) -> list[str] | None:
+    try:
+        data = json.loads(_cache_path(provider).read_text(encoding="utf-8"))
+        if time.time() - data.get("ts", 0) < ttl:
+            return data["models"]
+    except (FileNotFoundError, json.JSONDecodeError, KeyError, OSError):
+        pass
+    return None
+
+
+def _write_cache(provider: str, models: list[str]) -> None:
+    try:
+        _CACHE_DIR.mkdir(parents=True, exist_ok=True)
+        _cache_path(provider).write_text(
+            json.dumps({"models": models, "ts": time.time()}),
+            encoding="utf-8",
+        )
+    except OSError as exc:
+        _log.debug("Could not write %s cache: %s", provider, exc)
+
+
+def _fetch(spec: ProviderSpec) -> list[str] | None:
+    """Hit the provider's model-list endpoint.  Returns None on failure."""
+    url = f"{_resolve_url(spec)}{spec.endpoint}"
+    headers: dict[str, str] = {"Accept": "application/json"}
+
+    if spec.auth_env:
+        key = os.environ.get(spec.auth_env)
+        if key:
+            headers["Authorization"] = f"Bearer {key}"
+        elif spec.needs_key:
+            return None  # Can't call without credentials
+
+    try:
+        req = Request(url, headers=headers, method="GET")
+        with urlopen(req, timeout=3) as resp:  # noqa: S310
+            data = json.loads(resp.read())
+        return spec.parse(data)
+    except (URLError, OSError, json.JSONDecodeError, ValueError) as exc:
+        _log.debug("%s fetch failed (%s): %s", spec.name, url, exc)
+        return None
+
+
+def get_models(provider: str) -> list[str]:
+    """Models for *provider*: cache → live fetch → fallback list."""
+    spec = PROVIDERS.get(provider)
+    if spec is None:
+        return []
+
+    cached = _read_cache(provider, spec.ttl)
+    if cached is not None:
+        return cached
+
+    live = _fetch(spec)
+    if live is not None:
+        _write_cache(provider, live)
+        return live
+
+    if spec.fallback:
+        _log.debug("Using fallback model list for %s", provider)
+    return list(spec.fallback)
+
+
+def refresh_stale() -> None:
+    """Re-fetch every provider whose cache has expired.
+
+    Meant for a background thread — never blocks the UI.
+    """
+    for name, spec in PROVIDERS.items():
+        if _read_cache(name, spec.ttl) is not None:
+            continue
+        if spec.needs_key and spec.auth_env and not os.environ.get(spec.auth_env):
+            continue
+        live = _fetch(spec)
+        if live is not None:
+            _write_cache(name, live)
+            _log.info("Refreshed %s model cache: %d models", name, len(live))
+
+
+def _eligible_providers() -> list[str]:
+    """Providers we can actually serve models for right now."""
+    out: list[str] = []
+    for name, spec in PROVIDERS.items():
+        if spec.needs_key and spec.auth_env and not os.environ.get(spec.auth_env):
+            continue
+        out.append(name)
+    return out
+
+
+def inject_into_registry() -> None:
+    """Patch ``deepagents_cli.model_config`` so ``/model`` shows our providers.
+
+    Wraps ``get_available_models`` and ``has_provider_credentials`` once.
+    Safe to call multiple times (idempotent).
+    """
+    import deepagents_cli.model_config as mc
+
+    if getattr(mc.get_available_models, "_koda_providers", False):
+        return
+
+    _orig_get_models = mc.get_available_models
+    _orig_has_creds = mc.has_provider_credentials
+    providers = _eligible_providers()
+
+    def _get_available_models() -> dict[str, list[str]]:
+        result = _orig_get_models()
+        for name in providers:
+            if name not in result:
+                models = get_models(name)
+                if models:
+                    result[name] = models
+        return result
+
+    _get_available_models._koda_providers = True  # type: ignore[attr-defined]
+
+    no_key_providers = frozenset(
+        name for name, spec in PROVIDERS.items() if not spec.needs_key
+    )
+
+    def _has_provider_credentials(provider: str) -> bool | None:
+        if provider in no_key_providers:
+            return True  # Local servers need no API key
+        return _orig_has_creds(provider)
+
+    mc.get_available_models = _get_available_models  # type: ignore[assignment]
+    mc.has_provider_credentials = _has_provider_credentials  # type: ignore[assignment]
+    _log.debug("Injected providers into /model: %s", providers)

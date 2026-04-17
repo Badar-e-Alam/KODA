@@ -1,0 +1,5 @@
+| Date       | Event Description                                                   | Impact on Bitcoin Price |
+|------------|-------------------------------------------------------------------|------------------------|
+| Apr 17, 2026 | Strait of Hormuz reopens; Oil prices drop | Bitcoin price increased to $77K |
+| Apr 16, 2026 | Charles Schwab launches spot Bitcoin trading | Increased demand, price stability around $76K |
+| Recent       | General crypto market sentiment positive                       | Gradual price increase |

@@ -1,0 +1,31 @@
+[project]
+name = "koda"
+version = "0.3.0"
+description = "KODA — AI agent TUI powered by deepagents-cli"
+requires-python = ">=3.11"
+
+dependencies = [
+    "deepagents-cli>=0.0.37",
+    "python-dotenv>=1.0.0",
+    "langchain-core>=0.3",
+]
+
+[project.optional-dependencies]
+# Summarizer model backends (install the ones you use)
+anthropic = ["langchain-anthropic"]
+openai = ["langchain-openai"]
+ollama = ["langchain-ollama"]
+google = ["langchain-google-genai"]
+all = [
+    "langchain-anthropic",
+    "langchain-openai",
+    "langchain-ollama",
+    "langchain-google-genai",
+]
+
+[project.scripts]
+koda = "koda.__main__:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"

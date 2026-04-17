@@ -1,0 +1,15 @@
+# Core TUI
+textual>=1.0.0
+
+# HTTP agent bridge
+httpx>=0.27.0
+
+# Deep Agent backend
+deepagents>=0.1.0
+python-dotenv>=1.0.0
+
+# Model providers — install the ones you use:
+# pip install langchain-anthropic    # for anthropic:claude-*
+# pip install langchain-openai       # for openai:gpt-*
+# pip install langchain-ollama       # for ollama:*
+# pip install langchain-google-genai # for google:gemini-*
