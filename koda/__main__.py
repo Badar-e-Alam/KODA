@@ -55,8 +55,8 @@ def _load_agent(spec: str, model: str):
       "module.path.ClassName"   -> custom Python class (must return a graph)
     """
     if spec == "deep":
-        from koda.agents.deep import create_koda_agent
-        return create_koda_agent(model=model)
+        from koda.adapters.deep import build_deep_graph
+        return build_deep_graph(model=model)
 
     # Custom Python class
     if "." in spec:
@@ -108,11 +108,11 @@ def _setup_logging() -> str:
     # KODA's own logs: everything. Libraries: only warnings+errors.
     logging.getLogger("koda").setLevel(logging.DEBUG)
     logging.getLogger("deepagents_cli").setLevel(logging.WARNING)
-    logging.getLogger("deepagents").setLevel(logging.WARNING)
     logging.getLogger("deepagents_cli.model_config").setLevel(logging.ERROR)
     logging.getLogger("aiosqlite").setLevel(logging.WARNING)
+    logging.getLogger("langgraph").setLevel(logging.WARNING)
+    logging.getLogger("langchain").setLevel(logging.WARNING)
     # Silence benign warnings that repeat every session
-    logging.getLogger("deepagents.middleware.skills").setLevel(logging.ERROR)
     logging.getLogger("deepagents_cli.widgets.chat_input").setLevel(logging.ERROR)
     logging.getLogger("deepagents_cli.widgets.message_store").setLevel(logging.ERROR)
     logging.getLogger("koda").info("=== KODA session started === log: %s", log_path)

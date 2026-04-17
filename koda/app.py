@@ -416,9 +416,9 @@ class KodaApp(DeepAgentsApp):
                 return
 
         try:
-            from koda.agents.deep import create_koda_agent
+            from koda.adapters.deep import build_deep_graph
 
-            new_agent = create_koda_agent(model=display)
+            new_agent = build_deep_graph(model=display)
             self._agent = new_agent
             _log.info("Model switched to %s — agent recreated", display)
             await self._mount_message(AppMessage(f"Switched to {display}"))

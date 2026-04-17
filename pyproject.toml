@@ -1,13 +1,17 @@
 [project]
 name = "koda"
-version = "0.3.0"
-description = "KODA — AI agent TUI powered by deepagents-cli"
+version = "0.3.1"
+description = "KODA — agent-agnostic AI coding TUI"
 requires-python = ">=3.11"
 
 dependencies = [
+    # Phase 1: TUI still runs on deepagents-cli; Phase 2 will drop it.
     "deepagents-cli>=0.0.37",
     "python-dotenv>=1.0.0",
+    "langchain>=0.3",
     "langchain-core>=0.3",
+    "langgraph>=0.3",
+    "httpx>=0.27",
 ]
 
 [project.optional-dependencies]
