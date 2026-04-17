@@ -53,6 +53,7 @@ class KodaApp(App):
 
     BINDINGS: ClassVar[list[BindingType]] = [
         Binding("ctrl+c", "copy_or_interrupt", "Copy/Interrupt", show=False, priority=True),
+        Binding("ctrl+d", "quit_app", "Quit", show=False, priority=True),
         Binding("ctrl+t", "open_tree", "Session Tree", show=False),
         Binding("ctrl+y", "yank_last", "Copy last response", show=False),
         Binding("ctrl+b", "toggle_sidebar", "Toggle sidebar", show=False),
@@ -332,11 +333,14 @@ class KodaApp(App):
             self._sidebar_host.add_class("visible")
 
     async def action_copy_or_interrupt(self) -> None:
-        """Ctrl+C — interrupt a running turn, else fall through to default copy."""
+        """Ctrl+C — interrupt a running turn, else exit the app."""
         if self._turn_task and not self._turn_task.done():
             if self._adapter is not None:
                 await self._adapter.interrupt()
             self._turn_task.cancel()
             return
-        # Else: exit the app
+        self.exit()
+
+    def action_quit_app(self) -> None:
+        """Ctrl+D — always exits."""
         self.exit()
