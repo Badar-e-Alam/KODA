@@ -110,6 +110,34 @@ class ErrorMessage(BaseMessage):
         self._content = content
 
 
+class ThinkingMessage(BaseMessage):
+    """Pulsing placeholder shown while the agent is preparing its response.
+
+    Removed as soon as the first TextDelta or ToolStart event arrives.
+    """
+
+    _FRAMES = ("·   ", "··  ", "··· ", " ···", "  ··", "   ·")
+
+    def __init__(self, label: str = "Thinking", **kwargs: Any) -> None:
+        super().__init__("", **kwargs)
+        self._label = label
+        self._frame = 0
+        self._timer = None
+
+    def on_mount(self) -> None:
+        self._tick()
+        self._timer = self.set_interval(0.15, self._tick)
+
+    def on_unmount(self) -> None:
+        if self._timer is not None:
+            self._timer.stop()
+
+    def _tick(self) -> None:
+        frame = self._FRAMES[self._frame % len(self._FRAMES)]
+        self._frame += 1
+        self.update(f"[dim italic]{self._label} {frame}[/]")
+
+
 def _format_args(args: dict[str, Any]) -> str:
     """Compact single-line repr for tool arguments."""
     if not args:

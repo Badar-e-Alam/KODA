@@ -30,31 +30,48 @@ class Suggestion:
 
 # ── Entry point ────────────────────────────────────────────────────
 
-def complete(value: str, cursor: int) -> tuple[list[Suggestion], tuple[int, int]] | None:
-    """Return (suggestions, (replace_start, replace_end)) for the active trigger.
-
-    `replace_start`/`replace_end` are indexes in `value` that should be
-    replaced when a suggestion is accepted. Returns None if nothing triggers.
+def complete(
+    value: str, cursor: int
+) -> tuple[list[Suggestion], tuple[int, int], str] | None:
+    """Return (suggestions, (replace_start, replace_end), title) for the active
+    trigger. `title` is the category shown in the popup header
+    (e.g. "Commands", "Models", "Files"). None if nothing triggers.
     """
     # /model <fragment>
     if value.startswith("/model ") or value.startswith("/model\t"):
         frag = value[7:]
-        return (_complete_models(frag.strip()), (7, len(value)))
+        return (_complete_models(frag.strip()), (7, len(value)), "Models")
+
+    # /theme <fragment>
+    if value.startswith("/theme ") or value.startswith("/theme\t"):
+        frag = value[7:]
+        return (_complete_themes(frag.strip()), (7, len(value)), "Themes")
 
     # /<fragment>  (bare slash command)
     if value.startswith("/"):
         frag = value[1:].split(" ", 1)[0]
         end = 1 + len(frag)
-        return (_complete_commands(frag), (0, end))
+        return (_complete_commands(frag), (0, end), "Commands")
 
     # @<fragment>  — find the @word that contains the cursor
     at_range = _find_at_token(value, cursor)
     if at_range is not None:
         start, end = at_range
         frag = value[start + 1 : end]
-        return (_complete_files(frag), (start, end))
+        return (_complete_files(frag), (start, end), "Files")
 
     return None
+
+
+def _complete_themes(fragment: str) -> list[Suggestion]:
+    from koda.tui.theme import THEMES
+
+    frag = fragment.lower()
+    return [
+        Suggestion(insert=f"/theme {name}", label=name, description="theme")
+        for name in sorted(THEMES.keys())
+        if frag in name.lower()
+    ]
 
 
 # ── Slash commands ─────────────────────────────────────────────────

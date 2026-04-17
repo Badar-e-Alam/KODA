@@ -172,10 +172,10 @@ class KodaApp(App):
                 self._popup.clear()
             self._chat_input._last_replace_range = None  # type: ignore[attr-defined]
             return
-        suggestions, replace_range = result
+        suggestions, replace_range, title = result
         self._chat_input._last_replace_range = replace_range  # type: ignore[attr-defined]
         if self._popup is not None:
-            self._popup.set_suggestions(suggestions)
+            self._popup.set_suggestions(suggestions, title=title)
 
     # ── Message mount helper ─────────────────────────────────────────
 

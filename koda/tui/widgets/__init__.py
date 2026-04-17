@@ -7,6 +7,7 @@ from koda.tui.widgets.messages import (
     AssistantMessage,
     BaseMessage,
     ErrorMessage,
+    ThinkingMessage,
     ToolCallMessage,
     UserMessage,
 )
@@ -22,6 +23,7 @@ __all__ = [
     "ToolCallMessage",
     "AppMessage",
     "ErrorMessage",
+    "ThinkingMessage",
     "StatusBar",
     "SuggestionPopup",
 ]

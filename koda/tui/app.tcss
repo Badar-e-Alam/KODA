@@ -16,6 +16,7 @@ $muted: #565f89;
 
 Screen {
     background: $background;
+    layers: base popup;
 }
 
 /* ── Layout ─────────────────────────────────────────────────── */
@@ -23,6 +24,7 @@ Screen {
 #app-root {
     layout: vertical;
     height: 100%;
+    layer: base;
 }
 
 #main-row {
@@ -84,17 +86,7 @@ ToolCallMessage {
     padding: 0;
 }
 
-ToolCallMessage > .tool-header {
-    color: $tool;
-    text-style: bold;
-}
-
-ToolCallMessage > .tool-preview {
-    color: $muted;
-    padding-left: 2;
-}
-
-ToolCallMessage.-error > .tool-preview {
+ToolCallMessage.-error {
     color: $tool-err;
 }
 
@@ -108,6 +100,13 @@ ErrorMessage {
     text-style: bold;
     border-left: thick $error;
     padding-left: 1;
+}
+
+ThinkingMessage {
+    color: $muted;
+    text-style: italic;
+    height: 1;
+    padding: 0 1;
 }
 
 /* ── Chat input ─────────────────────────────────────────────── */
@@ -131,6 +130,53 @@ ChatInput.-command {
     border: round $accent;
 }
 
+/* ── Suggestion popup ───────────────────────────────────────── */
+
+SuggestionPopup {
+    layer: popup;
+    dock: bottom;
+    offset-y: -3;              /* float above the 3-row ChatInput */
+    width: 70;
+    max-width: 90%;
+    height: auto;
+    max-height: 14;
+    background: $surface;
+    border: round $accent;
+    padding: 0;
+    display: none;
+}
+
+SuggestionPopup.-visible {
+    display: block;
+}
+
+SuggestionPopup > .suggest-header {
+    height: 1;
+    background: $accent 15%;
+    color: $accent;
+    text-style: bold;
+    padding: 0 1;
+    dock: top;
+}
+
+SuggestionPopup > OptionList {
+    height: auto;
+    max-height: 12;
+    background: $surface;
+    border: none;
+    padding: 0;
+    scrollbar-size: 1 1;
+}
+
+SuggestionPopup > OptionList > .option-list--option {
+    padding: 0 1;
+}
+
+SuggestionPopup > OptionList > .option-list--option-highlighted {
+    background: $accent 30%;
+    text-style: bold;
+}
+
 /* ── Status bar ─────────────────────────────────────────────── */
 
 StatusBar {
@@ -138,13 +184,4 @@ StatusBar {
     background: $surface;
     color: $muted;
     padding: 0 1;
-}
-
-StatusBar > .sb-model {
-    color: $primary;
-    text-style: bold;
-}
-
-StatusBar > .sb-tokens {
-    color: $foreground;
 }

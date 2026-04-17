@@ -23,6 +23,7 @@ from koda.agent_api import (
 from koda.tui.widgets.messages import (
     AssistantMessage,
     ErrorMessage,
+    ThinkingMessage,
     ToolCallMessage,
 )
 
@@ -43,14 +44,31 @@ async def run_turn(
     pending_tools: dict[str, ToolCallMessage] = {}
     final_text_parts: list[str] = []
 
+    thinking: ThinkingMessage | None = ThinkingMessage()
+    await app.mount_message(thinking)
+
     try:
         async for ev in adapter.stream(message, history):
+            # First real event → remove the thinking placeholder
+            if thinking is not None and isinstance(
+                ev, (TextDelta, ThinkingDelta, ToolStart, ToolResult)
+            ):
+                try:
+                    await thinking.remove()
+                except Exception:
+                    pass
+                thinking = None
             await _dispatch(app, ev, current_assistant, pending_tools, final_text_parts)
-            # Update our local reference (Python closure mutation workaround)
             current_assistant = _active_assistant(app, ev, current_assistant)
     except Exception as e:
         _log.exception("Stream failed")
         await app.mount_message(ErrorMessage(f"Stream failed: {type(e).__name__}: {e}"))
+    finally:
+        if thinking is not None:
+            try:
+                await thinking.remove()
+            except Exception:
+                pass
 
     return "".join(final_text_parts)
 

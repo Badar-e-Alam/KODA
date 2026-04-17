@@ -1,70 +1,88 @@
 """
-SuggestionPopup — floating OptionList above the ChatInput.
+SuggestionPopup — floating dropdown above the ChatInput.
 
-Shown when the user types `/`, `/model `, or `@` in the input. The ChatInput
-owns keyboard routing (up/down/enter/escape) and forwards actions to this
-widget via `highlight_next`, `highlight_prev`, `current_selection`.
+Claude-Code-style layout:
+  ╭─ Commands ──────────────────────────╮
+  │  /clear      start a new chat       │
+  │  /copy       copy last response     │
+  │ ❯/tree       open the session tree  │   (highlighted)
+  ╰─────────────────────────────────────╯
+
+Shown when the user types `/`, `/model `, `/theme `, or `@` in the input.
+The ChatInput owns keyboard routing (up/down/enter/escape) and forwards
+actions to this widget via `highlight_next`, `highlight_prev`,
+`current_selection`.
 """
 
 from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
-from textual.widgets import OptionList
+from textual.app import ComposeResult
+from textual.containers import Container
+from textual.widgets import OptionList, Static
 from textual.widgets.option_list import Option
 
 if TYPE_CHECKING:
     from koda.tui.completers import Suggestion
 
 
-class SuggestionPopup(OptionList):
-    """Floating suggestion list. Hidden when empty."""
+# Max label width so description columns align
+_LABEL_WIDTH = 28
 
-    DEFAULT_CSS = """
-    SuggestionPopup {
-        height: auto;
-        max-height: 12;
-        dock: bottom;
-        offset-y: -3;
-        background: $surface;
-        border: round $accent;
-        padding: 0 1;
-        display: none;
-    }
 
-    SuggestionPopup.-visible {
-        display: block;
-    }
-
-    SuggestionPopup > .option-list--option-highlighted {
-        background: $accent 30%;
-        text-style: bold;
-    }
-    """
+class SuggestionPopup(Container):
+    """Floating suggestion list with a category header."""
 
     def __init__(self, **kwargs) -> None:
         super().__init__(**kwargs)
         self._suggestions: list["Suggestion"] = []
+        self._title: str = ""
 
-    def set_suggestions(self, suggestions: list["Suggestion"]) -> None:
-        self.clear_options()
+    def compose(self) -> ComposeResult:
+        yield Static("", id="suggest-header", classes="suggest-header")
+        yield OptionList(id="suggest-list")
+
+    def set_suggestions(self, suggestions: list["Suggestion"], title: str = "") -> None:
         self._suggestions = suggestions
+        self._title = title
+        header = self.query_one("#suggest-header", Static)
+        options = self.query_one("#suggest-list", OptionList)
+        options.clear_options()
         if not suggestions:
             self.remove_class("-visible")
             return
+        header.update(f"  {title}  ({len(suggestions)})" if title else "")
         for s in suggestions:
-            self.add_option(Option(s.display()))
+            options.add_option(Option(_format_row(s)))
         self.add_class("-visible")
-        self.highlighted = 0
+        options.highlighted = 0
 
-    def clear(self) -> None:  # type: ignore[override]
+    def clear(self) -> None:
         self._suggestions = []
-        self.clear_options()
+        try:
+            self.query_one("#suggest-list", OptionList).clear_options()
+        except Exception:
+            pass
         self.remove_class("-visible")
 
     @property
     def is_visible(self) -> bool:
         return "-visible" in self.classes and bool(self._suggestions)
+
+    @property
+    def highlighted(self) -> int | None:
+        try:
+            return self.query_one("#suggest-list", OptionList).highlighted
+        except Exception:
+            return None
+
+    @highlighted.setter
+    def highlighted(self, value: int | None) -> None:
+        try:
+            self.query_one("#suggest-list", OptionList).highlighted = value
+        except Exception:
+            pass
 
     @property
     def current_selection(self) -> "Suggestion | None":
@@ -84,3 +102,14 @@ class SuggestionPopup(OptionList):
             return
         cur = self.highlighted if self.highlighted is not None else 0
         self.highlighted = (cur - 1) % len(self._suggestions)
+
+
+def _format_row(s: "Suggestion") -> str:
+    """Two-column row: label padded, then dim description."""
+    label = s.label
+    if len(label) > _LABEL_WIDTH:
+        label = label[: _LABEL_WIDTH - 1] + "…"
+    padded = label.ljust(_LABEL_WIDTH)
+    if s.description:
+        return f"[b cyan]{padded}[/]  [dim]{s.description}[/]"
+    return f"[b cyan]{padded}[/]"

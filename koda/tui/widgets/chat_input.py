@@ -116,10 +116,17 @@ class ChatInput(Input):
     # ── Actions ──────────────────────────────────────────────────────
 
     async def action_submit(self) -> None:  # overrides Input.action_submit
-        # If popup is visible, accept suggestion instead of submitting
+        # If popup is visible, accept the highlighted suggestion first.
+        # If the inserted text ends with a space, the command expects an
+        # argument — stay in input mode and wait. Otherwise submit immediately.
         if self._popup is not None and self._popup.is_visible:
-            if self._accept_suggestion():
-                return
+            suggestion = self._popup.current_selection
+            if suggestion is not None:
+                self._accept_suggestion()
+                if suggestion.insert.endswith(" "):
+                    # Wait for the user to type the argument
+                    return
+                # Complete: fall through and submit
         text = self.value.strip()
         if not text:
             return

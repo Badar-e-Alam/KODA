@@ -74,11 +74,12 @@ def test_completer_slash_commands():
     """Unit: /t matches tree + theme."""
     from koda.tui.completers import complete
 
-    sugg, rng = complete("/t", 2)
+    sugg, rng, title = complete("/t", 2)
     labels = [s.label for s in sugg]
     assert "/tree" in labels
     assert "/theme" in labels
     assert rng == (0, 2)
+    assert title == "Commands"
 
 
 def test_completer_at_token_in_middle():
@@ -88,5 +89,6 @@ def test_completer_at_token_in_middle():
     value = "hello @app"
     result = complete(value, len(value))
     assert result is not None
-    _, rng = result
+    _, rng, title = result
     assert rng == (6, 10), f"Expected (6,10), got {rng}"
+    assert title == "Files"
