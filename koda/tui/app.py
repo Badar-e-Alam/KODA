@@ -37,6 +37,7 @@ from koda.tui.widgets import (
     ErrorMessage,
     KodaBanner,
     StatusBar,
+    SuggestionPopup,
     UserMessage,
 )
 from koda.tui.widgets.messages import ToolCallMessage
@@ -86,6 +87,7 @@ class KodaApp(App):
         self._messages_container: VerticalScroll | None = None
         self._banner: KodaBanner | None = None
         self._sidebar_host = None
+        self._popup: SuggestionPopup | None = None
         self._last_assistant_widget: AssistantMessage | None = None
         self._turn_task: asyncio.Task | None = None
 
@@ -119,6 +121,7 @@ class KodaApp(App):
                 yield Vertical(id="sidebar-host")
                 with Vertical(id="chat-area"):
                     yield VerticalScroll(id="messages")
+                    yield SuggestionPopup(id="suggestions")
                     yield ChatInput()
             yield StatusBar()
 
@@ -128,6 +131,8 @@ class KodaApp(App):
         self._messages_container = self.query_one("#messages", VerticalScroll)
         self._banner = self.query_one(KodaBanner)
         self._sidebar_host = self.query_one("#sidebar-host")
+        self._popup = self.query_one(SuggestionPopup)
+        self._chat_input.attach_popup(self._popup)
         self.apply_theme(DEFAULT_THEME)
 
         parsed = ModelSpec.try_parse(self._model)
@@ -154,6 +159,23 @@ class KodaApp(App):
 
     async def on_chat_input_submitted(self, event: ChatInput.Submitted) -> None:
         await self._handle_user_message(event.value)
+
+    async def on_chat_input_suggestions_requested(
+        self, event: ChatInput.SuggestionsRequested
+    ) -> None:
+        """Compute suggestions for the current input value & update popup."""
+        from koda.tui.completers import complete
+
+        result = complete(event.value, event.cursor)
+        if result is None:
+            if self._popup is not None:
+                self._popup.clear()
+            self._chat_input._last_replace_range = None  # type: ignore[attr-defined]
+            return
+        suggestions, replace_range = result
+        self._chat_input._last_replace_range = replace_range  # type: ignore[attr-defined]
+        if self._popup is not None:
+            self._popup.set_suggestions(suggestions)
 
     # ── Message mount helper ─────────────────────────────────────────
 

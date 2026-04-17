@@ -11,6 +11,7 @@ from koda.tui.widgets.messages import (
     UserMessage,
 )
 from koda.tui.widgets.status import StatusBar
+from koda.tui.widgets.suggestions import SuggestionPopup
 
 __all__ = [
     "KodaBanner",
@@ -22,4 +23,5 @@ __all__ = [
     "AppMessage",
     "ErrorMessage",
     "StatusBar",
+    "SuggestionPopup",
 ]

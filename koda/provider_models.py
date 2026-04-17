@@ -126,6 +126,49 @@ PROVIDERS: dict[str, ProviderSpec] = {
         parse=_parse_openai_compat,
         needs_key=True,
     ),
+    "openai": ProviderSpec(
+        name="openai",
+        env_urls=("OPENAI_BASE_URL",),
+        default_url="https://api.openai.com",
+        endpoint="/v1/models",
+        auth_env="OPENAI_API_KEY",
+        parse=_parse_openai_compat,
+        fallback=(
+            "gpt-4o", "gpt-4o-mini", "gpt-4.1", "gpt-4.1-mini",
+            "gpt-5", "gpt-5-mini", "gpt-5-nano", "o1", "o1-mini", "o3-mini",
+        ),
+        needs_key=True,
+    ),
+    "anthropic": ProviderSpec(
+        name="anthropic",
+        env_urls=("ANTHROPIC_BASE_URL",),
+        default_url="https://api.anthropic.com",
+        endpoint="/v1/models",
+        auth_env="ANTHROPIC_API_KEY",
+        parse=_parse_openai_compat,  # Anthropic's /v1/models uses {data: [{id: ...}]}
+        fallback=(
+            "claude-opus-4-7", "claude-sonnet-4-6", "claude-haiku-4-5",
+            "claude-opus-4-6", "claude-sonnet-4-5", "claude-haiku-4-0",
+        ),
+        needs_key=True,
+    ),
+    "google": ProviderSpec(
+        name="google",
+        env_urls=("GOOGLE_BASE_URL",),
+        default_url="https://generativelanguage.googleapis.com",
+        endpoint="/v1beta/models",
+        auth_env="GOOGLE_API_KEY",
+        parse=lambda d: sorted({
+            m.get("name", "").removeprefix("models/")
+            for m in d.get("models", [])
+            if m.get("name")
+        }),
+        fallback=(
+            "gemini-2.5-flash", "gemini-2.5-pro",
+            "gemini-2.0-flash", "gemini-1.5-flash", "gemini-1.5-pro",
+        ),
+        needs_key=True,
+    ),
 }
 
 
