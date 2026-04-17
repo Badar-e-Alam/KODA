@@ -24,7 +24,7 @@ from textual.containers import Horizontal, Vertical, VerticalScroll
 from koda import __version__
 from koda.agent_api import KodaAgent
 from koda.conversation_log import ConversationLog
-from koda.model_config import ModelSpec, has_provider_credentials
+from koda.model_config import ModelSpec, has_provider_credentials, warm_cache_in_background
 from koda.session import SessionTree
 from koda.tui.commands import dispatch as dispatch_command
 from koda.tui.stream import run_turn
@@ -145,6 +145,9 @@ class KodaApp(App):
         if self._banner:
             self._banner.set_connected()
         self._chat_input.focus()
+
+        # Warm model-discovery cache off the hot path so /model is instant.
+        warm_cache_in_background()
 
     # ── Theme ────────────────────────────────────────────────────────
 

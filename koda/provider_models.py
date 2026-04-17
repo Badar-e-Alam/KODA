@@ -230,7 +230,11 @@ def _fetch(spec: ProviderSpec) -> list[str] | None:
 
 
 def get_models(provider: str) -> list[str]:
-    """Models for *provider*: cache → live fetch → fallback list."""
+    """Models for *provider*: cache → live fetch → fallback list.
+
+    Blocks on network up to *spec.ttl*-expiry. Use `get_models_cached_only`
+    from hot UI paths.
+    """
     spec = PROVIDERS.get(provider)
     if spec is None:
         return []
@@ -246,6 +250,22 @@ def get_models(provider: str) -> list[str]:
 
     if spec.fallback:
         _log.debug("Using fallback model list for %s", provider)
+    return list(spec.fallback)
+
+
+def get_models_cached_only(provider: str) -> list[str]:
+    """Non-blocking: disk cache → fallback list. Never hits the network.
+
+    Safe to call from UI hot paths like the /model completer on every
+    keystroke. A background thread (see model_config.warm_cache_in_background)
+    is responsible for keeping the disk cache warm.
+    """
+    spec = PROVIDERS.get(provider)
+    if spec is None:
+        return []
+    cached = _read_cache(provider, spec.ttl)
+    if cached is not None:
+        return cached
     return list(spec.fallback)
 
 

@@ -7,12 +7,22 @@ Provides:
   ModelSpec.try_parse("provider:model")
   has_provider_credentials("anthropic")
   get_available_models()  — dict[provider, list[model_name]]
+
+Discovery is cache-first: the completer calls `get_available_models()` on
+every keystroke in `/model xxx`, so we keep a process-wide in-memory cache
+and never block on network inside the hot path. `warm_cache_in_background()`
+kicks off file-cache refresh in a daemon thread at app startup.
 """
 
 from __future__ import annotations
 
+import logging
 import os
+import threading
+import time
 from dataclasses import dataclass
+
+_log = logging.getLogger("koda.model_config")
 
 
 @dataclass(frozen=True)
@@ -62,19 +72,62 @@ def has_provider_credentials(provider: str) -> bool | None:
     return bool(os.environ.get(key))
 
 
-def get_available_models() -> dict[str, list[str]]:
+_MODELS_CACHE: tuple[float, dict[str, list[str]]] | None = None
+_MODELS_TTL = 300  # 5 minutes — the in-memory cache lifetime
+
+
+def get_available_models(force_refresh: bool = False) -> dict[str, list[str]]:
     """Discover models we can actually reach right now.
 
-    Pulls from `koda.provider_models` (cached). Only includes providers we
-    have credentials for.
+    Two-layer cache:
+      - Process-wide in-memory cache with 5-min TTL (the hot path for /model)
+      - Disk cache at ~/.koda/models/<provider>.json (24h TTL, in provider_models)
+
+    Only includes providers we have credentials for.
     """
-    from koda.provider_models import PROVIDERS, get_models
+    global _MODELS_CACHE
+
+    if not force_refresh and _MODELS_CACHE is not None:
+        ts, cached = _MODELS_CACHE
+        if time.time() - ts < _MODELS_TTL:
+            return cached
+
+    from koda.provider_models import PROVIDERS, get_models, get_models_cached_only
+
+    fetch = get_models if force_refresh else get_models_cached_only
 
     out: dict[str, list[str]] = {}
     for name, spec in PROVIDERS.items():
         if spec.needs_key and spec.auth_env and not os.environ.get(spec.auth_env):
             continue
-        models = get_models(name)
+        models = fetch(name)
         if models:
             out[name] = models
+
+    _MODELS_CACHE = (time.time(), out)
     return out
+
+
+def invalidate_models_cache() -> None:
+    """Clear the in-memory cache. Next call will re-scan disk / network."""
+    global _MODELS_CACHE
+    _MODELS_CACHE = None
+
+
+def warm_cache_in_background() -> None:
+    """Kick off model discovery in a daemon thread so the first /model
+    popup is instant. Called once from KodaApp.on_mount.
+    """
+
+    def _worker() -> None:
+        try:
+            from koda.provider_models import refresh_stale
+
+            refresh_stale()  # re-fetch any provider whose disk cache is stale
+            get_available_models(force_refresh=True)  # warm the in-memory cache
+            _log.debug("model cache warmed")
+        except Exception as e:
+            _log.warning("background model-cache warm failed: %s", e)
+
+    t = threading.Thread(target=_worker, name="koda-model-warm", daemon=True)
+    t.start()
