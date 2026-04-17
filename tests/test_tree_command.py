@@ -11,7 +11,7 @@ from __future__ import annotations
 import pytest
 from textual.worker import Worker
 
-from koda.app import KodaApp
+from koda.tui.app import KodaApp
 
 
 def test_action_open_tree_is_worker_decorated():

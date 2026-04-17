@@ -11,7 +11,7 @@ import asyncio
 
 import pytest
 
-from koda.app import KodaApp
+from koda.tui.app import KodaApp
 
 
 @pytest.mark.asyncio
@@ -25,8 +25,7 @@ async def test_shell_command_mode_detection():
         await pilot.press("!")
         await pilot.pause()
         assert ci.mode == "shell", f"Expected shell mode after !, got {ci.mode!r}"
-        # ! is stripped from the text area
-        assert ci._text_area.text == ""
+        assert ci.value == "!"
 
 
 @pytest.mark.asyncio
@@ -46,12 +45,11 @@ async def test_shell_command_executes():
         await asyncio.sleep(2)
         await pilot.pause()
 
-        from deepagents_cli.widgets.messages import AssistantMessage, UserMessage
+        from koda.tui.widgets.messages import AssistantMessage, UserMessage
 
         messages_container = app.query_one("#messages")
         children = list(messages_container.children)
 
-        # Should have at least a UserMessage and an AssistantMessage
         user_msgs = [c for c in children if isinstance(c, UserMessage)]
         asst_msgs = [c for c in children if isinstance(c, AssistantMessage)]
 

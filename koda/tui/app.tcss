@@ -1,0 +1,150 @@
+/* KODA TUI stylesheet
+ * Custom palette variables (overridden at runtime by KodaApp.apply_theme).
+ * Defaults = Tokyo Night (koda theme).
+ */
+$background: #1a1b26;
+$surface: #24283b;
+$foreground: #c0caf5;
+$primary: #7aa2f7;
+$accent: #bb9af7;
+$error: #f7768e;
+$user: #9ece6a;
+$tool: #e0af68;
+$tool-ok: #73daca;
+$tool-err: #f7768e;
+$muted: #565f89;
+
+Screen {
+    background: $background;
+}
+
+/* ── Layout ─────────────────────────────────────────────────── */
+
+#app-root {
+    layout: vertical;
+    height: 100%;
+}
+
+#main-row {
+    height: 1fr;
+    layout: horizontal;
+}
+
+#chat-area {
+    width: 1fr;
+    height: 100%;
+    layout: vertical;
+}
+
+#messages {
+    height: 1fr;
+    background: $background;
+    padding: 0 1;
+    scrollbar-size: 1 1;
+}
+
+#sidebar-host {
+    width: auto;
+    max-width: 40;
+    display: none;
+}
+
+#sidebar-host.visible {
+    display: block;
+}
+
+/* ── Banner ─────────────────────────────────────────────────── */
+
+KodaBanner {
+    height: auto;
+    padding: 1 2;
+    color: $primary;
+}
+
+/* ── Messages ───────────────────────────────────────────────── */
+
+BaseMessage {
+    height: auto;
+    padding: 0 1;
+    margin: 0 0 1 0;
+}
+
+UserMessage {
+    color: $user;
+    border-left: thick $user;
+    padding-left: 1;
+}
+
+AssistantMessage {
+    color: $foreground;
+}
+
+ToolCallMessage {
+    color: $tool;
+    padding: 0;
+}
+
+ToolCallMessage > .tool-header {
+    color: $tool;
+    text-style: bold;
+}
+
+ToolCallMessage > .tool-preview {
+    color: $muted;
+    padding-left: 2;
+}
+
+ToolCallMessage.-error > .tool-preview {
+    color: $tool-err;
+}
+
+AppMessage {
+    color: $muted;
+    text-style: italic;
+}
+
+ErrorMessage {
+    color: $error;
+    text-style: bold;
+    border-left: thick $error;
+    padding-left: 1;
+}
+
+/* ── Chat input ─────────────────────────────────────────────── */
+
+ChatInput {
+    height: 3;
+    border: round $muted;
+    padding: 0 1;
+    background: $surface;
+}
+
+ChatInput:focus {
+    border: round $primary;
+}
+
+ChatInput.-shell {
+    border: round $tool;
+}
+
+ChatInput.-command {
+    border: round $accent;
+}
+
+/* ── Status bar ─────────────────────────────────────────────── */
+
+StatusBar {
+    height: 1;
+    background: $surface;
+    color: $muted;
+    padding: 0 1;
+}
+
+StatusBar > .sb-model {
+    color: $primary;
+    text-style: bold;
+}
+
+StatusBar > .sb-tokens {
+    color: $foreground;
+}
