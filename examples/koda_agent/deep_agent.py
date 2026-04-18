@@ -82,7 +82,11 @@ def build(
         model=model,
         tools=list(ALL_TOOLS),
         system_prompt=build_prompt(ws),
-        backend=FilesystemBackend(root_dir=str(ws), virtual_mode=False),
+        # virtual_mode=True: "/" is the workspace root, so skill paths like
+        # "/skills/docx/" resolve to <ws>/skills/docx/. With virtual_mode=False
+        # on Windows, "/" resolved to the C:\ drive root — the agent saw
+        # `/skills` as missing and SkillsMiddleware loaded zero skills.
+        backend=FilesystemBackend(root_dir=str(ws), virtual_mode=True),
         skills=skill_paths or None,
         memory=[AGENTS_MD_PATH],
         checkpointer=MemorySaver(),
