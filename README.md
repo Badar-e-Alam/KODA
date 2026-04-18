@@ -9,9 +9,11 @@
 [![tests](https://img.shields.io/badge/tests-104%20passing-brightgreen.svg)](tests/)
 [![PRs welcome](https://img.shields.io/badge/PRs-welcome-brightgreen.svg)](CONTRIBUTING.md)
 
-![KODA in action — streamed tool calls + inline agent response](assets/koda_demo.png)
-
 </div>
+
+<p align="center">
+  <img src="assets/koda_demo.png" alt="KODA — banner, user prompt, streamed tool calls (web_search, read_webpage), agent answer, input bar + status" width="900">
+</p>
 
 ---
 
