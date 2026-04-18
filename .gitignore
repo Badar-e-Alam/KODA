@@ -14,3 +14,20 @@ env/
 logs/
 .DS_Store
 Thumbs.db
+
+# Local harness + workspace artifacts (do not track)
+.claude/settings.local.json
+agent_workspace/
+koda_*.svg
+koda_new_banner.svg
+koda_sidebar_*.svg
+koda_test_screenshot.svg
+koda_with_delete.svg
+
+# Session + model caches
+.koda/
+~/.koda/
+
+# Editor
+.idea/
+.vscode/

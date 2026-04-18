@@ -102,6 +102,11 @@ async def _quit(app: "KodaApp", _args: str) -> bool:
     return True
 
 
+async def _reload_memory(app: "KodaApp", _args: str) -> bool:
+    await app.reload_memory()
+    return True
+
+
 _HELP: dict[str, tuple[Handler, str]] = {
     "clear": (_clear, "start a new chat session"),
     "model": (_model, "[provider:model] — switch model or show current"),
@@ -109,6 +114,7 @@ _HELP: dict[str, tuple[Handler, str]] = {
     "copy": (_copy, "copy the last assistant response to clipboard"),
     "theme": (_theme, "[name] — switch color theme (or list)"),
     "usage": (_usage, "show cumulative token usage"),
+    "reload-memory": (_reload_memory, "re-read AGENTS.md (mid-session)"),
     "help": (_help, "list all slash commands"),
     "quit": (_quit, "exit KODA"),
     "exit": (_quit, "exit KODA"),

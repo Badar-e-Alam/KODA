@@ -87,6 +87,11 @@ async def _dispatch(
             app._last_assistant_widget = current_assistant
         current_assistant.append(ev.content)
         final_text_parts.append(ev.content)
+        # Keep the viewport pinned to the newest content as the widget
+        # grows — mount_message only scrolls once at mount time, so single
+        # large deltas (non-streamed responses) would otherwise land below
+        # the fold.
+        _scroll_to_end(app)
 
     elif isinstance(ev, ThinkingDelta):
         # For now, reasoning is silent. Future: dedicated ThinkingMessage.
@@ -101,10 +106,15 @@ async def _dispatch(
         widget = pending_tools.get(ev.tool_id)
         if widget is not None:
             widget.set_result(ev.output, is_error=ev.is_error)
+            _scroll_to_end(app)
         else:
-            # Orphan result (e.g. adapter error fabricated one)
-            from koda.tui.widgets.messages import AppMessage
-            await app.mount_message(AppMessage(f"{ev.output[:200]}"))
+            # Orphan result — the adapter fabricated one for a graph-level
+            # failure (connection refused, auth error, ...). Render it as
+            # a proper ErrorMessage with a humanized hint so the user sees
+            # *what* went wrong and *what to do* instead of a raw trace.
+            text = _humanize_adapter_error(ev.output)
+            await app.mount_message(ErrorMessage(text))
+            _scroll_to_end(app)
 
     elif isinstance(ev, Usage):
         if app._status_bar is not None:
@@ -113,6 +123,40 @@ async def _dispatch(
     elif isinstance(ev, Done):
         if ev.usage and app._status_bar is not None:
             app._status_bar.update_usage(ev.usage)
+
+
+_HINTS: list[tuple[str, str]] = [
+    # lowercase match → actionable message
+    ("connecterror", "Model server unreachable. If using ollama, run `ollama serve`."),
+    ("connection refused", "Model server refused the connection. Is it running?"),
+    ("all connection attempts failed", "Could not reach the model server. Check it's running and the host/port."),
+    ("401", "Authentication failed. Check your API key."),
+    ("unauthorized", "Authentication failed. Check your API key."),
+    ("403", "Access denied. The API key may lack permission for this model."),
+    ("429", "Rate-limited by the provider. Wait a moment and retry."),
+    ("timeout", "Request timed out. The model server may be slow or overloaded."),
+]
+
+
+def _humanize_adapter_error(raw: str) -> str:
+    """Turn a raw 'Agent error: ...' string into something actionable."""
+    low = raw.lower()
+    for needle, hint in _HINTS:
+        if needle in low:
+            # Keep the short error tag but replace the noise with the hint
+            head = raw.split(":", 2)[-1].strip()[:120]
+            return f"{hint}  ({head})"
+    return raw[:240]
+
+
+def _scroll_to_end(app: "KodaApp") -> None:
+    """Pin #messages to its bottom so streamed growth stays visible."""
+    container = getattr(app, "_messages_container", None)
+    if container is not None:
+        try:
+            container.scroll_end(animate=False)
+        except Exception:
+            pass
 
 
 def _active_assistant(

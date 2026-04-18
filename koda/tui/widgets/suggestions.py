@@ -1,12 +1,13 @@
 """
-SuggestionPopup — floating dropdown above the ChatInput.
+SuggestionPopup — inline dropdown that sits right above the ChatInput.
 
-Claude-Code-style layout:
-  ╭─ Commands ──────────────────────────╮
-  │  /clear      start a new chat       │
-  │  /copy       copy last response     │
-  │ ❯/tree       open the session tree  │   (highlighted)
-  ╰─────────────────────────────────────╯
+Claude-Code / Codex layout:
+  ╭─ Commands  (8) ─────────────────────────╮
+  │  /clear      start a new chat            │
+  │  /copy       copy last response          │
+  │ ❯/tree       open the session tree       │   (highlighted)
+  │  ↑↓ navigate · ⏎ accept · esc dismiss   │
+  ╰──────────────────────────────────────────╯
 
 Shown when the user types `/`, `/model `, `/theme `, or `@` in the input.
 The ChatInput owns keyboard routing (up/down/enter/escape) and forwards
@@ -30,9 +31,12 @@ if TYPE_CHECKING:
 # Max label width so description columns align
 _LABEL_WIDTH = 28
 
+# Footer hint line shown at the bottom of the popup
+_FOOTER_HINT = "↑↓ navigate · ⏎ accept · tab complete · esc dismiss"
+
 
 class SuggestionPopup(Container):
-    """Floating suggestion list with a category header."""
+    """Inline suggestion list with a category header + keybind hint footer."""
 
     def __init__(self, **kwargs) -> None:
         super().__init__(**kwargs)
@@ -42,6 +46,7 @@ class SuggestionPopup(Container):
     def compose(self) -> ComposeResult:
         yield Static("", id="suggest-header", classes="suggest-header")
         yield OptionList(id="suggest-list")
+        yield Static(f"  {_FOOTER_HINT}", id="suggest-footer", classes="suggest-footer")
 
     def set_suggestions(self, suggestions: list["Suggestion"], title: str = "") -> None:
         self._suggestions = suggestions
@@ -52,7 +57,8 @@ class SuggestionPopup(Container):
         if not suggestions:
             self.remove_class("-visible")
             return
-        header.update(f"  {title}  ({len(suggestions)})" if title else "")
+        count = len(suggestions)
+        header.update(f"  {title}  ({count})" if title else f"  ({count})")
         for s in suggestions:
             options.add_option(Option(_format_row(s)))
         self.add_class("-visible")

@@ -1,0 +1,29 @@
+name: Feature request
+description: Suggest a new feature or improvement for KODA
+labels: [enhancement]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: What problem are you trying to solve? What is the user-facing pain?
+      placeholder: I'm frustrated when ...
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed solution
+      description: Describe the feature you'd like. Mockups, examples, or TUI flows welcome.
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: Other approaches you've thought about and why they fall short.
+  - type: textarea
+    id: context
+    attributes:
+      label: Additional context
+      description: Links, related issues, provider quirks, anything else.

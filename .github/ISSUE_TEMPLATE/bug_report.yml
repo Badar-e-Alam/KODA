@@ -1,0 +1,71 @@
+name: Bug report
+description: Report a bug in KODA
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time to file a report. Please fill in the fields
+        below so we can reproduce the issue.
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened?
+      description: A clear and concise description of the bug.
+      placeholder: When I run `koda`, ...
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: What did you expect to happen?
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      description: Minimal steps that trigger the bug.
+      placeholder: |
+        1. Run `koda --model ...`
+        2. Type `/model`
+        3. See error
+    validations:
+      required: true
+  - type: input
+    id: koda-version
+    attributes:
+      label: KODA version
+      description: Output of `koda --version`
+      placeholder: 0.4.0
+    validations:
+      required: true
+  - type: input
+    id: python-version
+    attributes:
+      label: Python version
+      placeholder: "3.13"
+    validations:
+      required: true
+  - type: dropdown
+    id: os
+    attributes:
+      label: Operating system
+      options:
+        - Linux
+        - macOS
+        - Windows
+        - Other
+    validations:
+      required: true
+  - type: input
+    id: provider
+    attributes:
+      label: Model provider / model
+      placeholder: anthropic:claude-sonnet-4-6
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant logs
+      description: Paste any traceback or `~/.koda/logs/` output. Redact secrets.
+      render: shell

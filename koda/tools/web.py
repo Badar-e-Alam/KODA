@@ -7,11 +7,35 @@ the `JINA_API_KEY` env var for higher rate limits.
 
 from __future__ import annotations
 
+import ipaddress
 import os
-from urllib.parse import quote
+import socket
+from urllib.parse import quote, urlparse
 
 import httpx
 from langchain.tools import tool
+
+
+def _validate_public_url(url: str) -> str | None:
+    """Return an error string if url is not a safe public http(s) URL, else None."""
+    try:
+        parsed = urlparse(url)
+    except ValueError:
+        return "Error: invalid URL"
+    if parsed.scheme not in ("http", "https"):
+        return f"Error: only http/https URLs allowed (got {parsed.scheme!r})"
+    host = parsed.hostname
+    if not host:
+        return "Error: URL missing host"
+    try:
+        infos = socket.getaddrinfo(host, None)
+    except socket.gaierror:
+        return f"Error: cannot resolve host {host!r}"
+    for info in infos:
+        ip = ipaddress.ip_address(info[4][0])
+        if ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_reserved:
+            return f"Error: refusing to fetch private/internal address ({ip})"
+    return None
 
 
 @tool
@@ -42,6 +66,9 @@ def read_webpage(url: str) -> str:
     Args:
         url: Full http(s) URL.
     """
+    err = _validate_public_url(url)
+    if err:
+        return err
     headers: dict[str, str] = {
         "Accept": "text/markdown",
         "X-Return-Format": "markdown",

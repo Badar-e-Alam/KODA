@@ -246,12 +246,12 @@ Local install:
 
 - package `@mariozechner/pi-coding-agent`
 - version `0.67.1`
-- in the shorthand refs below, `.../` means the local PI install root under `C:\Users\badar\AppData\Roaming\npm\node_modules\@mariozechner\pi-coding-agent`
+- in the shorthand refs below, `.../` means the local PI install root under `&lt;pi-install-dir&gt;`
 
 Refs:
 
-- `C:\Users\badar\AppData\Roaming\npm\node_modules\@mariozechner\pi-coding-agent\package.json:3`
-- `C:\Users\badar\AppData\Roaming\npm\node_modules\@mariozechner\pi-coding-agent\package.json:4`
+- `&lt;pi-install-dir&gt;\package.json:3`
+- `&lt;pi-install-dir&gt;\package.json:4`
 
 ### Prompt construction
 
@@ -569,11 +569,11 @@ Local:
 - `.venv/Lib/site-packages/deepagents/backends/local_shell.py`
 - `.venv/Lib/site-packages/deepagents_cli/system_prompt.md`
 - `.venv/Lib/site-packages/deepagents_cli/agent.py`
-- `C:\Users\badar\AppData\Roaming\npm\node_modules\@mariozechner\pi-coding-agent\README.md`
-- `C:\Users\badar\AppData\Roaming\npm\node_modules\@mariozechner\pi-coding-agent\dist\core\system-prompt.js`
-- `C:\Users\badar\AppData\Roaming\npm\node_modules\@mariozechner\pi-coding-agent\dist\core\agent-session.js`
-- `C:\Users\badar\AppData\Roaming\npm\node_modules\@mariozechner\pi-coding-agent\node_modules\@mariozechner\pi-agent-core\dist\agent.js`
-- `C:\Users\badar\AppData\Roaming\npm\node_modules\@mariozechner\pi-coding-agent\node_modules\@mariozechner\pi-agent-core\dist\agent-loop.js`
+- `&lt;pi-install-dir&gt;\README.md`
+- `&lt;pi-install-dir&gt;\dist\core\system-prompt.js`
+- `&lt;pi-install-dir&gt;\dist\core\agent-session.js`
+- `&lt;pi-install-dir&gt;\node_modules\@mariozechner\pi-agent-core\dist\agent.js`
+- `&lt;pi-install-dir&gt;\node_modules\@mariozechner\pi-agent-core\dist\agent-loop.js`
 
 Web:
 

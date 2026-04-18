@@ -2,20 +2,40 @@
 name = "koda"
 version = "0.4.0"
 description = "KODA — agent-agnostic AI coding TUI"
+readme = "README.md"
 requires-python = ">=3.11"
+license = { text = "MIT" }
+authors = [
+    { name = "Badar-e-Alam" },
+]
+keywords = ["cli", "tui", "llm", "agent", "langgraph", "deepagents", "coding-agent"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Software Development",
+    "Topic :: Terminals",
+]
 
 dependencies = [
-    "textual>=0.60",
-    "python-dotenv>=1.0.0",
-    "langchain>=0.3",
-    "langchain-core>=0.3",
-    "langgraph>=0.3",
-    "httpx>=0.27",
-    "pyperclip>=1.8",
+    "textual>=1.0,<2.0",
+    "python-dotenv>=1.0,<2.0",
+    "langchain>=0.3,<0.4",
+    "langchain-core>=0.3,<0.4",
+    "langgraph>=0.3,<0.6",
+    "deepagents>=0.1,<0.2",
+    "httpx>=0.27,<0.29",
+    "pyperclip>=1.8,<2.0",
 ]
 
 [project.optional-dependencies]
-# Summarizer model backends (install the ones you use)
+# Summarizer + chat model backends — install the one(s) you use
 anthropic = ["langchain-anthropic"]
 openai = ["langchain-openai"]
 ollama = ["langchain-ollama"]
@@ -26,10 +46,31 @@ all = [
     "langchain-ollama",
     "langchain-google-genai",
 ]
+dev = [
+    "pytest>=8",
+    "pytest-asyncio>=0.23",
+    "ruff>=0.5",
+]
 
 [project.scripts]
 koda = "koda.__main__:main"
 
+[project.urls]
+Homepage = "https://github.com/Badar-e-Alam/KODA"
+Repository = "https://github.com/Badar-e-Alam/KODA"
+Issues = "https://github.com/Badar-e-Alam/KODA/issues"
+
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["koda"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM"]
+ignore = ["E501"]

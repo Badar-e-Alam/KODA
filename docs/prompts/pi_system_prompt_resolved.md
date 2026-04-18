@@ -45,15 +45,15 @@ Guidelines:
 - Show file paths clearly when working with files
 
 Pi documentation (read only when the user asks about pi itself, its SDK, extensions, themes, skills, or TUI):
-- Main documentation: C:/Users/badar/AppData/Roaming/npm/node_modules/@mariozechner/pi-coding-agent/README.md
-- Additional docs: C:/Users/badar/AppData/Roaming/npm/node_modules/@mariozechner/pi-coding-agent/docs
-- Examples: C:/Users/badar/AppData/Roaming/npm/node_modules/@mariozechner/pi-coding-agent/examples (extensions, custom tools, SDK)
+- Main documentation: &lt;pi-install-dir&gt;/README.md
+- Additional docs: &lt;pi-install-dir&gt;/docs
+- Examples: &lt;pi-install-dir&gt;/examples (extensions, custom tools, SDK)
 - When asked about: extensions (docs/extensions.md, examples/extensions/), themes (docs/themes.md), skills (docs/skills.md), prompt templates (docs/prompt-templates.md), TUI components (docs/tui.md), keybindings (docs/keybindings.md), SDK integrations (docs/sdk.md), custom providers (docs/custom-provider.md), adding models (docs/models.md), pi packages (docs/packages.md)
 - When working on pi topics, read the docs and examples, and follow .md cross-references before implementing
 - Always read pi .md files completely and follow links to related docs (e.g., tui.md for TUI API details)
 
 Current date: 2026-04-15
-Current working directory: C:/Users/badar/Desktop/KODA
+Current working directory: &lt;project-root&gt;
 ```
 
 ---
@@ -106,9 +106,9 @@ These are computed dynamically based on which tools are active:
 
 | Variable | Resolver | Resolved path |
 |----------|----------|---------------|
-| `readmePath` | `getReadmePath()` = `resolve(join(getPackageDir(), "README.md"))` | `C:/Users/badar/AppData/Roaming/npm/node_modules/@mariozechner/pi-coding-agent/README.md` |
-| `docsPath` | `getDocsPath()` = `resolve(join(getPackageDir(), "docs"))` | `C:/Users/badar/AppData/Roaming/npm/node_modules/@mariozechner/pi-coding-agent/docs` |
-| `examplesPath` | `getExamplesPath()` = `resolve(join(getPackageDir(), "examples"))` | `C:/Users/badar/AppData/Roaming/npm/node_modules/@mariozechner/pi-coding-agent/examples` |
+| `readmePath` | `getReadmePath()` = `resolve(join(getPackageDir(), "README.md"))` | `&lt;pi-install-dir&gt;/README.md` |
+| `docsPath` | `getDocsPath()` = `resolve(join(getPackageDir(), "docs"))` | `&lt;pi-install-dir&gt;/docs` |
+| `examplesPath` | `getExamplesPath()` = `resolve(join(getPackageDir(), "examples"))` | `&lt;pi-install-dir&gt;/examples` |
 
 ### Skills section (from `skills.js:260-281`)
 

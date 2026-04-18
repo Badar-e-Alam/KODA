@@ -24,11 +24,17 @@ from textual.containers import Horizontal, Vertical, VerticalScroll
 from koda import __version__
 from koda.agent_api import KodaAgent
 from koda.conversation_log import ConversationLog
-from koda.model_config import ModelSpec, has_provider_credentials, warm_cache_in_background
+from koda.model_config import (
+    ModelSpec,
+    has_provider_credentials,
+    probe_provider,
+    warm_cache_in_background,
+)
 from koda.session import SessionTree
+from koda.session_panel import ConfirmDeleteScreen, SessionPanel
 from koda.tui.commands import dispatch as dispatch_command
 from koda.tui.stream import run_turn
-from koda.tui.theme import DEFAULT_THEME, get as get_theme
+from koda.tui.theme import DEFAULT_THEME, THEMES, get as get_theme, to_textual_theme
 from koda.tui.widgets import (
     AppMessage,
     AssistantMessage,
@@ -43,6 +49,33 @@ from koda.tui.widgets import (
 from koda.tui.widgets.messages import ToolCallMessage
 
 _log = logging.getLogger("koda")
+
+
+def _default_adapter_factory(model: str, thread_id: str) -> KodaAgent:
+    """Default adapter factory — used by /model when no custom factory
+    was provided at app construction. Builds KODA's built-in deep adapter.
+    """
+    from koda.adapters.deep import create_deep_adapter
+
+    return create_deep_adapter(model=model, thread_id=thread_id)
+
+
+# File paths that count as agent memory — editing one triggers the
+# "Memory updated" notice so the user knows to /reload-memory for the
+# change to take effect this session.
+_MEMORY_FILES = {"/AGENTS.md", "AGENTS.md"}
+
+
+def _is_memory_file_edit(widget: "ToolCallMessage") -> bool:
+    """True if the tool call writes to an agent-memory file."""
+    name = (widget._tool_name or "").lower()
+    if name not in ("edit_file", "write_file"):
+        return False
+    args = widget._args or {}
+    path = args.get("file_path") or args.get("path") or ""
+    if not isinstance(path, str):
+        return False
+    return path in _MEMORY_FILES or path.endswith("/AGENTS.md")
 
 
 class KodaApp(App):
@@ -68,6 +101,7 @@ class KodaApp(App):
         model: str = "",
         auto_approve: bool = False,
         thread_id: str | None = None,
+        adapter_factory: Any | None = None,
     ) -> None:
         super().__init__()
         self._adapter: KodaAgent | None = adapter
@@ -77,7 +111,13 @@ class KodaApp(App):
             self._adapter = LangGraphAdapter(graph=agent, model=model, thread_id=thread_id)
         self._model = model or (self._adapter.model_name() if self._adapter else "")
         self._auto_approve = auto_approve
-        self._thread_id = thread_id or uuid.uuid4().hex
+        self._koda_thread_id = thread_id or uuid.uuid4().hex
+        # Factory used by /model to rebuild the adapter for a new model.
+        # Signature: factory(model: str, thread_id: str) -> KodaAgent
+        # Defaults to the built-in deep adapter — overridable so that
+        # custom backends (e.g. --agent examples.deepagents_backend.build)
+        # keep their wiring across /model switches.
+        self._adapter_factory = adapter_factory
 
         self._koda_session = SessionTree(path=self._new_session_path())
         self._conv_log = self._new_conversation_log()
@@ -91,6 +131,9 @@ class KodaApp(App):
         self._popup: SuggestionPopup | None = None
         self._last_assistant_widget: AssistantMessage | None = None
         self._turn_task: asyncio.Task | None = None
+        # Once the user sends a message the banner collapses permanently.
+        # Guards `_set_banner_compact(False)` from restoring the tall banner.
+        self._chat_started: bool = False
 
     # ── Session file paths ──────────────────────────────────────────
 
@@ -116,13 +159,21 @@ class KodaApp(App):
     # ── Compose ──────────────────────────────────────────────────────
 
     def compose(self) -> ComposeResult:
+        from textual.widgets import Static
+
         with Vertical(id="app-root"):
-            yield KodaBanner(thread_id=self._thread_id)
             with Horizontal(id="main-row"):
-                yield Vertical(id="sidebar-host")
+                with Vertical(id="sidebar-host"):
+                    yield SessionPanel(
+                        sessions_dir=self._sessions_dir(),
+                        current_session_id=self._koda_session.session_id,
+                        id="session-panel",
+                    )
                 with Vertical(id="chat-area"):
+                    yield KodaBanner(thread_id=self._koda_thread_id)
                     yield VerticalScroll(id="messages")
                     yield SuggestionPopup(id="suggestions")
+                    yield Static("", id="last-user-preview", classes="last-user-preview")
                     yield ChatInput()
             yield StatusBar()
 
@@ -134,6 +185,14 @@ class KodaApp(App):
         self._sidebar_host = self.query_one("#sidebar-host")
         self._popup = self.query_one(SuggestionPopup)
         self._chat_input.attach_popup(self._popup)
+
+        # Register all KODA palettes with Textual's theme registry so
+        # /theme <name> switches live via self.theme = name.
+        for theme_name in THEMES:
+            try:
+                self.register_theme(to_textual_theme(theme_name))
+            except Exception:
+                pass  # theme already registered, non-fatal
         self.apply_theme(DEFAULT_THEME)
 
         parsed = ModelSpec.try_parse(self._model)
@@ -149,15 +208,50 @@ class KodaApp(App):
         # Warm model-discovery cache off the hot path so /model is instant.
         warm_cache_in_background()
 
+        # Build the real adapter in a worker thread so the TUI is
+        # interactive immediately. Heavy imports (langgraph, langchain,
+        # deepagents) and graph compilation can take 5–8 s on a cold start.
+        if self._adapter is None and self._adapter_factory is not None:
+            asyncio.create_task(self._bootstrap_adapter())
+
+    async def _bootstrap_adapter(self) -> None:
+        """Build the initial adapter without blocking the UI thread."""
+        loading = AppMessage(f"Loading agent… ({self._model})")
+        await self.mount_message(loading)
+        try:
+            self._adapter = await asyncio.to_thread(
+                self._adapter_factory, self._model, self._koda_thread_id
+            )
+        except Exception as e:
+            _log.exception("Adapter bootstrap failed")
+            try:
+                await loading.remove()
+            except Exception:
+                pass
+            await self.mount_message(
+                ErrorMessage(f"Failed to load agent: {e}")
+            )
+            return
+        try:
+            await loading.remove()
+        except Exception:
+            pass
+        await self.mount_message(AppMessage(f"Agent ready ({self._model})"))
+
     # ── Theme ────────────────────────────────────────────────────────
 
     def apply_theme(self, name: str) -> None:
-        """Theme switching is a no-op in Phase 2.
-
-        The app.tcss baked-in defaults render the 'koda' palette. Live theme
-        swapping needs Textual's theme API; deferred to Phase 3.
+        """Swap the live theme. Uses Textual's built-in theme registry —
+        each palette in ``koda.tui.theme.THEMES`` was registered in
+        ``on_mount``.
         """
-        _log.debug("apply_theme(%s) — no-op (CSS defaults in use)", name)
+        if name not in THEMES:
+            _log.debug("apply_theme(%s) — unknown, ignored", name)
+            return
+        try:
+            self.theme = name
+        except Exception as e:
+            _log.warning("apply_theme(%s) failed: %s", name, e)
 
     # ── Input event ──────────────────────────────────────────────────
 
@@ -175,21 +269,66 @@ class KodaApp(App):
             if self._popup is not None:
                 self._popup.clear()
             self._chat_input._last_replace_range = None  # type: ignore[attr-defined]
+            self._set_banner_compact(False)
             return
         suggestions, replace_range, title = result
         self._chat_input._last_replace_range = replace_range  # type: ignore[attr-defined]
         if self._popup is not None:
             self._popup.set_suggestions(suggestions, title=title)
+            self._set_banner_compact(bool(suggestions))
+
+    def _set_banner_compact(self, compact: bool) -> None:
+        """Collapse the banner to one line while the popup is open, so the
+        full suggestion list (including /tree, /usage) is never clipped off
+        the bottom on small terminals.
+        """
+        if self._banner is None:
+            return
+        if compact:
+            self._banner.add_class("-compact")
+        elif not self._chat_started:
+            # Only restore the tall banner before the first user turn.
+            self._banner.remove_class("-compact")
+
+    async def on_chat_input_suggestions_dismissed(
+        self, _event: ChatInput.SuggestionsDismissed
+    ) -> None:
+        """User dismissed the popup (escape / accept) — restore the banner."""
+        self._set_banner_compact(False)
+
+    _PREVIEW_MAX_CHARS = 50
+
+    def _update_last_user_preview(self, message: str) -> None:
+        """Show a right-aligned snippet of the last user message above the
+        ChatInput — first 50 characters, collapsed whitespace, newlines → ' ⏎ '.
+        """
+        from textual.widgets import Static
+
+        try:
+            preview_widget = self.query_one("#last-user-preview", Static)
+        except Exception:
+            return
+        text = " ".join(message.replace("\n", " ⏎ ").split())
+        if len(text) > self._PREVIEW_MAX_CHARS:
+            text = text[: self._PREVIEW_MAX_CHARS - 1] + "…"
+        preview_widget.update(f"[dim]↳ {text}[/]" if text else "")
 
     # ── Message mount helper ─────────────────────────────────────────
 
     async def mount_message(self, widget: BaseMessage) -> None:
         assert self._messages_container is not None
+        notice: AppMessage | None = None
         if isinstance(widget, ToolCallMessage):
             self._conv_log.tool_call(widget._tool_name, widget._args)
+            if _is_memory_file_edit(widget):
+                notice = AppMessage(
+                    "Memory updated — active next session (or /reload-memory)."
+                )
         elif isinstance(widget, AssistantMessage):
             self._last_assistant_widget = widget
         await self._messages_container.mount(widget)
+        if notice is not None:
+            await self._messages_container.mount(notice)
         self._messages_container.scroll_end(animate=False)
 
     # ── Core turn ────────────────────────────────────────────────────
@@ -197,7 +336,14 @@ class KodaApp(App):
     async def _handle_user_message(self, message: str) -> None:
         self._koda_session.add_message("user", message)
         self._conv_log.user(message)
+        # Collapse the banner the first time the user sends anything so the
+        # #messages area is never squeezed out of view by the ~12-row ASCII
+        # art on short terminal windows.
+        self._chat_started = True
+        if self._banner is not None:
+            self._banner.add_class("-compact")
         await self.mount_message(UserMessage(message))
+        self._update_last_user_preview(message)
 
         # Slash command
         if message.startswith("/"):
@@ -212,7 +358,12 @@ class KodaApp(App):
 
         # Normal agent turn
         if self._adapter is None:
-            await self.mount_message(ErrorMessage("No agent attached."))
+            if self._adapter_factory is not None:
+                await self.mount_message(
+                    AppMessage("Agent still loading — give it a moment and resend.")
+                )
+            else:
+                await self.mount_message(ErrorMessage("No agent attached."))
             return
 
         self._history.append({"role": "user", "content": message})
@@ -237,6 +388,7 @@ class KodaApp(App):
         if not cmd:
             await self.mount_message(ErrorMessage("Empty shell command."))
             return
+        _log.warning("user shell exec: %s", cmd[:200])
         try:
             result = await asyncio.to_thread(
                 subprocess.run,
@@ -269,20 +421,56 @@ class KodaApp(App):
                     ErrorMessage(f"Missing credentials for {parsed.provider}")
                 )
                 return
+            # Pre-flight: probe local HTTP providers (ollama / lmstudio) so
+            # the user gets an actionable message instead of an httpx
+            # traceback on the first message after the switch.
+            reachable, hint = await asyncio.to_thread(probe_provider, parsed.provider)
+            if not reachable:
+                await self.mount_message(ErrorMessage(hint or f"{parsed.provider} is unreachable"))
+                return
+
+        # Immediate feedback — the heavy graph-compilation happens in a thread
+        # so the UI never freezes.
+        await self.mount_message(AppMessage(f"Switching to {display}…"))
+
+        factory = self._adapter_factory or _default_adapter_factory
 
         try:
-            from koda.adapters.deep import create_deep_adapter
-
-            self._adapter = create_deep_adapter(model=display, thread_id=self._thread_id)
-            self._model = display
-            if self._status_bar is not None:
-                p = parsed.provider if parsed else ""
-                m = parsed.model if parsed else display
-                self._status_bar.set_model(provider=p, model=m)
-            await self.mount_message(AppMessage(f"Switched to {display}"))
+            new_adapter = await asyncio.to_thread(
+                factory, display, self._koda_thread_id
+            )
         except Exception as e:
             _log.exception("Model switch failed")
             await self.mount_message(ErrorMessage(f"Failed to switch model: {e}"))
+            return
+
+        self._adapter = new_adapter
+        self._model = display
+        if self._status_bar is not None:
+            p = parsed.provider if parsed else ""
+            m = parsed.model if parsed else display
+            self._status_bar.set_model(provider=p, model=m)
+        await self.mount_message(AppMessage(f"Switched to {display}"))
+
+    async def reload_memory(self) -> None:
+        """Rebuild the current adapter so ``AGENTS.md`` is re-read.
+
+        Matches Claude Code's ``/clear``-to-apply pattern but scoped: only
+        the adapter is rebuilt, the conversation UI is preserved. Heavy
+        graph compilation runs in a worker thread.
+        """
+        factory = self._adapter_factory or _default_adapter_factory
+        await self.mount_message(AppMessage("Reloading memory…"))
+        try:
+            new_adapter = await asyncio.to_thread(
+                factory, self._model, self._koda_thread_id
+            )
+        except Exception as e:
+            _log.exception("Memory reload failed")
+            await self.mount_message(ErrorMessage(f"Failed to reload memory: {e}"))
+            return
+        self._adapter = new_adapter
+        await self.mount_message(AppMessage("Memory reloaded"))
 
     # ── Actions ──────────────────────────────────────────────────────
 
@@ -295,9 +483,14 @@ class KodaApp(App):
         self._koda_session = SessionTree(path=self._new_session_path())
         self._conv_log = self._new_conversation_log()
         self._last_assistant_widget = None
+        self._chat_started = False
+        if self._banner is not None:
+            self._banner.remove_class("-compact")
         if self._status_bar is not None:
             self._status_bar.reset_usage()
+        self._update_last_user_preview("")
         await self.mount_message(AppMessage("New session started"))
+        self._refresh_session_panel()
 
     @work(exclusive=True)
     async def action_open_tree(self) -> None:
@@ -334,15 +527,134 @@ class KodaApp(App):
             self._sidebar_host.remove_class("visible")
         else:
             self._sidebar_host.add_class("visible")
+            # Refresh the list when shown so newly-added sessions appear
+            try:
+                panel = self.query_one(SessionPanel)
+                panel.refresh_sessions()
+            except Exception:
+                pass
+
+    # ── Sidebar wiring ───────────────────────────────────────────────
+
+    async def on_session_panel_session_selected(
+        self, event: SessionPanel.SessionSelected
+    ) -> None:
+        """User picked an existing session — swap to it."""
+        await self._load_session(event.session_info.path)
+
+    async def on_session_panel_new_chat_requested(
+        self, _event: SessionPanel.NewChatRequested
+    ) -> None:
+        """User pressed the + New Chat button."""
+        await self.action_clear_session()
+
+    @work(exclusive=True)
+    async def on_session_panel_session_delete_requested(
+        self, event: SessionPanel.SessionDeleteRequested
+    ) -> None:
+        """User pressed Del on a session — confirm and delete."""
+        info = event.session_info
+        confirmed = await self.push_screen_wait(ConfirmDeleteScreen(info))
+        if not confirmed:
+            return
+        try:
+            info.path.unlink()
+        except OSError as e:
+            await self.mount_message(ErrorMessage(f"Failed to delete: {e}"))
+            return
+        await self.mount_message(AppMessage(f"Deleted session {info.display_time}"))
+        # If we just deleted the current session, start a fresh one
+        if info.session_id == self._koda_session.session_id:
+            await self.action_clear_session()
+        else:
+            self._refresh_session_panel()
+
+    # ── Session load / helpers ───────────────────────────────────────
+
+    async def _load_session(self, path: Path) -> None:
+        """Load a previously-saved session into the UI."""
+        assert self._messages_container is not None
+        new_tree = SessionTree(path=path)
+        self._koda_session = new_tree
+        # Rebuild message history for the agent + UI
+        for child in list(self._messages_container.children):
+            await child.remove()
+        self._history.clear()
+        self._last_assistant_widget = None
+        for entry in new_tree.get_active_path():
+            if entry.type != "message" or entry.role not in ("user", "assistant"):
+                continue
+            self._history.append({"role": entry.role, "content": entry.content})
+            if entry.role == "user":
+                await self.mount_message(UserMessage(entry.content))
+                self._update_last_user_preview(entry.content)
+            else:
+                await self.mount_message(AssistantMessage(entry.content))
+        self._conv_log = self._new_conversation_log()
+        self._refresh_session_panel()
+
+    def _refresh_session_panel(self) -> None:
+        try:
+            panel = self.query_one(SessionPanel)
+        except Exception:
+            return
+        panel.set_active_session(self._koda_session.session_id)
 
     async def action_copy_or_interrupt(self) -> None:
-        """Ctrl+C — interrupt a running turn, else exit the app."""
+        """Ctrl+C:
+          1. If the user has a mouse selection, copy it to the OS clipboard.
+             (Never interrupts in this case — selection copy must be safe.)
+          2. Otherwise, if a turn is running, interrupt it.
+          3. Otherwise, exit the app.
+        """
+        selected = self._current_selection_text()
+        if selected:
+            self._copy_to_os_clipboard(selected)
+            try:
+                self.screen.clear_selection()
+            except Exception:
+                pass
+            await self.mount_message(
+                AppMessage(f"Copied {len(selected)} char{'s' if len(selected) != 1 else ''}")
+            )
+            return
+
         if self._turn_task and not self._turn_task.done():
             if self._adapter is not None:
                 await self._adapter.interrupt()
             self._turn_task.cancel()
             return
         self.exit()
+
+    def _current_selection_text(self) -> str:
+        """Return the currently mouse-selected text across the screen, or ''."""
+        screen = getattr(self, "screen", None)
+        if screen is None:
+            return ""
+        try:
+            text = screen.get_selected_text()
+        except Exception:
+            return ""
+        return text or ""
+
+    def _copy_to_os_clipboard(self, text: str) -> None:
+        """Copy to the system clipboard.
+
+        Tries pyperclip first (works in most local terminals), then falls
+        back to Textual's OSC52 path (works over SSH into supported
+        terminals).
+        """
+        try:
+            import pyperclip
+
+            pyperclip.copy(text)
+            return
+        except Exception:
+            pass
+        try:
+            self.copy_to_clipboard(text)
+        except Exception:
+            pass
 
     def action_quit_app(self) -> None:
         """Ctrl+D — always exits."""

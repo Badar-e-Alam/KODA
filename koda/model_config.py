@@ -72,6 +72,73 @@ def has_provider_credentials(provider: str) -> bool | None:
     return bool(os.environ.get(key))
 
 
+# Local providers that speak HTTP — we can probe them before committing a
+# model switch so the user gets a clean error instead of an httpx traceback
+# surfacing mid-turn.
+_LOCAL_PROVIDER_PROBES: dict[str, tuple[str, str]] = {
+    # provider → (default_url, hint)
+    "ollama": (
+        "http://localhost:11434/api/tags",
+        "Ollama server not reachable. Start it with: ollama serve",
+    ),
+    "lmstudio": (
+        "http://localhost:1234/v1/models",
+        "LM Studio server not reachable. Start the local server in the LM Studio app.",
+    ),
+}
+
+
+def probe_provider(provider: str, timeout: float = 1.5) -> tuple[bool, str | None]:
+    """Check whether a local provider's HTTP endpoint is reachable.
+
+    Returns ``(reachable, hint_if_not)``. Non-local providers (openai,
+    anthropic, google, ...) short-circuit to ``(True, None)`` — their
+    reachability is effectively whether the API key works, and we only
+    find that out on the first request.
+
+    Ollama resolution order:
+      1. ``OLLAMA_HOST`` / ``OLLAMA_BASE_URL`` if set (accepts host:port or URL)
+      2. ``http://localhost:11434`` (default local daemon)
+      3. Ollama Cloud (``https://ollama.com``) **if ``OLLAMA_API_KEY`` is
+         set** — lets users run cloud-hosted models without a local
+         ``ollama serve`` process.
+    """
+    provider = provider.lower()
+    if provider not in _LOCAL_PROVIDER_PROBES:
+        return True, None
+
+    default_url, hint = _LOCAL_PROVIDER_PROBES[provider]
+    candidates: list[tuple[str, dict[str, str]]] = []
+
+    if provider == "ollama":
+        host = os.environ.get("OLLAMA_HOST") or os.environ.get("OLLAMA_BASE_URL")
+        if host:
+            base = host if host.startswith("http") else f"http://{host}"
+            candidates.append((f"{base.rstrip('/')}/api/tags", {}))
+        candidates.append((default_url, {}))
+        if key := os.environ.get("OLLAMA_API_KEY"):
+            candidates.append((
+                "https://ollama.com/api/tags",
+                {"Authorization": f"Bearer {key}"},
+            ))
+    else:
+        candidates.append((default_url, {}))
+
+    try:
+        import httpx
+    except ImportError:
+        return False, hint
+
+    for url, headers in candidates:
+        try:
+            resp = httpx.get(url, headers=headers, timeout=timeout)
+            if resp.status_code < 500:
+                return True, None
+        except Exception:
+            continue
+    return False, hint
+
+
 _MODELS_CACHE: tuple[float, dict[str, list[str]]] | None = None
 _MODELS_TTL = 300  # 5 minutes — the in-memory cache lifetime
 

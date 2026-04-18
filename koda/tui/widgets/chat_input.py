@@ -60,6 +60,21 @@ class ChatInput(Input):
         def control(self) -> "ChatInput":
             return self.chat_input
 
+    class SuggestionsDismissed(Message):
+        """Fired when the user dismisses the popup (escape / accept).
+
+        Lets the app restore any UI state it altered while the popup was open
+        (e.g. a collapsed banner).
+        """
+
+        def __init__(self, sender: "ChatInput") -> None:
+            super().__init__()
+            self.chat_input = sender
+
+        @property
+        def control(self) -> "ChatInput":
+            return self.chat_input
+
     def __init__(
         self,
         placeholder: str = "Ask KODA anything… (/ for commands, @ for files, ! for shell)",
@@ -68,6 +83,9 @@ class ChatInput(Input):
         self._history: list[str] = []
         self._history_idx: int | None = None
         self._popup: "SuggestionPopup | None" = None
+        # Set True around programmatic value mutations (suggestion accept) so
+        # watch_value doesn't re-fire the completer with stale cursor state.
+        self._suppress_suggestions: bool = False
 
     def attach_popup(self, popup: "SuggestionPopup") -> None:
         self._popup = popup
@@ -78,8 +96,10 @@ class ChatInput(Input):
         new_mode = _detect_mode(value)
         if new_mode != self.mode:
             self.mode = new_mode
-        # Ask the app to refresh suggestions
-        self.post_message(self.SuggestionsRequested(self, value, self.cursor_position))
+        # Ask the app to refresh suggestions — unless we're mid-accept and
+        # the cursor hasn't been moved yet (see _accept_suggestion).
+        if not self._suppress_suggestions:
+            self.post_message(self.SuggestionsRequested(self, value, self.cursor_position))
 
     def watch_mode(self, mode: str) -> None:
         for cls in ("-chat", "-shell", "-command"):
@@ -99,10 +119,11 @@ class ChatInput(Input):
                 event.prevent_default(); event.stop()
                 popup.highlight_next()
                 return
-            if event.key == "enter":
-                if self._accept_suggestion():
-                    event.prevent_default(); event.stop()
-                    return
+            # Enter is *not* intercepted — we let it reach ``action_submit``
+            # which both accepts the highlighted suggestion and (when the
+            # inserted text is a complete command, i.e. no trailing space)
+            # submits in one press. Intercepting here used to require a
+            # second Enter press, breaking /theme, /model, etc.
             if event.key == "tab":
                 event.prevent_default(); event.stop()
                 self._accept_suggestion()
@@ -110,6 +131,7 @@ class ChatInput(Input):
             if event.key == "escape":
                 event.prevent_default(); event.stop()
                 popup.clear()
+                self.post_message(self.SuggestionsDismissed(self))
                 return
         # Otherwise fall through to Input's default handler
 
@@ -139,6 +161,29 @@ class ChatInput(Input):
     def action_dismiss_popup(self) -> None:
         if self._popup is not None:
             self._popup.clear()
+
+    def action_paste(self) -> None:
+        """Ctrl+V — paste from the OS clipboard into the input at the cursor.
+
+        Overrides Input.action_paste (which only uses Textual's in-process
+        clipboard) so users can paste text copied from outside the TUI.
+        Falls back to the in-process clipboard if pyperclip is unavailable.
+        """
+        text = ""
+        try:
+            import pyperclip
+
+            text = pyperclip.paste() or ""
+        except Exception:
+            text = ""
+        if not text:
+            text = self.app.clipboard or ""
+        if not text:
+            return
+        # Collapse newlines — ChatInput is single-line
+        text = text.replace("\r\n", " ").replace("\n", " ").replace("\r", " ")
+        start, end = self.selection
+        self.replace(text, start, end)
 
     def action_accept_suggestion(self) -> None:
         self._accept_suggestion()
@@ -175,6 +220,12 @@ class ChatInput(Input):
         """Apply the currently highlighted suggestion to the input value.
 
         Returns True if a suggestion was applied.
+
+        Important: we clear the popup and set the ``_suppress_suggestions``
+        flag *before* mutating ``self.value`` — otherwise the reactive
+        ``watch_value`` fires ``SuggestionsRequested`` with the *old* cursor
+        position, and the completer re-suggests the same file/theme, so the
+        next Enter appends the suggestion again instead of submitting.
         """
         popup = self._popup
         if popup is None or not popup.is_visible:
@@ -182,20 +233,31 @@ class ChatInput(Input):
         suggestion = popup.current_selection
         if suggestion is None:
             return False
-        # Replace the currently-active completion range in the value
         replace_range = getattr(self, "_last_replace_range", None)
         if replace_range is None:
             return False
         start, end = replace_range
         value = self.value
         new_value = value[:start] + suggestion.insert + value[end:]
-        self.value = new_value
-        # Put cursor at end of inserted text
+        new_cursor = start + len(suggestion.insert)
+
+        # Silence the completer during the value+cursor update.
+        self._suppress_suggestions = True
         try:
-            self.cursor_position = start + len(suggestion.insert)
-        except Exception:
-            pass
-        popup.clear()
+            popup.clear()
+            self._last_replace_range = None
+            self.value = new_value
+            try:
+                self.cursor_position = new_cursor
+            except Exception:
+                pass
+        finally:
+            self._suppress_suggestions = False
+        # Now that cursor + value are in sync, let the completer re-evaluate
+        # against the fresh state (may legitimately open a new popup — e.g.
+        # after /theme <space>, show theme names).
+        self.post_message(self.SuggestionsRequested(self, self.value, self.cursor_position))
+        self.post_message(self.SuggestionsDismissed(self))
         return True
 
 

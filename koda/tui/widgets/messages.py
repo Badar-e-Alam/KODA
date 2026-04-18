@@ -15,9 +15,39 @@ Widgets:
 from __future__ import annotations
 
 import json
+import re
 from typing import Any
 
 from textual.widgets import Static
+
+
+# Matches both CSI (``ESC [ ... final``) and OSC (``ESC ] ... BEL``) sequences
+# plus the odd ``\x1b(B`` character-set selector some tools emit. We strip
+# these from tool output before rendering — otherwise raw cursor-up /
+# clear-line codes land in a Static widget and the terminal misinterprets
+# them on the next paint, breaking the TUI layout (e.g. `make` output
+# producing ghost-duplicated input rows).
+_ANSI_RE = re.compile(
+    r"\x1b(?:\[[0-9;?]*[ -/]*[@-~]|\][^\x07\x1b]*(?:\x07|\x1b\\)|[()][0-9A-Za-z])"
+)
+
+
+def _sanitize_tool_output(text: str) -> str:
+    """Strip ANSI escape sequences and normalize carriage returns.
+
+    - Removes color, cursor, clear, and OSC sequences.
+    - Collapses ``\\r\\n`` → ``\\n`` and drops bare ``\\r`` (progress-bar
+      artifacts — the pre-``\\r`` content is what the shell meant to
+      overwrite, so keeping only the final segment is the right call).
+    """
+    if not text:
+        return text
+    clean = _ANSI_RE.sub("", text)
+    clean = clean.replace("\r\n", "\n")
+    # For each line, keep only the part after the last \r (simulates what
+    # the user would have seen in a real terminal after progress overwrites).
+    clean = "\n".join(ln.rsplit("\r", 1)[-1] for ln in clean.split("\n"))
+    return clean
 
 
 class BaseMessage(Static):
@@ -72,7 +102,7 @@ class ToolCallMessage(BaseMessage):
         self._refresh_tool_display()
 
     def set_result(self, output: str, is_error: bool = False) -> None:
-        self._full_output = output
+        self._full_output = _sanitize_tool_output(output)
         self._is_error = is_error
         if is_error:
             self.add_class("-error")

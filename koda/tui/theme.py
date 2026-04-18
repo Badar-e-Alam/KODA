@@ -82,3 +82,35 @@ DEFAULT_THEME = "koda"
 
 def get(name: str | None) -> Palette:
     return THEMES.get(name or DEFAULT_THEME, DARK_KODA)
+
+
+def to_textual_theme(name: str):
+    """Return a textual.theme.Theme object representing one of our palettes.
+
+    Custom variables (user, tool, tool-ok, tool-err, muted, assistant) are
+    exposed via ``Theme.variables`` so the app CSS can reference them with
+    ``$user``, ``$tool``, etc.
+    """
+    from textual.theme import Theme
+
+    p = get(name)
+    return Theme(
+        name=name,
+        primary=p.primary,
+        accent=p.accent,
+        background=p.background,
+        surface=p.surface,
+        foreground=p.assistant,
+        error=p.error,
+        success=p.user,
+        warning=p.tool,
+        dark=True,
+        variables={
+            "user": p.user,
+            "tool": p.tool,
+            "tool-ok": p.tool_ok,
+            "tool-err": p.tool_err,
+            "muted": p.muted,
+            "assistant": p.assistant,
+        },
+    )

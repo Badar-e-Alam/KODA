@@ -47,7 +47,22 @@ def _resolve(p: str) -> Path:
     'foo/bar'   -> {root}/foo/bar
     """
     raw = p.lstrip("/").replace("\\", "/") if p.startswith("/") else p
-    full = (_ROOT / raw).resolve()
+    candidate = _ROOT / raw
+    # Reject symlinks along the path — resolve() would follow them out of the jail.
+    probe = candidate
+    while True:
+        if probe.is_symlink():
+            raise ValueError(f"Path traverses a symlink: {p!r}")
+        if probe == probe.parent:
+            break
+        probe = probe.parent
+        if not probe.exists():
+            continue
+        try:
+            probe.relative_to(_ROOT)
+        except ValueError:
+            break
+    full = candidate.resolve()
     try:
         full.relative_to(_ROOT)
     except ValueError as e:

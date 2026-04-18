@@ -48,6 +48,36 @@ def _ensure_agents_md(workspace: Path) -> None:
     )
 
 
+def _resolve_model(model: str):
+    """Return a chat-model instance ready for ``create_deep_agent``.
+
+    Special case: ``ollama:*`` with ``OLLAMA_API_KEY`` set and no explicit
+    ``OLLAMA_HOST`` → route to Ollama Cloud (``https://ollama.com``) with
+    the required ``Authorization: Bearer`` header. For any other provider
+    (openai, anthropic, google, local ollama, ...) we pass the string
+    through to ``init_chat_model`` unchanged.
+    """
+    if not model.lower().startswith("ollama:"):
+        return model  # create_deep_agent will call init_chat_model itself
+
+    key = os.environ.get("OLLAMA_API_KEY")
+    host = os.environ.get("OLLAMA_HOST") or os.environ.get("OLLAMA_BASE_URL")
+    if not key or host:
+        return model  # local daemon (or user-pinned host) — default path
+
+    try:
+        from langchain_ollama import ChatOllama
+    except ImportError:
+        return model  # graceful fallback; init_chat_model will error clearly
+
+    _, _, name = model.partition(":")
+    return ChatOllama(
+        model=name,
+        base_url="https://ollama.com",
+        client_kwargs={"headers": {"Authorization": f"Bearer {key}"}},
+    )
+
+
 def build(
     model: str = DEFAULT_MODEL,
     workspace: str | Path | None = None,
@@ -79,7 +109,7 @@ def build(
     skill_paths = discover_skills(ws)
 
     return create_deep_agent(
-        model=model,
+        model=_resolve_model(model),
         tools=list(ALL_TOOLS),
         system_prompt=build_prompt(ws),
         # virtual_mode=True: "/" is the workspace root, so skill paths like

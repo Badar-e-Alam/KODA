@@ -64,11 +64,15 @@ def complete(
 
 
 def _complete_themes(fragment: str) -> list[Suggestion]:
+    """Theme names. The replace_range for `/theme ` completions covers only
+    the argument (from index 7 onwards), so ``insert`` must be the bare name
+    — prepending "/theme " would duplicate the prefix.
+    """
     from koda.tui.theme import THEMES
 
     frag = fragment.lower()
     return [
-        Suggestion(insert=f"/theme {name}", label=name, description="theme")
+        Suggestion(insert=name, label=name, description="theme")
         for name in sorted(THEMES.keys())
         if frag in name.lower()
     ]
@@ -101,6 +105,10 @@ def _complete_commands(fragment: str) -> list[Suggestion]:
 # ── Model completion ───────────────────────────────────────────────
 
 def _complete_models(fragment: str) -> list[Suggestion]:
+    """``provider:model`` suggestions. As with /theme, replace_range starts at
+    7 (past "/model "), so ``insert`` must not include that prefix — otherwise
+    it gets duplicated into "/model /model provider:model".
+    """
     from koda.model_config import get_available_models
 
     frag = fragment.lower()
@@ -115,7 +123,7 @@ def _complete_models(fragment: str) -> list[Suggestion]:
             full = f"{provider}:{m}"
             if frag in full.lower():
                 out.append(
-                    Suggestion(insert=f"/model {full}", label=full, description=provider)
+                    Suggestion(insert=full, label=full, description=provider)
                 )
     return out[:60]
 
@@ -123,13 +131,31 @@ def _complete_models(fragment: str) -> list[Suggestion]:
 # ── File completion ────────────────────────────────────────────────
 
 _FILES_CACHE: list[str] = []
+# Directories we never descend into for the os.walk fallback
+_IGNORE_DIRS = {
+    ".git", ".hg", ".svn", "node_modules", "__pycache__", ".venv", "venv",
+    ".mypy_cache", ".pytest_cache", ".ruff_cache", ".tox", "dist", "build",
+    ".idea", ".vscode", ".DS_Store", "target", ".next", ".cache",
+}
+_MAX_WALK_FILES = 5000
 
 
 def _all_files() -> list[str]:
-    """Return tracked + untracked files via git (cheap, excludes .gitignore)."""
+    """Tracked + untracked files via git, or a pruned os.walk fallback.
+
+    Result is cached process-wide; call ``invalidate_files_cache()`` to refresh.
+    """
     global _FILES_CACHE
     if _FILES_CACHE:
         return _FILES_CACHE
+    files = _git_ls_files()
+    if not files:
+        files = _walk_files()
+    _FILES_CACHE = files
+    return files
+
+
+def _git_ls_files() -> list[str]:
     try:
         result = subprocess.run(
             ["git", "ls-files", "--cached", "--others", "--exclude-standard"],
@@ -138,12 +164,28 @@ def _all_files() -> list[str]:
             timeout=5,
             check=False,
         )
-        files = [f for f in result.stdout.splitlines() if f]
+        if result.returncode != 0:
+            return []
+        return [f for f in result.stdout.splitlines() if f]
     except Exception as e:
-        _log.warning("git ls-files failed: %s", e)
-        files = []
-    _FILES_CACHE = files
-    return files
+        _log.debug("git ls-files unavailable: %s", e)
+        return []
+
+
+def _walk_files() -> list[str]:
+    """Fallback: walk the CWD with ignore-dir pruning, capped at _MAX_WALK_FILES."""
+    import os
+
+    root = os.getcwd()
+    out: list[str] = []
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames[:] = [d for d in dirnames if d not in _IGNORE_DIRS]
+        for fn in filenames:
+            rel = os.path.relpath(os.path.join(dirpath, fn), root)
+            out.append(rel.replace(os.sep, "/"))
+            if len(out) >= _MAX_WALK_FILES:
+                return out
+    return out
 
 
 def invalidate_files_cache() -> None:
@@ -168,8 +210,11 @@ def _complete_files(fragment: str) -> list[Suggestion]:
         elif frag in path:
             scored.append((2, f))
     scored.sort()
+    # No trailing space: a file ref is self-contained, so a single Enter
+    # submits the message. Users who want multiple @refs can type a space
+    # themselves between them.
     return [
-        Suggestion(insert=f"@{path} ", label=path, description="")
+        Suggestion(insert=f"@{path}", label=path, description="")
         for _, path in scored[:40]
     ]
 

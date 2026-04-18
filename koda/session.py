@@ -19,6 +19,7 @@ Each line in the JSONL file is a SessionEntry with:
 from __future__ import annotations
 
 import json
+import os
 import uuid
 from dataclasses import asdict, dataclass, field
 from datetime import datetime
@@ -265,8 +266,14 @@ class SessionTree:
 
     def _save_entry(self, entry: SessionEntry) -> None:
         if self._path:
+            existed = self._path.exists()
             with open(self._path, "a", encoding="utf-8") as f:
                 f.write(entry.to_json() + "\n")
+            if not existed:
+                try:
+                    os.chmod(self._path, 0o600)
+                except OSError:
+                    pass
 
     def _load(self) -> None:
         if not self._path or not self._path.exists():

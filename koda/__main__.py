@@ -43,35 +43,38 @@ def _default_model() -> str:
     return "anthropic:claude-sonnet-4-6"
 
 
-def _load_adapter(spec: str, model: str, thread_id: str):
-    """
-    Load an agent adapter (KodaAgent).
+def _build_adapter_factory(spec: str):
+    """Return a callable ``factory(model, thread_id) -> KodaAgent``.
 
-    Resolution:
+    Resolution rules (same as before, but reusable across /model switches):
       "deep"                    -> KODA built-in deep adapter
       "module.path.ClassName"   -> custom factory that returns a KodaAgent
                                    (or a raw LangGraph graph — auto-wrapped)
     """
     if spec == "deep":
         from koda.adapters.deep import create_deep_adapter
-        return create_deep_adapter(model=model, thread_id=thread_id)
+        return lambda model, thread_id: create_deep_adapter(
+            model=model, thread_id=thread_id
+        )
 
     if "." in spec:
         module_path, class_name = spec.rsplit(".", 1)
         try:
             module = importlib.import_module(module_path)
-            factory = getattr(module, class_name)
-            result = factory(model=model)
+            user_factory = getattr(module, class_name)
         except (ImportError, AttributeError) as exc:
             print(f"Error loading agent '{spec}': {exc}", file=sys.stderr)
             sys.exit(1)
 
-        # Accept both: a KodaAgent or a raw LangGraph graph
-        from koda.agent_api import KodaAgent
-        if isinstance(result, KodaAgent):
-            return result
-        from koda.adapters.langgraph import LangGraphAdapter
-        return LangGraphAdapter(graph=result, model=model, thread_id=thread_id)
+        def factory(model: str, thread_id: str):
+            result = user_factory(model=model)
+            from koda.agent_api import KodaAgent
+            if isinstance(result, KodaAgent):
+                return result
+            from koda.adapters.langgraph import LangGraphAdapter
+            return LangGraphAdapter(graph=result, model=model, thread_id=thread_id)
+
+        return factory
 
     print(f"Unknown agent: '{spec}'", file=sys.stderr)
     print(
@@ -81,6 +84,11 @@ def _load_adapter(spec: str, model: str, thread_id: str):
         file=sys.stderr,
     )
     sys.exit(1)
+
+
+def _load_adapter(spec: str, model: str, thread_id: str):
+    """Build the initial adapter. See ``_build_adapter_factory`` for details."""
+    return _build_adapter_factory(spec)(model, thread_id)
 
 
 def _setup_logging() -> str:
@@ -135,23 +143,43 @@ def main() -> None:
 
     _setup_logging()
 
+    # Warm provider model lists in the background so /model is instant.
+    # Kicked off before building the (potentially slow) first adapter,
+    # so by the time the user reaches the TUI the cache is usually ready.
+    try:
+        from koda.model_config import warm_cache_in_background
+
+        warm_cache_in_background()
+    except Exception:
+        pass  # non-fatal — /model will still work off fallback lists
+
     import uuid
     thread_id = uuid.uuid4().hex
     model = args.model or _default_model()
-    adapter = _load_adapter(args.agent, model=model, thread_id=thread_id)
+    # Build the factory eagerly (cheap — just resolves a callable) but defer
+    # the expensive ``factory(model, thread_id)`` call into a background
+    # thread on TUI mount, so the user sees the KODA banner within ~1 s even
+    # when langchain + langgraph imports take 3–4 s to warm up.
+    factory = _build_adapter_factory(args.agent)
 
     import logging
-    logging.getLogger("koda").info("Adapter loaded: %s, model: %s", args.agent, model)
+    logging.getLogger("koda").info("Starting KODA: agent=%s model=%s", args.agent, model)
 
     import asyncio
-    asyncio.run(_run_app(adapter=adapter, model=model, thread_id=thread_id, auto_approve=args.auto_approve))
+    asyncio.run(_run_app(
+        factory=factory,
+        model=model,
+        thread_id=thread_id,
+        auto_approve=args.auto_approve,
+    ))
 
 
-async def _run_app(*, adapter, model: str, thread_id: str, auto_approve: bool = False) -> None:
+async def _run_app(*, factory, model: str, thread_id: str, auto_approve: bool = False) -> None:
     from koda.tui.app import KodaApp
 
     app = KodaApp(
-        adapter=adapter,
+        adapter=None,  # built lazily in KodaApp.on_mount
+        adapter_factory=factory,
         model=model,
         thread_id=thread_id,
         auto_approve=auto_approve,

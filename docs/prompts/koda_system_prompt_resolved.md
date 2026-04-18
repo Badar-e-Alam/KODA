@@ -64,7 +64,7 @@ Environment:
 - Date/time: 2026-04-15 18:30:00
 - OS: Windows 10.0.26200
 - Python: 3.13.2
-- Working directory: C:\Users\badar\Desktop\KODA
+- Working directory: &lt;project-root&gt;
 
 When given a task:
 1. Understand first — read relevant files, check existing patterns
@@ -91,7 +91,7 @@ When a skill file references a relative path, resolve it against the skill direc
   <skill>
     <name>skill-creator</name>
     <description>Create new KODA skills, modify existing skills, and validate skill structure. Use when the user wants to add a new skill, update a skill, or inspect the skills directory.</description>
-    <location>C:/Users/badar/Desktop/KODA/agent_workspace/skills/skill-creator/SKILL.md</location>
+    <location>&lt;project-root&gt;/agent_workspace/skills/skill-creator/SKILL.md</location>
   </skill>
 </available_skills>
 ```
