@@ -12,7 +12,7 @@
 </div>
 
 <p align="center">
-  <img src="assets/koda_demo.png" alt="KODA — banner, user prompt, streamed tool calls (web_search, read_webpage), agent answer, input bar + status" width="900">
+  <img src="assets/koda_demo.gif" alt="KODA in action — banner, user prompt, streamed web_search + read_webpage tool calls, agent answer, live status bar" width="900">
 </p>
 
 ---
