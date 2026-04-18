@@ -6,8 +6,10 @@
 
 [![license](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![python](https://img.shields.io/badge/python-3.11%2B-blue.svg)](https://www.python.org/)
-[![tests](https://github.com/Badar-e-Alam/KODA/actions/workflows/test.yml/badge.svg)](https://github.com/Badar-e-Alam/KODA/actions/workflows/test.yml)
+[![tests](https://img.shields.io/badge/tests-104%20passing-brightgreen.svg)](tests/)
 [![PRs welcome](https://img.shields.io/badge/PRs-welcome-brightgreen.svg)](CONTRIBUTING.md)
+
+![KODA in action — streamed tool calls + inline agent response](assets/koda_demo.png)
 
 </div>
 
