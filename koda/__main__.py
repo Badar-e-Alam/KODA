@@ -133,8 +133,8 @@ def main() -> None:
     )
     parser.add_argument(
         "--agent", "-a",
-        default="deep",
-        help="Agent backend: 'deep' (default), 'coding_agent', or 'module.ClassName'",
+        default="coding_agent",
+        help="Agent backend: 'coding_agent' (default), 'deep', or 'module.ClassName'",
     )
     parser.add_argument(
         "--model", "-m",
