@@ -57,6 +57,12 @@ def _build_adapter_factory(spec: str):
             model=model, thread_id=thread_id
         )
 
+    if spec == "coding_agent":
+        from koda.adapters.coding_agent import create_coding_agent_adapter
+        return lambda model, thread_id: create_coding_agent_adapter(
+            model=model, thread_id=thread_id
+        )
+
     if "." in spec:
         module_path, class_name = spec.rsplit(".", 1)
         try:
@@ -80,6 +86,7 @@ def _build_adapter_factory(spec: str):
     print(
         "Options:\n"
         "  deep                    KODA built-in deep adapter (default)\n"
+        "  coding_agent            OpenAI-Agents-SDK coding agent (coding_agent/)\n"
         "  module.ClassName        Custom factory returning a KodaAgent",
         file=sys.stderr,
     )
@@ -127,7 +134,7 @@ def main() -> None:
     parser.add_argument(
         "--agent", "-a",
         default="deep",
-        help="Agent backend: 'deep' (default) or 'module.ClassName'",
+        help="Agent backend: 'deep' (default), 'coding_agent', or 'module.ClassName'",
     )
     parser.add_argument(
         "--model", "-m",
