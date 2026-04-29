@@ -34,6 +34,11 @@ _log = logging.getLogger("koda.adapters.coding_agent")
 _PROJECT_ROOT = Path(__file__).resolve().parents[2]
 _AGENT_DIR = _PROJECT_ROOT / "coding_agent"
 
+# Tunables (env-overridable).
+_MAX_TURNS = int(os.getenv("KODA_CODING_AGENT_MAX_TURNS", "200"))
+_COMPACT_THRESHOLD_TOKENS = int(os.getenv("KODA_CODING_AGENT_COMPACT_TOKENS", "80000"))
+_KEEP_RECENT = int(os.getenv("KODA_CODING_AGENT_KEEP_RECENT", "6"))
+
 
 def _ensure_agent_importable() -> None:
     """The user's ``coding_agent/`` folder uses script-style imports
@@ -44,6 +49,52 @@ def _ensure_agent_importable() -> None:
         sys.path.insert(0, p)
 
 
+def _estimate_tokens(messages: list[dict[str, Any]]) -> int:
+    """Cheap char/4 heuristic — avoids pulling in tiktoken."""
+    total = 0
+    for m in messages:
+        c = m.get("content", "")
+        if isinstance(c, str):
+            total += len(c) // 4
+    return total
+
+
+async def _maybe_compact(
+    sdk_input: list[dict[str, Any]],
+    summarizer_model: str,
+) -> list[dict[str, Any]]:
+    """Summarize old turns when sdk_input exceeds the token threshold.
+
+    Keeps the last ``_KEEP_RECENT`` messages verbatim and replaces everything
+    before them with one ``system`` message containing a summary. The OpenAI
+    Agents SDK does not auto-compact, so we do it here before each run.
+    """
+    if _estimate_tokens(sdk_input) <= _COMPACT_THRESHOLD_TOKENS:
+        return sdk_input
+    if len(sdk_input) <= _KEEP_RECENT + 1:
+        return sdk_input
+
+    head = sdk_input[:-_KEEP_RECENT]
+    tail = sdk_input[-_KEEP_RECENT:]
+
+    try:
+        from koda.summarizer import summarize_messages
+        summary = await summarize_messages(head, summarizer_model)
+    except Exception as e:
+        _log.warning("auto-compact failed (%s) — running without compaction", e)
+        return sdk_input
+
+    _log.info(
+        "compacted %d earlier messages (~%d tokens) into a summary",
+        len(head),
+        _estimate_tokens(head),
+    )
+    return [
+        {"role": "system", "content": f"[Earlier conversation summary]\n{summary}"},
+        *tail,
+    ]
+
+
 class CodingAgentAdapter(BaseAdapter):
     """Wraps the OpenAI-Agents-SDK ``coding_agent`` for KODA."""
 
@@ -52,12 +103,15 @@ class CodingAgentAdapter(BaseAdapter):
         _ensure_agent_importable()
 
         from agent import coding_agent  # type: ignore
-        from tools import set_approval_mode  # type: ignore
 
-        # Under KODA the TUI owns stdin, so the agent's interactive approval
-        # prompt (asyncio.to_thread(input, ...)) would hang the run. KODA is
-        # already the trust boundary for this session, so auto-approve here.
-        set_approval_mode("yolo")
+        # Best-effort: if tools.py exposes an approval-mode toggle, force
+        # auto-approve so the TUI doesn't deadlock on stdin prompts. Older
+        # versions of tools.py shipped this; current versions don't.
+        try:
+            from tools import set_approval_mode  # type: ignore
+            set_approval_mode("yolo")
+        except ImportError:
+            pass
 
         # The agent is built on the OpenAI Agents SDK and its model field expects
         # a bare OpenAI model name (e.g. "gpt-4o"). If the user passed an OpenAI
@@ -97,7 +151,11 @@ class CodingAgentAdapter(BaseAdapter):
                 sdk_input.append({"role": role, "content": content})
         sdk_input.append({"role": "user", "content": message})
 
-        result = Runner.run_streamed(self._agent, sdk_input, max_turns=50)
+        # Auto-compact when history grows past the threshold. The OpenAI Agents
+        # SDK has no built-in compaction, so we summarize old turns ourselves.
+        sdk_input = await _maybe_compact(sdk_input, self._reported_model)
+
+        result = Runner.run_streamed(self._agent, sdk_input, max_turns=_MAX_TURNS)
         self._stream_handle = result
 
         try:
