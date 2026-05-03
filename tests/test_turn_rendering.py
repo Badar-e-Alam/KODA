@@ -32,6 +32,17 @@ from koda.tui.widgets.messages import (
 )
 
 
+def _plain(rendered) -> str:
+    """Extract plain text from a widget's ``render()`` result.
+
+    Textual 1.0 wraps the renderable in a ``RichVisual``; unwrap to the
+    inner renderable and read ``.plain``. See test_last_user_preview.py
+    for the full rationale.
+    """
+    inner = getattr(rendered, "_renderable", rendered)
+    return getattr(inner, "plain", str(inner))
+
+
 class _FakeAgent(KodaAgent):
     """Canned-event stand-in so the TUI doesn't hit a real LLM."""
 
@@ -99,7 +110,7 @@ async def test_user_tool_and_assistant_all_visible():
         # Assistant bubble — FULL text, not truncated
         assistant_widgets = list(app.query(AssistantMessage))
         assert len(assistant_widgets) == 1
-        assert str(assistant_widgets[0].render()).strip() == _ASSISTANT_FULL
+        assert _plain(assistant_widgets[0].render()).strip() == _ASSISTANT_FULL
 
 
 @pytest.mark.asyncio

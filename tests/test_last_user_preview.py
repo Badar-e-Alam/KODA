@@ -17,13 +17,26 @@ from textual.widgets import Static
 from koda.tui.app import KodaApp
 
 
+def _plain(rendered) -> str:
+    """Extract plain text from a widget's ``render()`` result.
+
+    Textual 1.0 wraps the renderable in a ``RichVisual`` whose ``str()`` is a
+    debug repr (``RichVisual(Static(...), <text 'foo' [] ''>)``) rather than
+    the underlying text. Unwrap to the inner renderable, then ``.plain``.
+    Older Textual versions return the renderable directly, so the unwrap is a
+    no-op there.
+    """
+    inner = getattr(rendered, "_renderable", rendered)
+    return getattr(inner, "plain", str(inner))
+
+
 @pytest.mark.asyncio
 async def test_preview_empty_before_any_message():
     async with KodaApp().run_test() as pilot:
         app: KodaApp = pilot.app  # type: ignore[assignment]
         await pilot.pause()
         w = app.query_one("#last-user-preview", Static)
-        assert str(w.render()).strip() == ""
+        assert _plain(w.render()).strip() == ""
 
 
 @pytest.mark.asyncio
@@ -56,7 +69,7 @@ async def test_preview_truncates_at_50_chars():
         await pilot.pause()
 
         w = app.query_one("#last-user-preview", Static)
-        text = str(w.render())
+        text = _plain(w.render())
         # Strip the decorative prefix ("↳ ") to measure just the message slice
         after_arrow = text.split(" ", 1)[-1] if " " in text else text
         # Message portion must be at most 50 chars (49 As + ellipsis)

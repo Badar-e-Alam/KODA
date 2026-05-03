@@ -494,17 +494,141 @@ class KodaApp(App):
 
     @work(exclusive=True)
     async def action_open_tree(self) -> None:
-        """Open the session tree modal. Runs in a worker for push_screen_wait."""
+        """Open the session tree, then truncate history to the picked node.
+
+        Two-step modal:
+          1. TreeScreen → user picks a target node
+          2. CompressionChoiceScreen → compress (summarize) or keep full
+
+        After the user confirms, the active path is moved to ``target_id``,
+        ``self._history`` is rebuilt from ``get_messages_for_agent()`` so the
+        next agent turn only sees messages up to that point, and the adapter
+        is reset so any cross-turn state (e.g. LangGraph's checkpointer) is
+        forgotten.
+        """
         has_messages = any(
             e.type == "message" for e in self._koda_session.entries.values()
         )
         if not has_messages:
             await self.mount_message(AppMessage("No messages yet — tree is empty"))
             return
-        from koda.tree_widget import TreeScreen
+        from koda.tree_widget import CompressionChoiceScreen, TreeScreen
 
-        screen = TreeScreen(self._koda_session)
-        await self.push_screen_wait(screen)
+        target_id = await self.push_screen_wait(TreeScreen(self._koda_session))
+        if not target_id:
+            return
+        if target_id == self._koda_session.leaf_id:
+            await self.mount_message(
+                AppMessage("Already on the selected node — nothing to do.")
+            )
+            return
+
+        target_entry = self._koda_session.entries.get(target_id)
+        if target_entry is None:
+            return
+        preview = (target_entry.content or "").replace("\n", " ").strip()
+        if len(preview) > 60:
+            preview = preview[:57] + "..."
+
+        mode = await self.push_screen_wait(CompressionChoiceScreen(preview))
+        if mode not in ("compress", "keep"):
+            return
+
+        await self._jump_to_node(target_id, mode)
+
+    async def _jump_to_node(self, target_id: str, mode: str) -> None:
+        """Move the active leaf to ``target_id`` and resync UI + adapter.
+
+        ``mode`` is ``"compress"`` (summarize the path up to target into one
+        system message) or ``"keep"`` (send the full path up to target).
+        """
+        assert self._messages_container is not None
+        session = self._koda_session
+
+        session.navigate_to(target_id)
+
+        if mode == "compress":
+            messages_to_compress = session.get_messages_for_agent()
+            if messages_to_compress:
+                await self.mount_message(AppMessage("Summarizing previous memory…"))
+                try:
+                    from koda.summarizer import summarize_messages
+
+                    summary = await summarize_messages(
+                        messages_to_compress, self._model
+                    )
+                except Exception as e:
+                    _log.exception("tree-jump compaction failed")
+                    await self.mount_message(
+                        ErrorMessage(f"Compaction failed: {e} — keeping full history.")
+                    )
+                else:
+                    session.add_compaction(
+                        summary=summary,
+                        source_message_count=len(messages_to_compress),
+                    )
+
+        # Rebuild the agent-facing history from the (possibly compacted) active path.
+        self._history = list(session.get_messages_for_agent())
+
+        # Repaint the messages area to mirror the active path. Walk the path
+        # directly so we can render a marker for the compaction node instead
+        # of leaving the user staring at the pre-jump UI.
+        for child in list(self._messages_container.children):
+            await child.remove()
+        self._last_assistant_widget = None
+        for entry in session.get_active_path():
+            if entry.type == "compaction":
+                await self.mount_message(
+                    AppMessage(
+                        f"[Earlier conversation summarized — "
+                        f"{entry.metadata.get('source_message_count', 0)} messages compacted]"
+                    )
+                )
+                continue
+            if entry.type != "message" or entry.role not in ("user", "assistant"):
+                continue
+            if entry.role == "user":
+                await self.mount_message(UserMessage(entry.content))
+                self._update_last_user_preview(entry.content)
+            else:
+                await self.mount_message(AssistantMessage(entry.content))
+
+        # Forget cross-turn state on the adapter so it doesn't replay the
+        # abandoned branch from its own cache (LangGraph checkpointer).
+        if self._adapter is not None:
+            try:
+                new_thread = uuid.uuid4().hex
+                self._adapter.reset_history(new_thread)
+                self._koda_thread_id = new_thread
+            except AttributeError:
+                # Older adapters predate reset_history — best-effort, skip.
+                pass
+
+        self._conv_log = self._new_conversation_log()
+        await self.mount_message(
+            AppMessage(
+                f"Jumped to selected node ({mode}). "
+                f"Next message will see {len(self._history)} prior message(s)."
+            )
+        )
+
+    @work(exclusive=True)
+    async def action_open_model_picker(self) -> None:
+        """Open the model picker modal. Runs in a worker for push_screen_wait.
+
+        Called by ``/model`` with no arguments. On selection, switches to the
+        picked ``provider:model`` via ``switch_model``.
+        """
+        from koda.tui.model_picker import ModelPickerScreen
+
+        picked = await self.push_screen_wait(ModelPickerScreen(current=self._model))
+        if not picked:
+            return
+        if picked == self._model:
+            await self.mount_message(AppMessage(f"Already on {picked}"))
+            return
+        await self.switch_model(picked)
 
     async def action_yank_last(self) -> None:
         if self._last_assistant_widget is None:
@@ -627,7 +751,13 @@ class KodaApp(App):
         self.exit()
 
     def _current_selection_text(self) -> str:
-        """Return the currently mouse-selected text across the screen, or ''."""
+        """Return the currently mouse-selected text across the screen, or ''.
+
+        Textual 1.0 dropped ``Screen.get_selected_text``; the AttributeError
+        is caught below so Ctrl+C-with-selection silently degrades to the
+        interrupt/exit path. Replace with a 1.0-compatible selection source
+        when one becomes available.
+        """
         screen = getattr(self, "screen", None)
         if screen is None:
             return ""

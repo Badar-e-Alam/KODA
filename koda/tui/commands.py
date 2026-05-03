@@ -46,7 +46,7 @@ async def _clear(app: "KodaApp", _args: str) -> bool:
 
 async def _model(app: "KodaApp", args: str) -> bool:
     if not args:
-        await app.mount_message(AppMessage(f"Current model: {app._model}"))
+        app.action_open_model_picker()
         return True
     await app.switch_model(args)
     return True

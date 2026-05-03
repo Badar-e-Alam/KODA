@@ -30,8 +30,16 @@ def _load_dotenv() -> None:
 
 
 def _default_model() -> str:
-    """Pick a default model from available API keys."""
+    """Pick a default model.
+
+    ``KODA_DEFAULT_MODEL`` (env or .env) wins if set — that's the per-user /
+    per-project override. Otherwise fall back to the first provider with an
+    API key configured.
+    """
     _load_dotenv()
+    override = os.environ.get("KODA_DEFAULT_MODEL")
+    if override:
+        return override
     if os.environ.get("ANTHROPIC_API_KEY"):
         return "anthropic:claude-sonnet-4-6"
     if os.environ.get("OPENAI_API_KEY"):

@@ -51,6 +51,13 @@ class LangGraphAdapter(BaseAdapter):
             _extract_tool_end,
         )
 
+    def reset_history(self, thread_id: str | None = None) -> None:
+        """Rotate the thread_id and re-arm the one-shot seeder so the next
+        turn ignores the old checkpointer state and re-seeds from the
+        truncated history we hand it."""
+        super().reset_history(thread_id or uuid.uuid4().hex)
+        self._seeded = False
+
     async def _native_stream(
         self, message: str, history: list[dict[str, Any]]
     ) -> AsyncIterator[dict[str, Any]]:

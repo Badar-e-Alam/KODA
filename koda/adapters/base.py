@@ -80,6 +80,18 @@ class BaseAdapter(KodaAgent):
     async def interrupt(self) -> None:
         self._cancel.set()
 
+    def reset_history(self, thread_id: str | None = None) -> None:
+        """Drop any cross-turn state so the next ``stream()`` call starts
+        fresh from the ``history`` argument alone.
+
+        Default is a no-op: stateless adapters (coding_agent, anthropic)
+        already redrive themselves from the per-turn ``history``. Adapters
+        that keep state across turns (LangGraph's checkpointer) override
+        this to forget the abandoned branch.
+        """
+        if thread_id is not None:
+            self._thread_id = thread_id
+
     async def stream(
         self, message: str, history: list[dict[str, Any]]
     ) -> AsyncIterator[AgentEvent]:

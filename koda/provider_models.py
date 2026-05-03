@@ -119,7 +119,11 @@ PROVIDERS: dict[str, ProviderSpec] = {
         needs_key=False,
         cloud_url="https://ollama.com",
         cloud_env_urls=("OLLAMA_CLOUD_HOST",),
-        cloud_needs_key=True,
+        # /api/tags on ollama.com is public — listing the cloud catalog is
+        # useful for discovery even without an API key. Running these models
+        # (kimi-k2.5, minimax-m2.7, deepseek-v4-pro, qwen3-coder:480b, …)
+        # still requires OLLAMA_API_KEY at request time.
+        cloud_needs_key=False,
     ),
     "lmstudio": ProviderSpec(
         name="lmstudio",
@@ -250,27 +254,39 @@ def _try_fetch(spec: ProviderSpec, url: str) -> list[str] | None:
 
 
 def _fetch(spec: ProviderSpec) -> list[str] | None:
-    """Try primary, then cloud fallback (if configured). Returns None on all failures."""
-    have_key = bool(spec.auth_env and os.environ.get(spec.auth_env))
+    """Hit primary AND cloud (if configured) and merge the catalogs.
 
-    # Primary: skip only if the provider strictly needs a key we don't have
+    Returns the union of model names from whichever endpoints respond, or
+    None if every endpoint failed. Cloud is no longer a strict fallback —
+    when both local Ollama and Ollama Cloud are reachable, the picker
+    shows everything from both.
+    """
+    have_key = bool(spec.auth_env and os.environ.get(spec.auth_env))
+    merged: set[str] = set()
+    any_ok = False
+
+    # Primary
     primary_url = f"{_resolve_url(spec)}{spec.endpoint}"
     if not (spec.needs_key and spec.auth_env and not have_key):
         live = _try_fetch(spec, primary_url)
         if live is not None:
-            return live
+            merged.update(live)
+            any_ok = True
 
-    # Cloud fallback
+    # Cloud
     cloud_base = _resolve_cloud_url(spec)
-    if cloud_base is None:
+    if cloud_base is not None:
+        cloud_url = f"{cloud_base}{spec.endpoint}"
+        if cloud_url != primary_url and (have_key or not spec.cloud_needs_key):
+            _log.debug("%s trying cloud: %s", spec.name, cloud_url)
+            live = _try_fetch(spec, cloud_url)
+            if live is not None:
+                merged.update(live)
+                any_ok = True
+
+    if not any_ok:
         return None
-    cloud_url = f"{cloud_base}{spec.endpoint}"
-    if cloud_url == primary_url:
-        return None
-    if spec.cloud_needs_key and not have_key:
-        return None
-    _log.debug("%s trying cloud fallback: %s", spec.name, cloud_url)
-    return _try_fetch(spec, cloud_url)
+    return sorted(merged)
 
 
 def get_models(provider: str) -> list[str]:
