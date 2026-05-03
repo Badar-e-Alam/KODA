@@ -1,0 +1,12 @@
+The module `temperature.py` has three functions but no tests. Write a test
+file `test_temperature.py` that thoroughly tests these functions, including
+edge cases and error conditions.
+
+Your tests must:
+  - Be in a file named test_temperature.py
+  - Achieve at least 90% line coverage of temperature.py
+  - All pass when run with `pytest`
+  - Test both happy paths and error handling
+
+You can run `pytest --cov=temperature --cov-report=term-missing test_temperature.py`
+to check your coverage.

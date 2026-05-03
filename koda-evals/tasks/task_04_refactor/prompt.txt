@@ -1,0 +1,8 @@
+The file `report.py` has three functions that all build CSV rows the same way
+(opening a file, writing a header, writing rows, closing). This duplication
+makes the module hard to maintain.
+
+Refactor to remove the duplication. Extract a helper called `_write_csv(path, header, rows)`
+and use it in all three functions. The public API and behavior must not change.
+
+All existing tests in test_report.py must still pass.

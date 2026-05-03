@@ -1,0 +1,13 @@
+There are 20 Python modules under `./api/` named `file_01.py` through
+`file_20.py`. Each module's docstring describes what resource it handles
+and which downstream service it integrates with.
+
+Read EVERY file with `read_file` and produce `./audit.md` with one
+bullet per file in this format:
+
+  - file_NN.py: <one-line summary mentioning the resource and the backend service>
+
+There must be exactly 20 bullets in audit.md when you're done — one for
+every file in `./api/`. Open each file with `read_file` (do NOT use
+`grep` or `glob_files` to short-circuit). After reading all files, write
+the final `audit.md` once with all 20 bullets.

@@ -1,0 +1,8 @@
+The function `find_duplicates(items)` in `dedup.py` is too slow. The current
+implementation is O(n²) and times out on large inputs.
+
+Rewrite it to be O(n) on average. The function must keep the same behavior
+and signature: given a list, return the set of items that appear more than once.
+
+The test suite includes a stress test with 100k items that must complete in
+under 2 seconds.

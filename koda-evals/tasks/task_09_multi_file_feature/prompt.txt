@@ -1,0 +1,16 @@
+This is a small Flask-style "todo" app split across three files: a model
+(`models.py`), routes (`app.py`), and tests (`test_app.py`).
+
+Add a new endpoint that lets users mark a todo as completed:
+
+    POST /todos/<id>/complete
+
+It should:
+  - Set `completed=True` on the todo
+  - Return JSON {"id": <id>, "completed": true} with status 200
+  - Return {"error": "not found"} with status 404 if the id doesn't exist
+  - The Todo model needs a new method `mark_completed()` for this
+  - Existing endpoints and tests must continue to work
+
+This requires editing models.py AND app.py. New tests for the endpoint are
+already in test_app.py.

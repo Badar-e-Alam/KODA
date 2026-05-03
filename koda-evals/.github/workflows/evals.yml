@@ -1,0 +1,129 @@
+name: KODA Coding Agent Evals
+
+on:
+  pull_request:
+    branches: [main, coding_agent]
+  push:
+    branches: [main, coding_agent]
+  workflow_dispatch:
+    inputs:
+      run_name:
+        description: 'Langfuse run name (optional)'
+        required: false
+      model:
+        description: 'KODA model spec (e.g. openai:gpt-4o-mini)'
+        required: false
+        default: 'openai:gpt-4o-mini'
+
+jobs:
+  evals:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      contents: read
+      pull-requests: write
+
+    # Run against multiple models to catch model-specific regressions.
+    # Comment out entries to save CI minutes/cost.
+    strategy:
+      fail-fast: false
+      matrix:
+        model:
+          - openai:gpt-4o-mini       # cheap baseline
+          # - openai:gpt-4o          # frontier
+          # - ollama:qwen2.5-coder:7b  # local — needs a self-hosted runner
+
+    steps:
+      - name: Checkout evals repo
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Checkout KODA agent
+        uses: actions/checkout@v4
+        with:
+          # Point this at your repo + branch
+          repository: Badar-e-Alam/KODA
+          ref: coding_agent
+          path: koda
+          # If KODA is private, add: token: ${{ secrets.KODA_GITHUB_TOKEN }}
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install eval deps
+        run: pip install -r requirements.txt
+
+      - name: Install KODA
+        working-directory: ./koda
+        run: |
+          # Adjust to match your install. Common patterns:
+          #   pip install -e .                   (if pyproject.toml/setup.py)
+          #   pip install -r requirements.txt    (if no install target)
+          if [ -f pyproject.toml ]; then
+            pip install -e .
+          elif [ -f setup.py ]; then
+            pip install -e .
+          elif [ -f requirements.txt ]; then
+            pip install -r requirements.txt
+          fi
+
+      - name: Run evals
+        env:
+          # Provider keys
+          OPENAI_API_KEY:   ${{ secrets.OPENAI_API_KEY }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          OLLAMA_API_KEY:   ${{ secrets.OLLAMA_API_KEY }}
+          OLLAMA_BASE_URL:  ${{ secrets.OLLAMA_BASE_URL }}
+
+          # Langfuse
+          LANGFUSE_PUBLIC_KEY: ${{ secrets.LANGFUSE_PUBLIC_KEY }}
+          LANGFUSE_SECRET_KEY: ${{ secrets.LANGFUSE_SECRET_KEY }}
+          LANGFUSE_HOST:       ${{ secrets.LANGFUSE_HOST }}
+
+          # KODA config
+          EVAL_AGENT_MODE:    import
+          KODA_MODEL:         ${{ matrix.model }}
+          EVAL_AGENT_TIMEOUT: '300'
+
+          EVAL_RUN_DESCRIPTION: >-
+            ${{ github.event_name }} on ${{ github.ref_name }}
+            (sha=${{ github.sha }}) by ${{ github.actor }}
+            model=${{ matrix.model }}
+        run: |
+          MODEL_TAG=$(echo "${{ matrix.model }}" | tr ':/' '--')
+          RUN_NAME="${{ inputs.run_name }}"
+          if [ -z "$RUN_NAME" ]; then
+            RUN_NAME="${GITHUB_REF_NAME//\//-}-${GITHUB_SHA::8}-${MODEL_TAG}"
+          fi
+          python -m eval.runner --run-name "$RUN_NAME" \
+                                --report-json "results-${MODEL_TAG}.json" \
+                                --report-md   "results-${MODEL_TAG}.md" \
+                                || EVAL_FAILED=1
+          echo "EVAL_FAILED=${EVAL_FAILED:-0}" >> $GITHUB_ENV
+          echo "MODEL_TAG=${MODEL_TAG}" >> $GITHUB_ENV
+
+      - name: Upload results artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: eval-results-${{ env.MODEL_TAG }}-${{ github.run_id }}
+          path: |
+            results-*.json
+            results-*.md
+          retention-days: 30
+
+      - name: Post PR comment
+        if: github.event_name == 'pull_request' && always()
+        uses: marocchino/sticky-pull-request-comment@v2
+        with:
+          # Separate header per model so multiple matrix jobs each get their own comment
+          header: koda-evals-${{ env.MODEL_TAG }}
+          path: results-${{ env.MODEL_TAG }}.md
+
+      - name: Fail job if any task regressed
+        if: env.EVAL_FAILED == '1'
+        run: exit 1

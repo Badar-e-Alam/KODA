@@ -1,0 +1,6 @@
+There's a bug in `cart.js` — `cartTotal` is stacking discount codes
+instead of applying only the single highest-percent applicable discount.
+The team handbook says discount codes are mutually exclusive.
+
+Run the tests with `node --test cart.test.mjs` to see the failure.
+Fix `cartTotal` so all tests pass. Do not modify `cart.test.mjs`.

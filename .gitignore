@@ -28,6 +28,10 @@ koda_with_delete.svg
 .koda/
 ~/.koda/
 
+# Eval harness outputs (regenerated on each run)
+koda-evals/results.json
+koda-evals/results.md
+
 # Editor
 .idea/
 .vscode/

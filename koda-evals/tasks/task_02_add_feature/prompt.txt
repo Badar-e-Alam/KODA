@@ -1,0 +1,12 @@
+Extend the `Stack` class in `stack.py` to support a `peek_n(n)` method that
+returns the top `n` items without removing them, in top-to-bottom order.
+
+Examples:
+  s = Stack()
+  s.push(1); s.push(2); s.push(3)
+  s.peek_n(2)  # -> [3, 2]
+  s.peek_n(0)  # -> []
+  s.peek_n(10) # -> [3, 2, 1]   (returns all if n > size)
+
+Add the method, and make sure all existing tests still pass. New tests for
+peek_n have been added to test_stack.py.
