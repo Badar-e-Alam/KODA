@@ -6,6 +6,7 @@ import sys
 import time
 import uuid
 from pathlib import Path
+from typing import Any
 
 from dotenv import load_dotenv
 
@@ -17,15 +18,22 @@ if not os.getenv("LANGFUSE_HOST") and os.getenv("LANGFUSE_BASE_URL"):
     os.environ["LANGFUSE_HOST"] = os.environ["LANGFUSE_BASE_URL"]
 
 from langfuse import get_client, observe, propagate_attributes
-from langfuse.openai import OpenAI, AsyncOpenAI  # auto-traced drop-in
 from openai import (
     APIConnectionError,
     APITimeoutError,
     InternalServerError,
     RateLimitError,
 )
-from agents import Agent, ModelSettings, OpenAIChatCompletionsModel
 from agents.tool_context import ToolContext
+
+# LangChain primitives — Phase 3 wiring. ``build_chat_model`` returns a
+# provider-agnostic ``BaseChatModel`` from a ``"provider:model"`` spec
+# (see coding_agent/clients.py). ``convert_to_messages`` turns the
+# OpenAI-shape dict history we already keep into LangChain ``BaseMessage``s
+# right before each ``astream`` call, so we don't have to change any of the
+# message-building / tool-result-appending code below.
+from clients import build_chat_model
+from langchain_core.messages import AIMessageChunk, convert_to_messages
 
 _log = logging.getLogger("coding_agent")
 
@@ -65,6 +73,106 @@ AGENTS_MD_NAME = "AGENTS.md"
 
 # Default coding model. Connection settings (base URL, API key) come from .env.
 MINIMAX_MODEL_NAME = "MiniMax-M2.7-UD-Q8_K_XL"
+
+# ── Context compaction tunables (env-overridable) ───────────────────────
+#
+# Compaction folds older history into a single summary system message when
+# the running message list crosses ``COMPACT_THRESHOLD_CHARS``. We keep the
+# last ``COMPACT_KEEP_RECENT_TURNS`` user turns intact (a "turn" being a
+# user message and everything that follows it until the next user message,
+# i.e. assistant + any tool replies). Cuts only happen on user-message
+# boundaries so we never split an assistant ``tool_calls`` message from
+# its matching ``tool`` replies.
+#
+# Threshold ~50k chars ≈ 12k tokens — fires well before typical 16k–32k
+# context limits but not so eagerly it kicks in for normal multi-step
+# tasks. Set ``KODA_DISABLE_COMPACT=1`` to skip entirely.
+_COMPACT_THRESHOLD_CHARS = int(os.getenv("KODA_COMPACT_THRESHOLD_CHARS", "50000"))
+# An "assistant block" = one think→act exchange (one assistant message and
+# any tool replies that follow). Single-turn tasks only have ONE user
+# message but can have many assistant blocks, so cutting on user-msg
+# boundaries leaves nothing to compact. Default keeps the last 2 blocks
+# verbatim and folds everything before.
+_COMPACT_KEEP_RECENT_BLOCKS = int(
+    os.getenv(
+        "KODA_COMPACT_KEEP_RECENT_BLOCKS",
+        os.getenv("KODA_COMPACT_KEEP_RECENT_TURNS", "2"),
+    )
+)
+_COMPACT_DISABLED = os.getenv("KODA_DISABLE_COMPACT", "0") == "1"
+_SUMMARY_MAX_CHARS = int(os.getenv("KODA_COMPACT_SUMMARY_CHARS", "2000"))
+
+
+def _message_chars(msg: dict) -> int:
+    """Best-effort char count for a message dict.
+
+    Includes ``content`` plus any tool-call ``arguments`` strings since
+    those can be large (a single ``write_file`` arguments blob may be
+    several kilobytes of source code).
+    """
+    n = len(msg.get("content") or "")
+    for tc in msg.get("tool_calls") or []:
+        fn = tc.get("function") or {}
+        n += len(fn.get("arguments") or "")
+    return n
+
+
+def _find_safe_compact_cut(
+    messages: list[dict], keep_recent_blocks: int
+) -> tuple[int, int] | None:
+    """Identify the slice ``messages[start:cut]`` that compaction may fold.
+
+    A safe cut respects two invariants:
+
+    1. ``messages[0]`` (system prompt) and ``messages[1]`` (the original
+       user prompt) are always preserved verbatim — they're the agent's
+       mission. Compaction starts at index 2.
+    2. The cut must land on an *assistant-block boundary*: the first
+       message of a step (an ``assistant`` message immediately after a
+       non-assistant message). Cutting elsewhere would strand a ``tool``
+       message away from its parent assistant, breaking the next
+       provider call.
+
+    Returns ``(start, cut)`` such that ``messages[start:cut]`` is the
+    slice to compact and ``messages[cut:]`` is the recent tail to keep.
+    Returns ``None`` when there aren't enough blocks to compact safely.
+    """
+    if len(messages) < 3:
+        return None
+    block_starts: list[int] = []
+    for i in range(1, len(messages)):
+        m = messages[i]
+        if m.get("role") != "assistant":
+            continue
+        prev_role = messages[i - 1].get("role")
+        if prev_role != "assistant":  # block start = first assistant after user/tool
+            block_starts.append(i)
+    if len(block_starts) <= keep_recent_blocks:
+        return None
+    cut = block_starts[-keep_recent_blocks]
+    # Preserve system prompt + initial user prompt.
+    start = 2 if messages[1].get("role") == "user" else 1
+    if start >= cut:
+        return None
+    return (start, cut)
+
+
+def _render_for_summary(messages: list[dict]) -> str:
+    """Flatten a slice of message dicts into one prompt-ready string."""
+    parts: list[str] = []
+    for m in messages:
+        role = m.get("role", "?")
+        content = m.get("content") or ""
+        line = f"[{role}] {content}".rstrip()
+        # Include tool-call info inline so the summarizer sees what tools ran.
+        for tc in m.get("tool_calls") or []:
+            fn = tc.get("function") or {}
+            line += f"\n  ↳ tool_call {fn.get('name', '?')}({fn.get('arguments', '') or ''})"
+        if m.get("role") == "tool":
+            tcid = m.get("tool_call_id", "?")
+            line = f"[tool result {tcid}] {content}".rstrip()
+        parts.append(line)
+    return "\n\n".join(parts)
 
 
 def _read_agents_md(project_root: Path) -> str:
@@ -156,31 +264,9 @@ def _compose_instructions_cached(base: str, project_root: Path) -> str:
     return value
 
 
-_async_client = AsyncOpenAI(
-    base_url=os.getenv("MINIMAX_BASE_URL"),
-    api_key=os.getenv("MINIMAX_API_KEY"),
-)
-
-# Module-level SDK Agent — instructions get AGENTS.md appended at import time
-# when the file is present. The standalone CodingAgent below can also create
-# the file on demand.
-coding_agent = Agent(
-    name="CodingAgent",
-    instructions=_compose_instructions(SYSTEM_PROMPT, Path(os.getcwd())),
-    model=OpenAIChatCompletionsModel(
-        model=MINIMAX_MODEL_NAME,
-        openai_client=_async_client,
-    ),
-    model_settings=ModelSettings(temperature=0.2),
-    tools=_TOOLS,
-)
-
-
 class CodingAgent:
     def __init__(
         self,
-        base_url: str,
-        api_key: str,
         model: str,
         tools: list | None = None,
         system_prompt: str = "",
@@ -189,24 +275,44 @@ class CodingAgent:
         project_root: str | os.PathLike | None = None,
         auto_create_agents_md: bool = True,
         temperature: float = 0.7,
+        # Optional overrides for self-hosted / OpenAI-compatible endpoints.
+        # When ``None``, ``build_chat_model`` reads the right env var per
+        # provider (e.g. ``OPENAI_API_KEY``, ``OLLAMA_BASE_URL``).
+        base_url: str | None = None,
+        api_key: str | None = None,
     ):
-        """
-        Main Coding Agent class. Owns the LLM client(s), the bound tool list,
-        the system prompt, optional summarizer, and a project-scoped AGENTS.md
-        that is loaded into the system prompt for project-specific context.
+        """Main Coding Agent class.
 
-        If `auto_create_agents_md=True` and the project's AGENTS.md is missing,
-        the agent bootstraps the file by running itself once with
+        Owns a LangChain ``BaseChatModel`` (provider chosen by the
+        ``provider:model[:tag]`` ``model`` spec — see
+        :func:`clients.build_chat_model`), the bound tool list, the system
+        prompt, an optional summarizer, and a project-scoped AGENTS.md that
+        gets loaded into the system prompt for project-specific context.
+
+        If ``auto_create_agents_md=True`` and the project's AGENTS.md is
+        missing, the agent bootstraps the file by running itself once with
         AGENTS_INIT_PROMPT, then re-loads it into the system prompt.
-
-        Both a sync and an async OpenAI client are constructed: the sync one
-        backs `run()` (CLI), the async one backs `stream_events()` (TUI).
         """
-
-        self.client = OpenAI(base_url=base_url, api_key=api_key)
-        self.async_client = AsyncOpenAI(base_url=base_url, api_key=api_key)
         self.model = model
         self.tools = list(tools or [])
+
+        # Build the chat model from the provider spec. Tools are bound on
+        # the model (not passed per-call) so providers that need
+        # provider-specific schema massaging (Anthropic, Gemini) get one
+        # consistent surface.
+        chat_kwargs: dict[str, Any] = {"temperature": temperature}
+        if base_url is not None:
+            chat_kwargs["base_url"] = base_url
+        if api_key is not None:
+            chat_kwargs["api_key"] = api_key
+        base_model = build_chat_model(model, **chat_kwargs)
+        # Keep the un-bound model around for compaction summaries — we
+        # don't want the summarizer call to itself try to emit tool calls.
+        self._summarizer_model = base_model
+        self._chat_model = (
+            base_model.bind_tools(self._tool_schemas()) if self.tools else base_model
+        )
+
         # Keep raw + composed prompts separate so the async path can recompose
         # AGENTS.md + git context fresh on every turn (state changes between turns).
         self._raw_system_prompt = system_prompt or SYSTEM_PROMPT
@@ -218,8 +324,6 @@ class CodingAgent:
         self._lf = get_client()
         self.project_root = Path(project_root or os.getcwd()).resolve()
         self.agents_md_path = self.project_root / AGENTS_MD_NAME
-        if not self._check_health():
-            raise RuntimeError(f"cannot reach {base_url}")
         self._load_or_create_agents_md(auto_create_agents_md)
 
     def _load_or_create_agents_md(self, auto_create: bool) -> None:
@@ -249,15 +353,6 @@ class CodingAgent:
         finally:
             self.system_prompt = saved_prompt
 
-    def _check_health(self) -> bool:
-        """Check API availability; logs and returns False on connection failure."""
-        try:
-            self.client.models.list()
-            return True
-        except APIConnectionError as e:
-            _log.error("Can't reach server: %s", e)
-            return False
-
     _RETRYABLE_LLM_ERRORS = (
         APIConnectionError,
         APITimeoutError,
@@ -265,22 +360,99 @@ class CodingAgent:
         InternalServerError,
     )
 
-    def _stream_with_retry(self, **kwargs):
-        """Call chat.completions.create with up to 3 attempts on transient errors."""
+    def _compact_if_needed(self, messages: list[dict]) -> bool:
+        """Fold older history into a single summary system message in place.
+
+        Triggers when total content+args char count crosses
+        ``KODA_COMPACT_THRESHOLD_CHARS`` (default 50k). Cuts only on user-
+        message boundaries so the assistant ``tool_calls`` ↔ ``tool``
+        pairing the next ``astream`` call requires stays intact. Preserves
+        ``messages[0]`` (the system prompt) verbatim. Returns ``True`` iff
+        a compaction actually fired (caller can use this for telemetry).
+        """
+        if _COMPACT_DISABLED:
+            return False
+        total = sum(_message_chars(m) for m in messages)
+        if total < _COMPACT_THRESHOLD_CHARS:
+            return False
+        cut_info = _find_safe_compact_cut(messages, _COMPACT_KEEP_RECENT_BLOCKS)
+        if cut_info is None:
+            return False
+        start, cut = cut_info
+
+        slice_to_compact = messages[start:cut]
+        rendered = _render_for_summary(slice_to_compact)
+        prompt = (
+            f"You are a memory compactor. Summarise the following coding-agent "
+            f"transcript in at most {_SUMMARY_MAX_CHARS} characters. Preserve: "
+            f"file paths read or written, errors encountered, tool results that "
+            f"informed later decisions, key architectural decisions, and any "
+            f"outstanding TODOs. Drop chat fluff and verbose tool output. Write "
+            f"in compact bullet form.\n\n"
+            f"--- TRANSCRIPT ---\n{rendered}"
+        )
+        from langchain_core.messages import HumanMessage
+
+        try:
+            resp = self._summarizer_model.invoke([HumanMessage(content=prompt)])
+            summary = (getattr(resp, "content", None) or "")[: _SUMMARY_MAX_CHARS]
+        except Exception as e:  # noqa: BLE001 — compaction must never crash a turn
+            _log.warning("compaction summariser failed (%s: %s); skipping", type(e).__name__, e)
+            return False
+
+        if not summary.strip():
+            return False
+        summary_msg = {
+            "role": "system",
+            "content": (
+                f"[compacted {len(slice_to_compact)} prior message(s); "
+                f"~{total} chars folded]\n\n{summary}"
+            ),
+        }
+        messages[start:cut] = [summary_msg]
+        _log.info(
+            "compacted %d msgs (~%d chars) into 1 summary msg",
+            len(slice_to_compact), total,
+        )
+        return True
+
+    async def _astream_with_retry(self, lc_messages):
+        """Yield chunks from ``self._chat_model.astream()`` with retry.
+
+        Retries on transient provider failures (connection drops, timeouts,
+        rate limits, 500s) up to 3 attempts with exponential backoff, but
+        **only when no chunks have been yielded yet from this attempt**.
+        Once we've started streaming, a mid-stream failure is fatal — we
+        can't re-do the call without risking double-emit of text deltas.
+        Same semantic the old sync ``_stream_with_retry`` had, just lifted
+        to the async/LangChain path.
+        """
         last_err: Exception | None = None
         for attempt in range(3):
+            yielded_any = False
             try:
-                return self.client.chat.completions.create(**kwargs)
+                async for chunk in self._chat_model.astream(lc_messages):
+                    yielded_any = True
+                    yield chunk
+                return  # stream completed
             except self._RETRYABLE_LLM_ERRORS as e:
                 last_err = e
+                if yielded_any:
+                    _log.warning(
+                        "LLM stream failed mid-stream (%s: %s); cannot retry",
+                        type(e).__name__, e,
+                    )
+                    raise
+                if attempt == 2:
+                    raise
                 wait = 2 ** attempt
                 _log.warning(
-                    "LLM call failed (%s: %s); retry %d/3 in %ds",
+                    "LLM stream failed (%s: %s); retry %d/3 in %ds",
                     type(e).__name__, e, attempt + 1, wait,
                 )
-                time.sleep(wait)
-        assert last_err is not None
-        raise last_err
+                await asyncio.sleep(wait)
+        if last_err is not None:
+            raise last_err
 
     def _tool_schemas(self) -> list[dict]:
         """
@@ -435,50 +607,61 @@ class CodingAgent:
                         if cancel_event is not None and cancel_event.is_set():
                             return
 
-                        async with await self.async_client.chat.completions.create(
-                            model=self.model,
-                            messages=messages,
-                            tools=self._tool_schemas() or None,
-                            stream=True,
-                            temperature=self.temperature,
-                            stream_options={"include_usage": True},
-                        ) as stream:
-                            content_parts: list[str] = []
-                            tool_calls_acc: dict[int, dict] = {}
-                            step_usage: dict | None = None
+                        # ── Drive one provider round through LangChain ──
+                        # ``self._chat_model`` is a ``BaseChatModel`` already
+                        # ``.bind_tools()``ed in __init__, so the schemas
+                        # never travel on the wire — only the messages do.
+                        # ``convert_to_messages`` accepts the OpenAI-shape
+                        # dicts we already keep (system / user / assistant
+                        # +tool_calls / tool) and produces ``BaseMessage``s
+                        # with the right per-role envelope.
+                        lc_messages = convert_to_messages(messages)
+                        content_parts: list[str] = []
+                        tool_calls_acc: dict[int, dict] = {}
+                        step_usage: dict | None = None
 
-                            async for chunk in stream:
-                                if cancel_event is not None and cancel_event.is_set():
-                                    return
-                                if getattr(chunk, "usage", None):
-                                    u = chunk.usage
-                                    step_usage = {
-                                        "prompt_tokens": getattr(u, "prompt_tokens", 0) or 0,
-                                        "completion_tokens": getattr(u, "completion_tokens", 0) or 0,
-                                        "total_tokens": getattr(u, "total_tokens", 0) or 0,
-                                    }
-                                if not chunk.choices:
-                                    continue
-                                delta = chunk.choices[0].delta
-                                if delta.content:
-                                    content_parts.append(delta.content)
-                                    yield {"type": "text_delta", "content": delta.content}
-                                if delta.tool_calls:
-                                    for tc_delta in delta.tool_calls:
-                                        idx = tc_delta.index
-                                        slot = tool_calls_acc.setdefault(idx, {
-                                            "id": "",
-                                            "type": "function",
-                                            "function": {"name": "", "arguments": ""},
-                                        })
-                                        if tc_delta.id:
-                                            slot["id"] = tc_delta.id
-                                        fn = tc_delta.function
-                                        if fn:
-                                            if fn.name:
-                                                slot["function"]["name"] += fn.name
-                                            if fn.arguments:
-                                                slot["function"]["arguments"] += fn.arguments
+                        async for chunk in self._astream_with_retry(lc_messages):
+                            if cancel_event is not None and cancel_event.is_set():
+                                return
+                            # Usage typically arrives on the final chunk for
+                            # OpenAI/Anthropic-shape providers. Treat as
+                            # cumulative for the current step.
+                            usage_meta = getattr(chunk, "usage_metadata", None)
+                            if usage_meta:
+                                step_usage = {
+                                    "prompt_tokens": int(usage_meta.get("input_tokens") or 0),
+                                    "completion_tokens": int(usage_meta.get("output_tokens") or 0),
+                                    "total_tokens": int(usage_meta.get("total_tokens") or 0),
+                                }
+                            # ``chunk.text`` is the public accessor that
+                            # flattens both string ``content`` and
+                            # content-block lists (Anthropic) into a single
+                            # string. Yield it as a text_delta event — same
+                            # shape the existing TUI extractor consumes.
+                            text = getattr(chunk, "text", "") or ""
+                            if text:
+                                content_parts.append(text)
+                                yield {"type": "text_delta", "content": text}
+                            # Tool-call streaming — LangChain normalizes
+                            # OpenAI deltas / Anthropic tool_use blocks into
+                            # ``tool_call_chunks`` keyed by ``index``. Each
+                            # chunk may carry partial ``args`` JSON; we
+                            # accumulate into the same dict shape the rest
+                            # of the loop already speaks (OpenAI-style
+                            # ``{"id":..., "function":{"name":..., "arguments":...}}``).
+                            for tc in getattr(chunk, "tool_call_chunks", None) or []:
+                                idx = tc.get("index") or 0
+                                slot = tool_calls_acc.setdefault(idx, {
+                                    "id": "",
+                                    "type": "function",
+                                    "function": {"name": "", "arguments": ""},
+                                })
+                                if tc.get("id"):
+                                    slot["id"] = tc["id"]
+                                if tc.get("name"):
+                                    slot["function"]["name"] += tc["name"] or ""
+                                if tc.get("args"):
+                                    slot["function"]["arguments"] += tc["args"] or ""
 
                         content = "".join(content_parts)
                         tool_calls = [tool_calls_acc[i] for i in sorted(tool_calls_acc)]
@@ -598,6 +781,13 @@ class CodingAgent:
                                 "content": output,
                             })
 
+                        # Compact in place at the end of the step so the
+                        # next chat.astream sees the trimmed history. The
+                        # compactor only fires when total chars cross the
+                        # threshold and there's a safe boundary to cut on,
+                        # so for short tasks this is a free no-op.
+                        self._compact_if_needed(messages)
+
                     yield {
                         "type": "done",
                         "content": "[max steps reached]",
@@ -633,51 +823,41 @@ class CodingAgent:
             if verbose:
                 _log.info("step %d: think", step)
 
-            stream = self._stream_with_retry(
-                model=self.model,
-                messages=messages,
-                tools=self._tool_schemas() or None,
-                stream=True,
-                temperature=self.temperature,
-                stream_options={"include_usage": True},
-            )
-
+            # Sync streaming via LangChain — same chunk shape we consume in
+            # ``stream_events`` (see comments there). The retry path that
+            # used to wrap this call lived only in the OpenAI-specific path;
+            # callers that need retries should wrap ``run()``.
+            lc_messages = convert_to_messages(messages)
             content_parts: list[str] = []
             tool_calls_acc: dict[int, dict] = {}
             step_usage: dict | None = None
 
-            for chunk in stream:
-                # The final usage chunk has empty `choices` and a populated `usage`.
-                if getattr(chunk, "usage", None):
-                    u = chunk.usage
+            for chunk in self._chat_model.stream(lc_messages):
+                usage_meta = getattr(chunk, "usage_metadata", None)
+                if usage_meta:
                     step_usage = {
-                        "prompt_tokens": getattr(u, "prompt_tokens", 0) or 0,
-                        "completion_tokens": getattr(u, "completion_tokens", 0) or 0,
-                        "total_tokens": getattr(u, "total_tokens", 0) or 0,
+                        "prompt_tokens": int(usage_meta.get("input_tokens") or 0),
+                        "completion_tokens": int(usage_meta.get("output_tokens") or 0),
+                        "total_tokens": int(usage_meta.get("total_tokens") or 0),
                     }
-                if not chunk.choices:
-                    continue
-                delta = chunk.choices[0].delta
-                if delta.content:
-                    content_parts.append(delta.content)
+                text = getattr(chunk, "text", "") or ""
+                if text:
+                    content_parts.append(text)
                     if verbose:
-                        print(delta.content, end="", flush=True)
-                if delta.tool_calls:
-                    for tc_delta in delta.tool_calls:
-                        idx = tc_delta.index
-                        slot = tool_calls_acc.setdefault(idx, {
-                            "id": "",
-                            "type": "function",
-                            "function": {"name": "", "arguments": ""},
-                        })
-                        if tc_delta.id:
-                            slot["id"] = tc_delta.id
-                        fn = tc_delta.function
-                        if fn:
-                            if fn.name:
-                                slot["function"]["name"] += fn.name
-                            if fn.arguments:
-                                slot["function"]["arguments"] += fn.arguments
+                        print(text, end="", flush=True)
+                for tc in getattr(chunk, "tool_call_chunks", None) or []:
+                    idx = tc.get("index") or 0
+                    slot = tool_calls_acc.setdefault(idx, {
+                        "id": "",
+                        "type": "function",
+                        "function": {"name": "", "arguments": ""},
+                    })
+                    if tc.get("id"):
+                        slot["id"] = tc["id"]
+                    if tc.get("name"):
+                        slot["function"]["name"] += tc["name"] or ""
+                    if tc.get("args"):
+                        slot["function"]["arguments"] += tc["args"] or ""
 
             content = "".join(content_parts)
             tool_calls = [tool_calls_acc[i] for i in sorted(tool_calls_acc)]
@@ -745,12 +925,16 @@ if __name__ == "__main__":
         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
         datefmt="%H:%M:%S",
     )
+    # Standalone CLI default: route the original MiniMax setup through the
+    # OpenAI-compatible provider path. Override with KODA_DEFAULT_MODEL or
+    # by passing a different ``model`` spec.
+    model_spec = os.getenv("KODA_DEFAULT_MODEL", f"openai:{MINIMAX_MODEL_NAME}")
     agent = CodingAgent(
-        base_url=os.getenv("MINIMAX_BASE_URL"),
-        api_key=os.getenv("MINIMAX_API_KEY"),
-        model=MINIMAX_MODEL_NAME,
+        model=model_spec,
         tools=_TOOLS,
         system_prompt=SYSTEM_PROMPT,
+        base_url=os.getenv("MINIMAX_BASE_URL"),
+        api_key=os.getenv("MINIMAX_API_KEY"),
     )
 
     query = sys.argv[1] if len(sys.argv) > 1 else (
