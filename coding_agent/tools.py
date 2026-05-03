@@ -1,26 +1,138 @@
+import json
+import os
 import subprocess
 import re
 from pathlib import Path
+
+from pydantic import BaseModel
 from agents import function_tool
 
+
+class FindReplace(BaseModel):
+    """One find/replace operation for `multi_edit`."""
+    old: str
+    new: str
+
+
+# ── Approval system ────────────────────────────────────────────────────
+#
+# `_APPROVAL_MODE` controls what `run_shell` is allowed to execute.
+#   yolo  — run anything (default; matches prior behavior).
+#   auto  — run only commands matching the safe-command allowlist below.
+#   ask   — block all commands; the model must request a mode change.
+# The TUI adapter sets "yolo" at startup so it doesn't deadlock on prompts;
+# CLI users can call `set_approval_mode("auto")` to enable the allowlist.
+_APPROVAL_MODE = "yolo"
+
+_DEFAULT_ALLOWLIST = [
+    r"^\s*ls(\s|$)",
+    r"^\s*pwd\s*$",
+    r"^\s*echo\s+",
+    r"^\s*cat\s+",
+    r"^\s*head\s+",
+    r"^\s*tail\s+",
+    r"^\s*wc\s+",
+    r"^\s*file\s+",
+    r"^\s*git\s+(status|log|diff|blame|show|branch|remote|rev-parse|config\s+--get|describe)\b",
+    r"^\s*rg\s+",
+    r"^\s*grep\s+",
+    r"^\s*find\s+\S+\s+-(name|type|maxdepth)\b",
+    r"^\s*node\s+(-v|--version)\s*$",
+    r"^\s*npm\s+(-v|--version|list|ls)(\s|$)",
+    r"^\s*python3?\s+(-V|--version)\s*$",
+    r"^\s*command\s+-v\s+",
+    r"^\s*which\s+",
+    r"^\s*test\s+-",
+]
+
+
+def set_approval_mode(mode: str) -> str:
+    """Set the approval mode used by `run_shell`. Returns the new mode."""
+    global _APPROVAL_MODE
+    if mode not in {"yolo", "auto", "ask"}:
+        return f"unknown mode: {mode}; use yolo|auto|ask"
+    _APPROVAL_MODE = mode
+    return f"approval mode = {mode}"
+
+
+def get_approval_mode() -> str:
+    return _APPROVAL_MODE
+
+
+def _is_allowlisted(command: str) -> bool:
+    return any(re.search(p, command) for p in _DEFAULT_ALLOWLIST)
+
+
+def _enriched_env() -> dict[str, str]:
+    """Return os.environ with user-local toolchain bins prepended to PATH.
+
+    `subprocess.run(..., shell=True)` invokes /bin/sh, which never sources
+    ~/.bashrc, so version-manager-installed tools (nvm, pyenv, cargo, pipx)
+    are invisible by default. Prepend their bin dirs so the agent can run
+    things it just installed without the user needing to restart koda.
+    """
+    home = Path.home()
+    candidates: list[str] = []
+    nvm_versions = home / ".nvm" / "versions" / "node"
+    if nvm_versions.is_dir():
+        # Pick the highest version dir; nvm names are like v24.15.0.
+        versions = sorted(
+            (p for p in nvm_versions.iterdir() if p.is_dir() and (p / "bin" / "node").exists()),
+            key=lambda p: p.name,
+        )
+        if versions:
+            candidates.append(str(versions[-1] / "bin"))
+    for sub in (".local/bin", ".cargo/bin", ".pyenv/shims", ".pyenv/bin", ".bun/bin", ".deno/bin"):
+        d = home / sub
+        if d.is_dir():
+            candidates.append(str(d))
+
+    env = os.environ.copy()
+    existing = env.get("PATH", "")
+    parts = [c for c in candidates if c and c not in existing.split(os.pathsep)]
+    if parts:
+        env["PATH"] = os.pathsep.join(parts + ([existing] if existing else []))
+    return env
 
 
 @function_tool
 def run_shell(command: str, timeout: int = 30) -> str:
-    """Run a shell command. Returns exit code, stdout, and stderr."""
+    """Run a shell command. Returns exit code, stdout, and stderr.
+
+    Behavior depends on the approval mode (see `set_approval_mode`):
+      yolo — execute as-is.
+      auto — execute only if the command matches the safe-command allowlist;
+             otherwise return a [blocked] message so the model can rephrase.
+      ask  — refuse all commands; the user must explicitly switch modes first.
+    """
+    if _APPROVAL_MODE == "ask":
+        return (
+            f"[blocked] approval mode is 'ask'; cannot run: {command}\n"
+            f"Tell the user a shell command is required, then wait."
+        )
+    if _APPROVAL_MODE == "auto" and not _is_allowlisted(command):
+        return (
+            f"[blocked] command not on safe allowlist (mode=auto): {command}\n"
+            f"Either narrow it to a read-only equivalent (ls/cat/git status/etc) "
+            f"or ask the user to switch to 'yolo' mode."
+        )
     try:
         r = subprocess.run(
-            command, shell=True, capture_output=True, text=True, timeout=timeout
+            command,
+            shell=True,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            env=_enriched_env(),
         )
         return f"exit={r.returncode}\n--stdout--\n{r.stdout}\n--stderr--\n{r.stderr}"
     except subprocess.TimeoutExpired:
         return f"timeout after {timeout}s"
 
-
-
 @function_tool
 def read_file(path: str, start_line: int = 1, end_line: int = -1) -> str:
-    """Read a text file with optional line range (1-indexed, inclusive).
+    """
+    Read a text file with optional line range (1-indexed, inclusive).
 
     Use start_line and end_line to read just a slice of large files instead
     of the whole thing. end_line=-1 means read to the end.
@@ -37,35 +149,42 @@ def read_file(path: str, start_line: int = 1, end_line: int = -1) -> str:
     numbered = "\n".join(f"{i + start:>{width}}  {line}" for i, line in enumerate(chunk))
     return f"# {path} lines {start}-{end} of {total}\n{numbered}"
 
-
 @function_tool
 def write_file(path: str, content: str) -> str:
     """Create or overwrite a file with the given content."""
     Path(path).write_text(content)
     return f"wrote {len(content)} chars to {path}"
 
-
 @function_tool
 def edit_file(path: str, old: str, new: str) -> str:
-    """Replace `old` with `new` in `path`. `old` must match exactly once."""
+    """Replace `old` with `new` in `path`. `old` must match exactly once.
+
+    Fails loudly when `old` is not unique — DO NOT retry with the same string.
+    Either: (a) widen `old` with more surrounding context to disambiguate, or
+    (b) use `multi_edit` if you want to change every occurrence.
+    """
     p = Path(path)
+    if not p.exists():
+        return f"[error] file not found: {path}"
     text = p.read_text()
     n = text.count(old)
-    if n != 1:
-        return f"error: `old` matched {n} times, need exactly 1"
+    if n == 0:
+        return (
+            f"[error] `old` did not match any text in {path}. "
+            f"Read the file first to confirm the exact characters (whitespace, line endings, casing)."
+        )
+    if n > 1:
+        return (
+            f"[error] `old` matched {n} places in {path}; need exactly 1. "
+            f"Add more surrounding context to make `old` unique, or use `multi_edit`."
+        )
     p.write_text(text.replace(old, new))
     return f"edited {path}"
 
-
-
 @function_tool
-def grep(
-    pattern: str,
-    path: str = ".",
-    glob: str = "*",
-    max_results: int = 50,
-) -> str:
-    """Search for a regex pattern in files under `path`.
+def grep( pattern: str, path: str = ".", glob: str = "*", max_results: int = 50,) -> str:
+    """
+    Search for a regex pattern in files under `path`.
 
     Returns matching lines as `filepath:lineno: line`. Use this to find
     where things are defined or used before reading whole files.
@@ -102,7 +221,6 @@ def grep(
 
     return "\n".join(hits) if hits else "no matches"
 
-
 _TODOS: list[dict] = []
 
 
@@ -112,6 +230,20 @@ def todo_write(items: list[str]) -> str:
 
     Call this at the start of a multi-step task to plan, and again whenever
     the plan changes. Each item starts as 'pending'.
+
+    Plan quality rules:
+    - Do NOT submit shallow plans like "create html, create css, create js".
+      Before calling this, use `think` to decide the design and approach.
+    - Each todo should describe an outcome, not a file
+      (good: "Build hero with animated gradient and typewriter intro";
+       bad: "create index.html").
+    - For UI work, the FIRST todo should commit to a concrete visual direction
+      (palette, typography, layout, motion) rather than leaving it implicit.
+    - The LAST todos MUST be verification: open the artifact, run it, exercise
+      the API, screenshot at desktop+mobile, hit the endpoint, etc. Plans that
+      end at "implementation done" are incomplete.
+    - If verification fails, add a follow-up todo and re-verify; don't mark
+      the final task done until the deliverable actually works.
     """
     global _TODOS
     _TODOS = [{"id": i + 1, "task": t, "status": "pending"} for i, t in enumerate(items)]
@@ -152,4 +284,276 @@ def think(thought: str) -> str:
     Use for: planning an approach, debugging hypotheses, weighing trade-offs.
     """
     return f"noted: {thought[:80]}{'...' if len(thought) > 80 else ''}"
+
+
+# ── multi_edit ──────────────────────────────────────────────────────────
+
+
+@function_tool
+def multi_edit(path: str, edits: list[FindReplace]) -> str:
+    """Apply multiple find/replace edits to one file atomically.
+
+    All edits succeed or none are written — if any `old` fails to match
+    uniquely (in the file state *after* prior edits in this batch), the
+    file is left untouched and an error is returned.
+
+    Args:
+        path: target file.
+        edits: list of {"old": str, "new": str} entries, applied in order.
+    """
+    p = Path(path)
+    if not p.exists():
+        return f"[error] file not found: {path}"
+    text = p.read_text()
+    original = text
+    for i, e in enumerate(edits, 1):
+        n = text.count(e.old)
+        if n != 1:
+            return (
+                f"[error] edit {i}: `old` matched {n} times in current state, need exactly 1. "
+                f"No changes written — widen `old` with surrounding context."
+            )
+        text = text.replace(e.old, e.new)
+    if text == original:
+        return "no changes (edits resolved to no-op)"
+    p.write_text(text)
+    return f"applied {len(edits)} edits to {path}"
+
+
+# ── glob_files ─────────────────────────────────────────────────────────
+
+
+@function_tool
+def glob_files(pattern: str, path: str = ".", max_results: int = 200) -> str:
+    """Find files by *name* using a glob pattern.
+
+    Use this for filename search; use `grep` for content search.
+    Pattern uses pathlib glob semantics: `**` matches any depth.
+    Examples: `**/*.test.ts`, `src/**/*.py`, `*.md`, `koda/**/*.py`.
+    """
+    root = Path(path)
+    if not root.exists():
+        return f"path not found: {path}"
+    skip = {".git", "node_modules", "__pycache__", ".venv", "venv", "dist", "build", ".next", ".turbo"}
+    hits: list[str] = []
+    try:
+        iterator = root.glob(pattern)
+    except (ValueError, OSError) as e:
+        return f"[error] bad pattern: {e}"
+    for p in iterator:
+        if any(part in skip for part in p.parts):
+            continue
+        if p.is_file():
+            hits.append(str(p))
+            if len(hits) >= max_results:
+                return "\n".join(hits) + f"\n... (capped at {max_results})"
+    return "\n".join(hits) if hits else "no matches"
+
+
+# ── web_fetch ──────────────────────────────────────────────────────────
+
+
+@function_tool
+def web_fetch(url: str, max_chars: int = 20_000) -> str:
+    """Fetch a URL and return its text content (truncated to `max_chars`).
+
+    Use when you need to read external docs, an API reference, a Stack
+    Overflow answer, or any page to inform your work. HTML is stripped to
+    body text. Set `max_chars` higher for long pages, lower to save tokens.
+    """
+    try:
+        import httpx
+    except ImportError:
+        return "[error] httpx not installed; cannot fetch URLs"
+    try:
+        r = httpx.get(
+            url,
+            follow_redirects=True,
+            timeout=15.0,
+            headers={"User-Agent": "koda-coding-agent/1.0"},
+        )
+    except Exception as e:
+        return f"[error] fetch failed: {e}"
+    if r.status_code >= 400:
+        return f"[error] HTTP {r.status_code} for {url}"
+    text = r.text
+    ct = (r.headers.get("content-type") or "").lower()
+    if "html" in ct:
+        text = re.sub(r"<script[\s\S]*?</script>|<style[\s\S]*?</style>", "", text, flags=re.I)
+        text = re.sub(r"<[^>]+>", "", text)
+        text = re.sub(r"\n[ \t]*\n+", "\n\n", text).strip()
+    overflow = max(0, len(text) - max_chars)
+    if overflow:
+        text = text[:max_chars] + f"\n... [truncated, {overflow} chars omitted]"
+    return f"# {url} ({r.status_code}, {ct or 'unknown content-type'})\n{text}"
+
+
+# ── git tools ──────────────────────────────────────────────────────────
+
+
+def _git(args: list[str], cwd: str = ".") -> str:
+    try:
+        r = subprocess.run(
+            ["git", *args],
+            cwd=cwd,
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+    except FileNotFoundError:
+        return "[error] git is not installed or not on PATH"
+    except subprocess.TimeoutExpired:
+        return "[error] git timed out"
+    if r.returncode != 0 and not r.stdout:
+        return f"[error] git {' '.join(args)} exit={r.returncode}\n{r.stderr.strip()}"
+    out = r.stdout
+    if r.stderr.strip():
+        out += f"\n[stderr]\n{r.stderr.strip()}"
+    return out or "(no output)"
+
+
+@function_tool
+def git_status(path: str = ".") -> str:
+    """Show working-tree status with branch info (short format)."""
+    return _git(["status", "--short", "--branch"], cwd=path)
+
+
+@function_tool
+def git_diff(path: str = ".", staged: bool = False, file: str = "") -> str:
+    """Show unified diff of unstaged (default) or staged changes.
+
+    Args:
+        path: repo root.
+        staged: True for staged diff, False for unstaged.
+        file: optional path to limit the diff to one file.
+    """
+    args = ["diff"] + (["--cached"] if staged else [])
+    if file:
+        args += ["--", file]
+    return _git(args, cwd=path)
+
+
+@function_tool
+def git_log(n: int = 10, path: str = ".", file: str = "") -> str:
+    """Show the last N commits as `<short-sha> <author> <date> <subject>`.
+
+    Args:
+        n: how many commits.
+        path: repo root.
+        file: optional path to limit history to one file.
+    """
+    args = ["log", f"-{max(1, n)}", "--pretty=format:%h %an %ad %s", "--date=short"]
+    if file:
+        args += ["--", file]
+    return _git(args, cwd=path)
+
+
+@function_tool
+def git_blame(file: str, line_start: int = 1, line_end: int = 0, path: str = ".") -> str:
+    """Show git blame for a file, optionally limited to a line range.
+
+    Args:
+        file: file path to blame.
+        line_start: first line (1-indexed). Default 1.
+        line_end: last line; 0 means line_start + 200.
+        path: repo root.
+    """
+    end = line_end if line_end and line_end >= line_start else line_start + 200
+    return _git(["blame", "--date=short", "-L", f"{line_start},{end}", file], cwd=path)
+
+
+# ── run_tests ──────────────────────────────────────────────────────────
+
+
+def _detect_test_framework(root: Path) -> str:
+    if (root / "pytest.ini").exists() or (root / "tests").is_dir():
+        return "pytest"
+    pyproject = root / "pyproject.toml"
+    if pyproject.exists():
+        try:
+            txt = pyproject.read_text()
+            if "[tool.pytest" in txt or "pytest" in txt:
+                return "pytest"
+        except OSError:
+            pass
+    pkg = root / "package.json"
+    if pkg.exists():
+        try:
+            data = json.loads(pkg.read_text())
+            deps = {**data.get("devDependencies", {}), **data.get("dependencies", {})}
+            if "jest" in deps:
+                return "jest"
+            if data.get("scripts", {}).get("test"):
+                return "npm-test"
+        except (OSError, json.JSONDecodeError):
+            pass
+    if (root / "Cargo.toml").exists():
+        return "cargo"
+    if (root / "go.mod").exists():
+        return "go"
+    return ""
+
+
+def _summarize_tests(framework: str, output: str) -> str:
+    if framework == "pytest":
+        m = re.search(r"^=+ (.+?) =+\s*$", output, flags=re.M)
+        return m.group(1) if m else "(no pytest summary line)"
+    if framework == "jest":
+        tests = re.search(r"^Tests:\s+(.+)$", output, flags=re.M)
+        suites = re.search(r"^Test Suites:\s+(.+)$", output, flags=re.M)
+        parts = []
+        if suites: parts.append(f"suites: {suites.group(1)}")
+        if tests: parts.append(f"tests: {tests.group(1)}")
+        return ", ".join(parts) if parts else "(no jest summary)"
+    if framework == "cargo":
+        m = re.search(r"test result: (.+)", output)
+        return m.group(1) if m else "(no cargo summary)"
+    if framework == "go":
+        if "FAIL" in output:
+            fails = re.findall(r"--- FAIL: (\S+)", output)
+            return f"FAIL ({len(fails)} failing): {', '.join(fails[:5])}"
+        return "ok" if "ok" in output else "(no go summary)"
+    return "(parser not implemented)"
+
+
+@function_tool
+def run_tests(framework: str = "auto", args: str = "", path: str = ".") -> str:
+    """Run the project's test suite and return a structured summary.
+
+    `framework='auto'` (default) detects pytest / jest / cargo / go / npm-test
+    by inspecting the project root. Override to force a specific runner.
+    The result includes: framework, exit code, summary line, and the tail
+    of stdout/stderr (last ~4 KB) so the model can read failure details
+    without ballooning the context.
+    """
+    root = Path(path)
+    fw = framework if framework != "auto" else _detect_test_framework(root)
+    if not fw:
+        return "[error] could not auto-detect a test framework; pass framework= explicitly"
+
+    if fw == "pytest":
+        cmd = f"pytest --tb=short -q {args}".strip()
+    elif fw == "jest":
+        cmd = f"npx --yes jest --silent {args}".strip()
+    elif fw == "npm-test":
+        cmd = f"npm test --silent {args}".strip()
+    elif fw == "cargo":
+        cmd = f"cargo test {args}".strip()
+    elif fw == "go":
+        cmd = f"go test ./... {args}".strip()
+    else:
+        return f"[error] unsupported framework: {fw}"
+
+    try:
+        r = subprocess.run(
+            cmd, cwd=root, shell=True, capture_output=True, text=True,
+            timeout=600, env=_enriched_env(),
+        )
+    except subprocess.TimeoutExpired:
+        return f"[error] {fw} timed out after 600s"
+
+    output = (r.stdout or "") + (("\n[stderr]\n" + r.stderr) if r.stderr.strip() else "")
+    summary = _summarize_tests(fw, output)
+    tail = output[-4000:]
+    return f"framework={fw} exit={r.returncode}\nsummary: {summary}\n--output (tail)--\n{tail}"
 
