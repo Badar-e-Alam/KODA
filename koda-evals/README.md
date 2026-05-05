@@ -177,6 +177,62 @@ Langfuse (look at trace depth).
   you ever want to optimize: reuse a single agent instance across tasks
   (currently the adapter constructs a new one per task to ensure clean state).
 
+## Running SWE-bench Lite (hard real-world problems)
+
+The 64 tasks in `tasks/` are synthetic and run in seconds — great for the
+inner loop, but they don't tell you whether the agent can fix real-world bugs
+in million-line codebases. For that, `eval/swebench_runner.py` runs SWE-bench
+Lite (300 real GitHub issues from django/sympy/sklearn/etc.), graded by the
+official Docker harness.
+
+### Discipline: dev split vs full split
+Don't iterate against the same instances you report on, or you'll silently
+overfit to those repos.
+
+```
+SWE-bench Lite (300)
+├── dev-20    → swebench/dev_split.json    ← iterate against this
+└── eval-280  → everything else            ← only run on PRs to main
+```
+
+### One-time setup
+```bash
+pip install -r requirements.txt          # installs swebench + datasets
+python -m swebench.pick_dev_split        # writes swebench/dev_split.json (commit it!)
+```
+
+### Daily inner loop (dev-20, ~$0.50–$5/run depending on model)
+```bash
+# Full pipeline: clone repos → run agent → grade with Docker
+python -m eval.swebench_runner
+
+# Just produce predictions, grade later on a beefier box
+python -m eval.swebench_runner --no-grade
+
+# Debug one instance
+python -m eval.swebench_runner --instance django__django-11099
+```
+
+### Release-gate run (full SWE-bench Lite, ~hours, ~$50–200)
+```bash
+python -m eval.swebench_runner --split full --run-name release-v0.5
+```
+
+### How it integrates
+- Same `eval.agent_adapter.run_agent` as the synthetic-tasks runner — model
+  selection, `EVAL_AGENT_MODE`, and Langfuse `session_id` propagation work
+  identically.
+- Each instance becomes one Langfuse trace tagged with `instance_id`, repo,
+  and base_commit. Scores: `patch_nonempty`, `agent_latency_s`.
+- Inference output is `predictions.jsonl` in the standard SWE-bench schema —
+  you can ship it directly to the SWE-bench leaderboard.
+
+### Requirements
+- **Docker daemon** running (only for grading, not inference). Pulls one
+  base image per repo, ~2-5 GB total.
+- **~10 GB disk** for clones + Docker images. The runner cleans up clones
+  but Docker images persist for caching.
+
 ## Adding tasks specific to your codebase
 
 The 10 included tasks are generic (Python, no dependencies, fast graders).
@@ -215,12 +271,16 @@ fix the O(n²) bug.
 ## Layout
 ```
 .
-├── tasks/                       10 self-contained eval tasks
+├── tasks/                       64 self-contained synthetic eval tasks
 ├── eval/
 │   ├── agent_adapter.py         ← KODA-specific (verify CHECK comments)
-│   ├── runner.py                main orchestration
+│   ├── runner.py                synthetic-tasks orchestration
+│   ├── swebench_runner.py       SWE-bench Lite orchestration (dev/full splits)
 │   ├── langfuse_reporter.py     traces, scores, dataset linking
 │   └── upload_dataset.py        one-time: tasks → Langfuse
+├── swebench/
+│   ├── pick_dev_split.py        deterministic dev-20 sampler
+│   └── dev_split.json           frozen list of dev instances (commit it)
 ├── .github/workflows/evals.yml  CI with model matrix
 ├── requirements.txt
 └── .env.example
