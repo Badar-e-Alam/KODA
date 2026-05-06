@@ -69,6 +69,15 @@ async def run_turn(
                 await thinking.remove()
             except Exception:
                 pass
+        # Drain any deltas still in the buffer of the most recent assistant
+        # widget so the final word(s) of the response don't sit in-buffer
+        # until the next mount_message triggers a refresh.
+        last = getattr(app, "_last_assistant_widget", None)
+        if last is not None:
+            try:
+                last.finalize()
+            except Exception:
+                pass
 
     return "".join(final_text_parts)
 
@@ -83,15 +92,15 @@ async def _dispatch(
     if isinstance(ev, TextDelta):
         if current_assistant is None:
             current_assistant = AssistantMessage()
+            # Keep the viewport pinned each time the buffered widget flushes
+            # (~30 Hz) instead of every TextDelta. mount_message scrolls once
+            # at mount; from then on the widget itself drives scroll-pinning
+            # at the same cadence as its repaints.
+            current_assistant.set_on_flush(lambda: _scroll_to_end(app))
             await app.mount_message(current_assistant)
             app._last_assistant_widget = current_assistant
         current_assistant.append(ev.content)
         final_text_parts.append(ev.content)
-        # Keep the viewport pinned to the newest content as the widget
-        # grows — mount_message only scrolls once at mount time, so single
-        # large deltas (non-streamed responses) would otherwise land below
-        # the fold.
-        _scroll_to_end(app)
 
     elif isinstance(ev, ThinkingDelta):
         # For now, reasoning is silent. Future: dedicated ThinkingMessage.
@@ -118,10 +127,14 @@ async def _dispatch(
 
     elif isinstance(ev, Usage):
         if app._status_bar is not None:
-            app._status_bar.update_usage(ev)
+            # Mid-stream Usage events are coalesced to ~1 Hz so the
+            # status bar doesn't repaint on every token.
+            app._status_bar.update_usage_throttled(ev)
 
     elif isinstance(ev, Done):
         if ev.usage and app._status_bar is not None:
+            # Final flush — apply any pending mid-stream delta plus the
+            # ``Done`` totals in one synchronous repaint.
             app._status_bar.update_usage(ev.usage)
 
 

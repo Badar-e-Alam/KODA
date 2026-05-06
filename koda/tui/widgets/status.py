@@ -7,6 +7,8 @@ by the app.
 
 from __future__ import annotations
 
+from typing import Any
+
 from textual.reactive import reactive
 from textual.widgets import Static
 
@@ -49,12 +51,57 @@ class StatusBar(Static):
     def set_model(self, provider: str, model: str) -> None:
         self.model = f"{provider}:{model}" if provider else (model or "")
 
+    # ── Usage updates ─────────────────────────────────────────────────
+    #
+    # Each token streamed by some providers fires a Usage event. Setting
+    # the three reactive properties immediately would trigger three
+    # ``_refresh_display`` repaints per event — noticeable mid-stream.
+    # ``update_usage_throttled`` accumulates deltas in a private buffer
+    # and flushes them at most ~1 Hz; ``update_usage`` (un-throttled) is
+    # kept for the final ``Done`` flush and the legacy direct-call path.
+    _USAGE_FLUSH_INTERVAL = 1.0
+
     def update_usage(self, usage: Usage) -> None:
+        """Apply a Usage delta immediately. Use for one-shot updates."""
+        self._flush_pending_usage()
         self.input_tokens += usage.input_tokens
         self.output_tokens += usage.output_tokens
         self.cache_read += usage.cache_read_tokens
 
+    def update_usage_throttled(self, usage: Usage) -> None:
+        """Coalesce mid-stream Usage deltas into a ~1 Hz repaint."""
+        pending = getattr(self, "_pending_usage", None)
+        if pending is None:
+            pending = [0, 0, 0]
+            self._pending_usage = pending
+        pending[0] += usage.input_tokens
+        pending[1] += usage.output_tokens
+        pending[2] += usage.cache_read_tokens
+        timer: Any = getattr(self, "_usage_flush_timer", None)
+        if timer is None:
+            self._usage_flush_timer = self.set_timer(
+                self._USAGE_FLUSH_INTERVAL, self._flush_pending_usage
+            )
+
+    def _flush_pending_usage(self) -> None:
+        timer: Any = getattr(self, "_usage_flush_timer", None)
+        if timer is not None:
+            try:
+                timer.stop()
+            except Exception:
+                pass
+            self._usage_flush_timer = None
+        pending = getattr(self, "_pending_usage", None)
+        if not pending or not any(pending):
+            self._pending_usage = None
+            return
+        self.input_tokens += pending[0]
+        self.output_tokens += pending[1]
+        self.cache_read += pending[2]
+        self._pending_usage = None
+
     def reset_usage(self) -> None:
+        self._flush_pending_usage()
         self.input_tokens = 0
         self.output_tokens = 0
         self.cache_read = 0

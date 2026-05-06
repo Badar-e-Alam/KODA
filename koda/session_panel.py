@@ -56,9 +56,9 @@ class SessionInfo:
 def scan_sessions(sessions_dir: Path, limit: int = 50) -> list[SessionInfo]:
     """Scan *sessions_dir* for JSONL session files and return metadata.
 
-    Returns a list sorted newest-first, capped at *limit*.  Only the
-    first ~30 lines of each file are read so this stays fast even with
-    large session histories.
+    Returns a list sorted newest-first, capped at *limit*.  The first
+    ~30 lines are parsed for the header + first user message; remaining
+    lines are counted in the same pass for a rough message-count display.
     """
     if not sessions_dir.exists():
         return []
@@ -76,12 +76,15 @@ def scan_sessions(sessions_dir: Path, limit: int = 50) -> list[SessionInfo]:
         first_user_msg = ""
         msg_count = 0
         session_id = ""
+        total_lines = 0
 
         try:
             with open(fpath, "r", encoding="utf-8") as f:
                 for i, line in enumerate(f):
+                    total_lines += 1
                     if i > 30:
-                        break
+                        # Past the parse window: just keep counting lines.
+                        continue
                     line = line.strip()
                     if not line:
                         continue
@@ -97,10 +100,6 @@ def scan_sessions(sessions_dir: Path, limit: int = 50) -> list[SessionInfo]:
                         msg_count += 1
                         if not first_user_msg and entry.get("role") == "user":
                             first_user_msg = entry.get("content", "")
-
-            # Fast total-line count as a rough message estimate.
-            with open(fpath, "r", encoding="utf-8") as f:
-                total_lines = sum(1 for _ in f)
             msg_count = max(msg_count, total_lines - 1)
         except OSError:
             continue
@@ -268,25 +267,50 @@ class SessionPanel(Vertical):
         yield Static("", id="session-count")
 
     def on_mount(self) -> None:
+        # Show a lightweight placeholder immediately, then run the
+        # (potentially slow) directory scan on a worker thread so the rest
+        # of the TUI paints without waiting on filesystem I/O.
+        try:
+            self.query_one("#session-count", Static).update("[dim]Loading…[/]")
+        except Exception:
+            pass
         self.refresh_sessions()
 
     # ── Public API ───────────────────────────────────────────────────
 
     def refresh_sessions(self) -> None:
-        """Re-scan session files and rebuild the list."""
-        self._sessions = scan_sessions(self._sessions_dir)
-        list_view = self.query_one("#session-list", SessionListView)
-        list_view.clear()
+        """Kick off a background scan; render results on the main thread."""
+        self.run_worker(
+            self._scan_and_render,
+            exclusive=True,
+            thread=True,
+            name="session-scan",
+        )
 
-        for info in self._sessions:
+    def _scan_and_render(self) -> None:
+        """Worker entry: scan in the thread, hop back to the UI to render."""
+        sessions = scan_sessions(self._sessions_dir)
+        self.app.call_from_thread(self._render_sessions, sessions)
+
+    def _render_sessions(self, sessions: list[SessionInfo]) -> None:
+        """Rebuild the list on the main thread from a scanned snapshot."""
+        self._sessions = sessions
+        try:
+            list_view = self.query_one("#session-list", SessionListView)
+        except Exception:
+            return
+        list_view.clear()
+        for info in sessions:
             is_active = info.session_id == self._current_session_id
             list_view.append(SessionItem(info, is_active=is_active))
-
-        count_label = self.query_one("#session-count", Static)
-        count_label.update(
-            f"[dim]{len(self._sessions)} sessions[/]\n"
-            f"[dim]Del[/] delete  [dim]Ctrl+B[/] toggle"
-        )
+        try:
+            count_label = self.query_one("#session-count", Static)
+            count_label.update(
+                f"[dim]{len(sessions)} sessions[/]\n"
+                f"[dim]Del[/] delete  [dim]Ctrl+B[/] toggle"
+            )
+        except Exception:
+            pass
 
     def set_active_session(self, session_id: str) -> None:
         """Mark a different session as active and refresh."""

@@ -61,18 +61,58 @@ class UserMessage(BaseMessage):
 
 
 class AssistantMessage(BaseMessage):
-    """Streaming assistant text. Call `append(delta)` for each TextDelta."""
+    """Streaming assistant text. Call `append(delta)` for each TextDelta.
+
+    Deltas are buffered and flushed at ~30 fps. Per-token ``self.update()``
+    forces Textual to re-measure and re-layout the entire growing message
+    on every token; coalescing into a single concat + update per frame
+    keeps streaming smooth on slow terminals.
+    """
+
+    _FLUSH_INTERVAL = 0.033  # ~30 fps
 
     def __init__(self, content: str = "", **kwargs: Any) -> None:
         super().__init__(content, **kwargs)
         self._content = content
+        self._buffer: list[str] = []
+        self._flush_timer: Any = None
+        self._on_flush: Any = None  # optional callback (e.g. scroll-to-end)
 
     def append(self, delta: str) -> None:
-        self._content += delta
+        self._buffer.append(delta)
+        if self._flush_timer is None:
+            self._flush_timer = self.set_timer(self._FLUSH_INTERVAL, self._flush)
+
+    def set_on_flush(self, cb: Any) -> None:
+        """Register a no-arg callback fired after each buffer flush."""
+        self._on_flush = cb
+
+    def _flush(self) -> None:
+        self._flush_timer = None
+        if not self._buffer:
+            return
+        self._content += "".join(self._buffer)
+        self._buffer.clear()
         self.update(self._content)
+        if self._on_flush is not None:
+            try:
+                self._on_flush()
+            except Exception:
+                pass
+
+    def finalize(self) -> None:
+        """Flush any pending deltas and stop the timer. Idempotent."""
+        if self._flush_timer is not None:
+            try:
+                self._flush_timer.stop()
+            except Exception:
+                pass
+            self._flush_timer = None
+        self._flush()
 
     def set_text(self, text: str) -> None:
         self._content = text
+        self._buffer.clear()
         self.update(text)
 
 
@@ -144,21 +184,36 @@ class ThinkingMessage(BaseMessage):
     """Pulsing placeholder shown while the agent is preparing its response.
 
     Removed as soon as the first TextDelta or ToolStart event arrives.
+    The first paint is delayed 300 ms so fast model responses (first
+    delta in <200 ms) never animate at all — saves a render storm on
+    every turn.
     """
 
     _FRAMES = ("·   ", "··  ", "··· ", " ···", "  ··", "   ·")
+    _START_DELAY = 0.30
+    _TICK_INTERVAL = 0.25  # 4 Hz — slow enough not to fight streaming
 
     def __init__(self, label: str = "Thinking", **kwargs: Any) -> None:
         super().__init__("", **kwargs)
         self._label = label
         self._frame = 0
         self._timer = None
+        self._start_timer = None
 
     def on_mount(self) -> None:
+        self._start_timer = self.set_timer(self._START_DELAY, self._begin_animation)
+
+    def _begin_animation(self) -> None:
+        self._start_timer = None
         self._tick()
-        self._timer = self.set_interval(0.15, self._tick)
+        self._timer = self.set_interval(self._TICK_INTERVAL, self._tick)
 
     def on_unmount(self) -> None:
+        if self._start_timer is not None:
+            try:
+                self._start_timer.stop()
+            except Exception:
+                pass
         if self._timer is not None:
             self._timer.stop()
 

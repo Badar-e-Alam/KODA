@@ -28,6 +28,19 @@ koda_with_delete.svg
 .koda/
 ~/.koda/
 
+# Local-only databases / runtime state — never commit
+*.db
+*.sqlite
+*.sqlite3
+chronos.db
+
+# One-off downloads / demo scratch — not part of the codebase
+get-pip.py
+take_screenshot.py
+index.html
+script.js
+style.css
+
 # Editor
 .idea/
 .vscode/

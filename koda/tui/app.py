@@ -28,7 +28,6 @@ from koda.model_config import (
     ModelSpec,
     has_provider_credentials,
     probe_provider,
-    warm_cache_in_background,
 )
 from koda.session import SessionTree
 from koda.session_panel import ConfirmDeleteScreen, SessionPanel
@@ -205,8 +204,8 @@ class KodaApp(App):
             self._banner.set_connected()
         self._chat_input.focus()
 
-        # Warm model-discovery cache off the hot path so /model is instant.
-        warm_cache_in_background()
+        # Note: the model-discovery cache is already warmed in
+        # ``koda/__main__.py`` before app boot, so no second warm here.
 
         # Build the real adapter in a worker thread so the TUI is
         # interactive immediately. Heavy imports (langgraph, langchain,
