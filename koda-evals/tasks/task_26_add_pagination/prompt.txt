@@ -1,0 +1,10 @@
+The `list_users()` function in `users.py` returns all users at once. Add pagination support:
+
+    list_users(page=1, per_page=10)
+
+It should:
+- Return a dict with `{"users": [...], "total": N, "page": page, "per_page": per_page}`
+- Validate that `page` and `per_page` are positive integers
+- Return empty `users` list and correct `total` for out-of-range pages
+
+All tests in `test_users.py` must pass.

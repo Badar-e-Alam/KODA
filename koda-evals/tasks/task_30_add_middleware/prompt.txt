@@ -1,0 +1,5 @@
+The `App` class in `app.py` has a `register_route` method. Add a `use(middleware)` method that wraps all registered routes so middleware runs before the route handler.
+
+A middleware is a callable `(handler) -> new_handler`.
+
+All tests in `test_app.py` must pass.

@@ -1,0 +1,3 @@
+The `merge_records(records)` function in `merger.py` merges a list of dicts into one, but overwrites values when keys collide instead of collecting them into lists.
+
+Fix it so colliding keys produce lists of all values. All tests in `test_merger.py` must pass.

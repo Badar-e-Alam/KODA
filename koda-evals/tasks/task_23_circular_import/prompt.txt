@@ -1,0 +1,3 @@
+The `models.py` and `validators.py` modules have a circular import that crashes on import. `models.py` imports `validators` at the top, and `validators.py` imports `models` inside a function.
+
+Restructure the code to eliminate the circular import while keeping all functionality. All tests in `test_models.py` must pass.

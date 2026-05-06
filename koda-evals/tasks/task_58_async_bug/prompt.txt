@@ -1,0 +1,3 @@
+The `fetch_all(urls)` function in `fetcher.py` is supposed to fetch URLs concurrently but currently awaits them sequentially.
+
+Fix it to use `asyncio.gather` for true concurrency. All tests in `test_fetcher.py` must pass.

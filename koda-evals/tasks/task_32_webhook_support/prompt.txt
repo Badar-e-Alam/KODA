@@ -1,0 +1,8 @@
+The `Notifier` class in `notifier.py` only logs to console. Add webhook support:
+
+- `register_webhook(url)` — stores the URL
+- `notify(message)` — POSTs JSON `{"text": message}` to the webhook if registered
+- If webhook call fails (simulate with a bool flag), fall back to console
+- Use `urllib.request` (no external deps)
+
+All tests in `test_notifier.py` must pass.

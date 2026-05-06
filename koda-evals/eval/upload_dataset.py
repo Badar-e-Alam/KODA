@@ -3,12 +3,15 @@
 After running this, every task becomes a `dataset_item` in Langfuse and
 each eval run is linked to it for easy comparison.
 
-    python -m eval.upload_dataset
+    python -m eval.upload_dataset                           # default dataset name
+    KODA_EVAL_DATASET=koda-coding-evals-v2 python -m eval.upload_dataset
+    python -m eval.upload_dataset --dataset koda-coding-evals-v2
 
 Re-run after editing tasks; it upserts by task name (dedup on input.task).
 """
 from __future__ import annotations
 
+import argparse
 import json
 import os
 import sys
@@ -23,6 +26,19 @@ TASKS_DIR = ROOT / "tasks"
 
 
 def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--dataset",
+        default=os.getenv("KODA_EVAL_DATASET", DATASET_NAME),
+        help="Langfuse dataset name (default: $KODA_EVAL_DATASET or langfuse_reporter.DATASET_NAME)",
+    )
+    parser.add_argument(
+        "--description",
+        default="KODA coding agent eval suite — disk-curated tasks.",
+        help="dataset description (only set on first creation)",
+    )
+    args = parser.parse_args()
+
     if not os.getenv("LANGFUSE_PUBLIC_KEY"):
         sys.exit("LANGFUSE_PUBLIC_KEY not set. Did you load .env?")
 
@@ -32,18 +48,20 @@ def main():
         host=os.getenv("LANGFUSE_HOST", "https://cloud.langfuse.com"),
     )
 
+    dataset_name = args.dataset
+
     # Create dataset (idempotent — Langfuse upserts)
     client.create_dataset(
-        name=DATASET_NAME,
-        description="KODA coding agent eval suite — 10 tasks across bug fixes, features, refactors, and perf.",
-        metadata={"version": "1.0", "source": "github.com/yourorg/koda-evals"},
+        name=dataset_name,
+        description=args.description,
+        metadata={"version": "2.0", "source": "github.com/yourorg/koda-evals"},
     )
-    print(f"✓ dataset: {DATASET_NAME}")
+    print(f"✓ dataset: {dataset_name}")
 
     # Snapshot existing items so we can dedup by task name
     existing = {}
     try:
-        for it in client.get_dataset(DATASET_NAME).items:
+        for it in client.get_dataset(dataset_name).items:
             existing[it.input.get("task")] = it.id
     except Exception:
         pass
@@ -66,7 +84,7 @@ def main():
                     repo_files[rel] = "<binary>"
 
         client.create_dataset_item(
-            dataset_name=DATASET_NAME,
+            dataset_name=dataset_name,
             id=existing.get(task_dir.name),  # reuse id if it exists → upsert
             input={"task": task_dir.name, "prompt": prompt},
             expected_output={"grader": "test.sh exits 0", "hint": hint},
@@ -79,7 +97,7 @@ def main():
         print(f"  + {task_dir.name}")
         count += 1
 
-    print(f"\n✓ uploaded {count} tasks to Langfuse dataset '{DATASET_NAME}'")
+    print(f"\n✓ uploaded {count} tasks to Langfuse dataset '{dataset_name}'")
     client.flush()
 
 

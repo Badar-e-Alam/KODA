@@ -1,0 +1,3 @@
+The `is_due_today(due_date)` function in `scheduler.py` compares a due date (naive datetime) against `datetime.now()`. The comparison fails when the due date is from a different timezone because it doesn't account for timezone offsets.
+
+Fix the bug so all tests in `test_scheduler.py` pass. Treat naive datetimes as UTC.

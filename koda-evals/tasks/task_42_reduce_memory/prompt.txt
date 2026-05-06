@@ -1,0 +1,3 @@
+The `read_large_file(path)` function in `reader.py` reads the entire file into memory. Rewrite it as a generator that yields one line at a time.
+
+All tests in `test_reader.py` must pass.

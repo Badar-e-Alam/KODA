@@ -1,0 +1,3 @@
+The `remove_expired(items)` function in `inventory.py` removes expired items from a list while iterating over it, causing some items to be skipped.
+
+Fix the bug so all expired items are removed. All tests in `test_inventory.py` must pass.
