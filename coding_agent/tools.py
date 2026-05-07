@@ -7,6 +7,11 @@ from pathlib import Path
 from pydantic import BaseModel
 from agents import function_tool
 
+from memory import (
+    VALID_TYPES as _MEMORY_TYPES,
+    get_memory_store as _get_memory_store,
+)
+
 
 class FindReplace(BaseModel):
     """One find/replace operation for `multi_edit`."""
@@ -557,3 +562,150 @@ def run_tests(framework: str = "auto", args: str = "", path: str = ".") -> str:
     tail = output[-4000:]
     return f"framework={fw} exit={r.returncode}\nsummary: {summary}\n--output (tail)--\n{tail}"
 
+
+# ── Persistent memory ──────────────────────────────────────────────────
+#
+# These tools write to ``<project_root>/.koda/memory/`` so the agent can
+# carry non-obvious facts (user preferences, project decisions, gotchas)
+# across sessions. The store is anchored by ``CodingAgent.__init__`` via
+# ``memory.set_memory_root``.
+
+_MEMORY_TYPE_HELP = (
+    "Type must be one of: "
+    "user (who the user is, role, expertise), "
+    "feedback (corrections or validated approaches — include WHY), "
+    "project (current initiatives, deadlines, decisions), "
+    "reference (pointers to external systems or files)."
+)
+
+
+@function_tool
+def save_memory(name: str, type: str, description: str, content: str) -> str:
+    """Persist a durable fact to .koda/memory/ so future sessions inherit it.
+
+    Use this when the user tells you something non-obvious that should
+    survive context compaction or a session restart: a preference
+    ("we always use ruff with line-length 100"), a correction ("don't
+    mock the database"), a project fact ("merge freeze on 2026-03-05"),
+    or an external pointer ("oncall dashboard at grafana.internal/...").
+
+    Do NOT save: code patterns derivable from the repo, ephemeral task
+    state, or anything already in CLAUDE.md / AGENTS.md.
+
+    Args:
+      name: Short, unique title (becomes the filename slug).
+      type: One of user / feedback / project / reference. See type help below.
+      description: One-line summary shown in the index.
+      content: The full memory body (markdown). Lead with the rule/fact,
+               then a "Why:" line and a "How to apply:" line for feedback
+               or project memories.
+    """
+    store = _get_memory_store()
+    if store is None:
+        return "[error] memory store not initialized (no project root anchored)"
+    try:
+        path = store.save(name, type, description, content)
+    except ValueError as e:
+        return f"[error] {e}\n{_MEMORY_TYPE_HELP}"
+    return f"saved memory {name!r} → {path.relative_to(store.project_root)}"
+
+
+@function_tool
+def update_memory(name: str, content: str) -> str:
+    """Replace the body of an existing memory; frontmatter (type, description) is preserved.
+
+    Use to refine a memory whose facts have evolved. To change the
+    description or type, delete and re-save.
+    """
+    store = _get_memory_store()
+    if store is None:
+        return "[error] memory store not initialized"
+    try:
+        path = store.update(name, content)
+    except (ValueError, FileNotFoundError) as e:
+        return f"[error] {e}"
+    return f"updated memory {name!r} → {path.relative_to(store.project_root)}"
+
+
+@function_tool
+def delete_memory(name: str) -> str:
+    """Remove a memory whose facts are stale or wrong.
+
+    Prefer ``update_memory`` when only the body is outdated. Delete only
+    when the memory should no longer influence the agent at all.
+    """
+    store = _get_memory_store()
+    if store is None:
+        return "[error] memory store not initialized"
+    if store.delete(name):
+        return f"deleted memory {name!r}"
+    return f"[warn] no memory named {name!r}"
+
+
+# ── Explore (read-only subagent) ───────────────────────────────────────
+#
+# Spawns a child agent loop limited to read-only tools and returns just
+# its final natural-language summary. Keeps the parent's context small
+# when answering "where is X?" / "what calls Y?" / "give me a quick map
+# of Z" questions — the child's tool calls and intermediate reads stay
+# private. Trade-off: latency (extra LLM round-trips) vs. context.
+
+EXPLORER_PROMPT = """You are an EXPLORER subagent. Your only job is to investigate the user's question and return a concise natural-language summary.
+
+You have READ-ONLY tools: read_file, grep, glob_files, git_status, git_diff, git_log, git_blame. You CANNOT write, edit, run shell commands, or modify memory.
+
+Process:
+1. Plan briefly which files/symbols to look at. Don't restate the question.
+2. Use grep / glob_files to locate; use read_file (sliced) to confirm. Batch tool calls when independent.
+3. Stop as soon as you can answer. Don't read every file in the repo.
+
+Answer format:
+- Lead with the answer in 1-2 sentences.
+- Cite specific files with `path:line` when applicable.
+- If the question can't be answered from the repo, say so explicitly — don't speculate.
+- Keep the whole reply under ~300 words. The parent agent only sees this final reply, not your tool calls."""
+
+
+def _explore_tools() -> list:
+    """Return the read-only tool subset the explorer is allowed to use."""
+    return [read_file, grep, glob_files, git_status, git_diff, git_log, git_blame]
+
+
+@function_tool
+def explore(query: str, focus_paths: list[str] | None = None) -> str:
+    """Spawn a read-only subagent to investigate, returning ONLY its summary.
+
+    Use for "where is X defined?", "what calls Y?", "give me a quick map
+    of Z" style questions. The subagent's tool calls and intermediate
+    file reads stay out of your context — only the final summary returns.
+
+    Trade-off: an extra LLM round-trip vs. keeping your context small.
+    Worth it when you'd otherwise grep + read 5+ files just to answer one
+    orientation question.
+
+    Args:
+      query: The investigation question, phrased naturally.
+      focus_paths: Optional list of paths/globs to direct the explorer at
+                   first (e.g. ``["coding_agent/", "tests/test_*.py"]``).
+                   The explorer can still read elsewhere if needed.
+
+    Returns:
+      The explorer's final summary string. Errors are returned with an
+      ``[error]`` prefix so the calling loop can recover.
+    """
+    # Lazy import dodges the agent <-> tools circular at module load time.
+    from agent import get_active_agent
+
+    a = get_active_agent()
+    if a is None:
+        return "[error] explore unavailable (no active agent registered)"
+
+    extra = ""
+    if focus_paths:
+        bullets = "\n".join(f"  - {p}" for p in focus_paths)
+        extra = f"\n\nFocus on these paths first (but you may read others if needed):\n{bullets}"
+    full_query = (
+        f"{query.strip()}{extra}\n\n"
+        "Reply with a concise summary only — no preamble, no recap of these instructions."
+    )
+    return a._run_subagent(EXPLORER_PROMPT, full_query, _explore_tools(), max_steps=12)

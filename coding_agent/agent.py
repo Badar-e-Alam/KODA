@@ -2,9 +2,12 @@ import asyncio
 import json
 import logging
 import os
+import platform
+import re
 import sys
 import time
 import uuid
+from datetime import date
 from pathlib import Path
 from typing import Any
 
@@ -58,6 +61,16 @@ from tools import (
     git_blame,
     run_tests,
     set_approval_mode,
+    save_memory,
+    update_memory,
+    delete_memory,
+    explore,
+)
+from memory import set_memory_root, get_memory_store, INDEX_FILENAME, MEMORY_DIRNAME
+from project_state import (
+    BootstrapAction,
+    decide_bootstrap_action,
+    save_snapshot,
 )
 
 
@@ -67,6 +80,8 @@ _TOOLS = [
     multi_edit, glob_files, web_fetch,
     git_status, git_diff, git_log, git_blame,
     run_tests,
+    save_memory, update_memory, delete_memory,
+    explore,
 ]
 
 AGENTS_MD_NAME = "AGENTS.md"
@@ -101,6 +116,28 @@ _COMPACT_KEEP_RECENT_BLOCKS = int(
 )
 _COMPACT_DISABLED = os.getenv("KODA_DISABLE_COMPACT", "0") == "1"
 _SUMMARY_MAX_CHARS = int(os.getenv("KODA_COMPACT_SUMMARY_CHARS", "2000"))
+
+# ── Subagent / explore plumbing ─────────────────────────────────────────
+#
+# Tools are registered as bare module-level functions, so they can't see
+# ``self`` on the running CodingAgent. We expose the active agent as a
+# module-level singleton (set in ``__init__``) so the ``explore`` tool can
+# call back into it. Same pattern as ``memory.set_memory_root``.
+#
+# Depth counter prevents an explorer from spawning explorers. The agent
+# loop is synchronous, so a plain int is enough — no locking needed.
+_active_agent: "CodingAgent | None" = None
+_subagent_depth: int = 0
+_MAX_SUBAGENT_DEPTH = 1
+
+
+def _set_active_agent(a: "CodingAgent") -> None:
+    global _active_agent
+    _active_agent = a
+
+
+def get_active_agent() -> "CodingAgent | None":
+    return _active_agent
 
 
 def _message_chars(msg: dict) -> int:
@@ -175,12 +212,127 @@ def _render_for_summary(messages: list[dict]) -> str:
     return "\n\n".join(parts)
 
 
+# ── AGENTS.md cascade ───────────────────────────────────────────────────
+#
+# Mirrors the Codex-style hierarchical AGENTS.md walk: from cwd, walk up to
+# the git work-tree root collecting AGENTS.md at each level, plus a
+# user-level ~/.koda/AGENTS.md. Closer files are more specific and appended
+# *last* so the LLM treats them as the most recent (winning) instructions.
+USER_AGENTS_MD = Path.home() / ".koda" / AGENTS_MD_NAME
+_MAX_CASCADE_LEVELS = 8
+
+
+def _git_toplevel(start: Path) -> Path | None:
+    """Return the git work-tree root containing ``start``, or None."""
+    try:
+        r = subprocess.run(
+            ["git", "rev-parse", "--show-toplevel"],
+            cwd=start, capture_output=True, text=True, timeout=3,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired, NotADirectoryError):
+        return None
+    if r.returncode != 0:
+        return None
+    top = r.stdout.strip()
+    return Path(top).resolve() if top else None
+
+
+def _agents_md_chain(project_root: Path) -> list[Path]:
+    """Return AGENTS.md paths to consider, ordered general → specific.
+
+    User-level first (most general fallback), then outermost git ancestor
+    down to ``project_root`` last. Used by both the loader and the cache
+    so both consider the same set of files.
+    """
+    chain: list[Path] = [USER_AGENTS_MD]
+    stop_at = _git_toplevel(project_root)
+    walk: list[Path] = []
+    cur = project_root.resolve()
+    for _ in range(_MAX_CASCADE_LEVELS):
+        walk.append(cur / AGENTS_MD_NAME)
+        if stop_at is not None and cur == stop_at:
+            break
+        if cur.parent == cur:
+            break
+        cur = cur.parent
+    chain.extend(reversed(walk))
+    return chain
+
+
+def _collect_agents_md_files(project_root: Path) -> list[tuple[Path, str]]:
+    """Read each AGENTS.md in the cascade. Returns ``[(path, content), …]``."""
+    out: list[tuple[Path, str]] = []
+    seen: set[Path] = set()
+    for path in _agents_md_chain(project_root):
+        try:
+            rp = path.resolve()
+        except OSError:
+            continue
+        if rp in seen:
+            continue
+        seen.add(rp)
+        if not rp.exists():
+            continue
+        try:
+            content = rp.read_text().strip()
+        except OSError:
+            continue
+        if content:
+            out.append((rp, content))
+    return out
+
+
 def _read_agents_md(project_root: Path) -> str:
-    """Return AGENTS.md contents (stripped) or '' if absent/empty."""
+    """Return the project-root AGENTS.md (stripped) or '' if absent/empty.
+
+    Kept as a thin shim for callers that only care about the file the
+    agent itself would *write* to (e.g. bootstrap target).
+    """
     path = project_root / AGENTS_MD_NAME
     if not path.exists():
         return ""
-    return path.read_text().strip()
+    try:
+        return path.read_text().strip()
+    except OSError:
+        return ""
+
+
+def _compose_env_block(project_root: Path, *, model_name: str | None = None) -> str:
+    """Return the ``<env>`` block prepended to the system prompt.
+
+    Gives the model a stable header it can rely on for "where am I, when
+    is it, what model am I" instead of having to ask via tools. Cheap —
+    one short ``git rev-parse`` if we're in a repo, otherwise no I/O.
+    """
+    is_git_repo = (project_root / ".git").exists() or _git_toplevel(project_root) is not None
+    branch = ""
+    if is_git_repo:
+        try:
+            r = subprocess.run(
+                ["git", "rev-parse", "--abbrev-ref", "HEAD"],
+                cwd=project_root, capture_output=True, text=True, timeout=3,
+            )
+            if r.returncode == 0:
+                branch = r.stdout.strip()
+        except (FileNotFoundError, subprocess.TimeoutExpired, NotADirectoryError):
+            pass
+
+    parts = [
+        "<env>",
+        f"cwd: {project_root}",
+        f"platform: {sys.platform}",
+        f"os: {platform.platform(terse=True)}",
+        f"python: {platform.python_version()}",
+        f"shell: {os.getenv('SHELL', 'unknown')}",
+        f"date: {date.today().isoformat()}",
+    ]
+    if model_name:
+        parts.append(f"model: {model_name}")
+    parts.append(f"is_git_repo: {str(is_git_repo).lower()}")
+    if branch:
+        parts.append(f"git_branch: {branch}")
+    parts.append("</env>")
+    return "\n".join(parts)
 
 
 def _compose_git_context(project_root: Path) -> str:
@@ -214,53 +366,133 @@ def _compose_git_context(project_root: Path) -> str:
     return "# Git context (snapshot at session start)\n\n" + "\n\n".join(parts) + "\n"
 
 
-def _compose_instructions(base: str, project_root: Path) -> str:
-    """Append AGENTS.md and git context to the system prompt when present."""
-    out = base
-    project_md = _read_agents_md(project_root)
-    if project_md:
-        out = f"{out}\n\n# Project context (from {AGENTS_MD_NAME})\n\n{project_md}\n"
+def _compose_instructions(
+    base: str,
+    project_root: Path,
+    *,
+    model_name: str | None = None,
+) -> str:
+    """Wrap the base system prompt with env block + AGENTS.md cascade + git.
+
+    Layout of the composed prompt::
+
+        <env>...</env>          ← always present, gives orientation
+        <base system prompt>
+        # Project context (AGENTS.md cascade — closer files override)
+          ### AGENTS.md (~/.koda/AGENTS.md)        ← user-level
+          ### AGENTS.md (../AGENTS.md)             ← parent
+          ### AGENTS.md (./AGENTS.md)              ← project root (winning)
+        # Git context (snapshot at session start)
+
+    Closer files appear *last* in the cascade so the LLM treats them as
+    the most recent (and authoritative) instructions.
+    """
+    env = _compose_env_block(project_root, model_name=model_name)
+    out = f"{env}\n\n{base}" if env else base
+
+    md_files = _collect_agents_md_files(project_root)
+    if md_files:
+        sections: list[str] = []
+        for path, content in md_files:
+            try:
+                label = str(path.relative_to(project_root))
+                if not label.startswith("."):
+                    label = f"./{label}"
+            except ValueError:
+                try:
+                    label = f"~/{path.relative_to(Path.home())}"
+                except ValueError:
+                    label = str(path)
+            sections.append(f"### AGENTS.md ({label})\n\n{content}")
+        out = (
+            f"{out}\n\n# Project context (AGENTS.md cascade — closer files override)"
+            f"\n\n" + "\n\n---\n\n".join(sections) + "\n"
+        )
+
+    mem = _read_memory_index(project_root)
+    if mem:
+        out = (
+            f"{out}\n\n# Persistent memory (.koda/memory/MEMORY.md — read individual "
+            f"entries with read_file when relevant)\n\n{mem}\n"
+        )
+
     git_ctx = _compose_git_context(project_root)
     if git_ctx:
         out = f"{out}\n\n{git_ctx}"
     return out
 
 
+def _memory_index_path(project_root: Path) -> Path:
+    return project_root / MEMORY_DIRNAME / INDEX_FILENAME
+
+
+def _read_memory_index(project_root: Path) -> str:
+    """Return ``.koda/memory/MEMORY.md`` contents (stripped) or '' if absent."""
+    path = _memory_index_path(project_root)
+    try:
+        return path.read_text().strip()
+    except OSError:
+        return ""
+
+
 # ── Composed-prompt cache ───────────────────────────────────────────────
 #
-# The composed prompt costs three git subprocess calls + a file read every
-# turn — significant TTFT on long sessions and the dominant local overhead
-# before the first token goes out. We memoize per (base, project_root) with
-# a 30s TTL plus an AGENTS.md mtime check, so the prompt still tracks repo
-# state but doesn't re-fork three processes per user message.
+# The composed prompt costs several git subprocess calls + a few file reads
+# every turn — significant TTFT on long sessions and the dominant local
+# overhead before the first token goes out. We memoize per
+# (base, project_root, model_name) with a 30s TTL plus a per-file mtime
+# tuple covering every AGENTS.md in the cascade, so any edit anywhere in
+# the cascade invalidates within the TTL.
 _COMPOSED_TTL = float(os.getenv("KODA_CODING_AGENT_PROMPT_TTL", "30"))
-_COMPOSED_CACHE: dict[tuple[int, str], tuple[float, float, str]] = {}
+_COMPOSED_CACHE: dict[
+    tuple[int, str, str | None],
+    tuple[float, tuple[tuple[str, float], ...], str],
+] = {}
 
 
-def _compose_instructions_cached(base: str, project_root: Path) -> str:
+def _agents_md_mtimes(project_root: Path) -> tuple[tuple[str, float], ...]:
+    """Snapshot mtimes of every prompt-affecting file (AGENTS.md cascade + memory index).
+
+    Missing files are recorded as ``0.0`` so creating one later still
+    invalidates the cache.
+    """
+    out: list[tuple[str, float]] = []
+    paths = list(_agents_md_chain(project_root))
+    paths.append(_memory_index_path(project_root))
+    for path in paths:
+        try:
+            mt = path.stat().st_mtime
+        except OSError:
+            mt = 0.0
+        out.append((str(path), mt))
+    return tuple(out)
+
+
+def _compose_instructions_cached(
+    base: str,
+    project_root: Path,
+    *,
+    model_name: str | None = None,
+) -> str:
     """Memoized variant of :func:`_compose_instructions`.
 
-    Cache key is ``(id(base), str(project_root))`` so distinct base prompts
-    don't collide. Invalidated when:
+    Cache key is ``(id(base), str(project_root), model_name)`` so distinct
+    base prompts / projects / models don't collide. Invalidated when:
       * the entry is older than ``_COMPOSED_TTL`` seconds, OR
-      * AGENTS.md's mtime changed since the entry was built.
+      * any AGENTS.md mtime in the cascade changed since the entry was built.
     """
-    key = (id(base), str(project_root))
+    key = (id(base), str(project_root), model_name)
     now = time.time()
-    md_path = project_root / AGENTS_MD_NAME
-    try:
-        md_mtime = md_path.stat().st_mtime
-    except OSError:
-        md_mtime = 0.0
+    mtimes = _agents_md_mtimes(project_root)
 
     cached = _COMPOSED_CACHE.get(key)
     if cached is not None:
-        ts, cached_mtime, value = cached
-        if now - ts < _COMPOSED_TTL and cached_mtime == md_mtime:
+        ts, cached_mtimes, value = cached
+        if now - ts < _COMPOSED_TTL and cached_mtimes == mtimes:
             return value
 
-    value = _compose_instructions(base, project_root)
-    _COMPOSED_CACHE[key] = (now, md_mtime, value)
+    value = _compose_instructions(base, project_root, model_name=model_name)
+    _COMPOSED_CACHE[key] = (now, mtimes, value)
     return value
 
 
@@ -324,19 +556,62 @@ class CodingAgent:
         self._lf = get_client()
         self.project_root = Path(project_root or os.getcwd()).resolve()
         self.agents_md_path = self.project_root / AGENTS_MD_NAME
+        # Anchor the persistent-memory store before composing the prompt;
+        # the composer reads .koda/memory/MEMORY.md if it exists.
+        set_memory_root(self.project_root)
+        # Register this agent so the ``explore`` tool can call back into
+        # it. The TUI runs one CodingAgent at a time, so last-set wins.
+        _set_active_agent(self)
         self._load_or_create_agents_md(auto_create_agents_md)
 
     def _load_or_create_agents_md(self, auto_create: bool) -> None:
-        """Append AGENTS.md to system prompt; bootstrap if missing and allowed."""
-        content = _read_agents_md(self.project_root)
-        if not content and auto_create:
-            _log.info("AGENTS.md not found at %s — bootstrapping...", self.agents_md_path)
-            self._bootstrap_agents_md()
-            content = _read_agents_md(self.project_root)
-        if content:
-            self.system_prompt = _compose_instructions(
-                self.system_prompt or SYSTEM_PROMPT, self.project_root
+        """Route between SKIP / DELTA / FULL bootstrap based on signal state.
+
+        - FULL: nothing in the AGENTS.md cascade (project, parents, user)
+          has any content → run the original full-explore bootstrap.
+        - DELTA: AGENTS.md exists but tracked signal files (manifests,
+          top-level dirs) have changed since the last snapshot → run a
+          *focused* update that only re-reads what changed.
+        - SKIP: AGENTS.md exists and signals are unchanged → use as-is.
+
+        After a successful FULL or DELTA bootstrap the new project-state
+        snapshot is persisted to ``.koda/state.json`` so the next session
+        has a fresh baseline to diff against.
+        """
+        cascade = _collect_agents_md_files(self.project_root)
+        agents_md_present = bool(cascade)
+
+        if auto_create:
+            action, changed, snap = decide_bootstrap_action(
+                self.project_root, agents_md_present=agents_md_present,
             )
+            if action is BootstrapAction.FULL:
+                _log.info(
+                    "No AGENTS.md found in cascade — full bootstrap at %s",
+                    self.agents_md_path,
+                )
+                self._bootstrap_agents_md()
+                # Re-snapshot after the file was written.
+                from project_state import collect_snapshot
+                save_snapshot(self.project_root, collect_snapshot(self.project_root))
+            elif action is BootstrapAction.DELTA:
+                _log.info(
+                    "AGENTS.md may be stale — delta update; %d signal(s) changed: %s",
+                    len(changed), ", ".join(changed[:5]),
+                )
+                self._delta_bootstrap_agents_md(changed)
+                from project_state import collect_snapshot
+                save_snapshot(self.project_root, collect_snapshot(self.project_root))
+            else:  # SKIP
+                # Still persist the snapshot if we don't have one yet, so the
+                # *next* run can detect changes against this baseline.
+                save_snapshot(self.project_root, snap)
+
+        self.system_prompt = _compose_instructions(
+            self._raw_system_prompt or SYSTEM_PROMPT,
+            self.project_root,
+            model_name=self.model,
+        )
 
     def _bootstrap_agents_md(self) -> None:
         """Run a one-shot agent loop with AGENTS_INIT_PROMPT to create AGENTS.md."""
@@ -353,12 +628,159 @@ class CodingAgent:
         finally:
             self.system_prompt = saved_prompt
 
+    def _delta_bootstrap_agents_md(self, changed_signals: list[str]) -> None:
+        """Update an existing AGENTS.md based on what changed.
+
+        Cheaper than a full bootstrap because the model is told *exactly*
+        which files moved — it can read just those plus the current
+        AGENTS.md, then write back a focused revision instead of
+        re-exploring the entire repo. Caps at 12 steps (full bootstrap is
+        20).
+        """
+        if not self.agents_md_path.exists():
+            # Cascade had a parent AGENTS.md but project root doesn't —
+            # treat as full to actually create the project file.
+            self._bootstrap_agents_md()
+            return
+        saved_prompt = self.system_prompt
+        try:
+            self.system_prompt = AGENTS_INIT_PROMPT
+            change_list = "\n".join(f"  - {c}" for c in changed_signals)
+            query = (
+                f"AGENTS.md at `{self.agents_md_path}` already exists. The "
+                f"following project signals changed since it was last "
+                f"updated:\n{change_list}\n\n"
+                f"Read the current AGENTS.md and the changed files (focus on "
+                f"these — do NOT re-explore the whole repo). Produce an "
+                f"UPDATED AGENTS.md that reflects the new state: bumped "
+                f"dependency versions, new commands, new top-level packages, "
+                f"removed sections, etc. Preserve sections unrelated to the "
+                f"changed signals. Save with `write_file` to "
+                f"`{self.agents_md_path}`. Reply `done` when saved."
+            )
+            self.run(query, max_steps=12, verbose=True)
+        finally:
+            self.system_prompt = saved_prompt
+
+    def _run_subagent(
+        self,
+        prompt: str,
+        query: str,
+        tools: list,
+        max_steps: int = 12,
+        verbose: bool = False,
+    ) -> str:
+        """Run a focused sub-loop with a different prompt + tool subset.
+
+        Saves and restores ``system_prompt`` / ``tools`` / ``_chat_model``
+        around the call. Tools are rebound on the unbound ``base_model``
+        (``self._summarizer_model`` is the same reference) so the parent
+        keeps its own bound model intact.
+
+        Returns the sub-loop's final assistant content. Errors bubble up
+        as a string starting with ``[error]`` so the parent's tool-result
+        handling stays uniform.
+        """
+        global _subagent_depth
+        if _subagent_depth >= _MAX_SUBAGENT_DEPTH:
+            return "[error] subagent max depth reached (no nested explore)"
+        saved_prompt = self.system_prompt
+        saved_tools = self.tools
+        saved_chat_model = self._chat_model
+        _subagent_depth += 1
+        try:
+            self.system_prompt = prompt
+            self.tools = list(tools)
+            self._chat_model = (
+                self._summarizer_model.bind_tools(self._tool_schemas())
+                if self.tools else self._summarizer_model
+            )
+            return self.run(query, max_steps=max_steps, verbose=verbose)
+        except Exception as e:  # noqa: BLE001 — never let a subagent crash the parent
+            _log.warning("subagent failed (%s: %s)", type(e).__name__, e)
+            return f"[error] subagent failed: {type(e).__name__}: {e}"
+        finally:
+            self.system_prompt = saved_prompt
+            self.tools = saved_tools
+            self._chat_model = saved_chat_model
+            _subagent_depth -= 1
+
     _RETRYABLE_LLM_ERRORS = (
         APIConnectionError,
         APITimeoutError,
         RateLimitError,
         InternalServerError,
     )
+
+    def _extract_durable_facts(self, slice_to_compact: list[dict]) -> list[dict]:
+        """Ask the model for durable facts in the slice worth saving as memory.
+
+        Runs *before* the lossy summarisation step in :meth:`_compact_if_needed`,
+        so anything worth remembering migrates from the conversation into
+        ``.koda/memory/`` before the originals are dropped. Returns the
+        list of facts actually persisted (for logging / telemetry); empty
+        list on any failure — compaction proceeds either way.
+        """
+        store = get_memory_store()
+        if store is None:
+            return []
+        rendered = _render_for_summary(slice_to_compact)
+        prompt = (
+            "Extract DURABLE facts from the following coding-agent transcript "
+            "that should survive into future sessions as persistent memory.\n\n"
+            "Save ONLY:\n"
+            "  - user: who the user is, role, expertise (when newly revealed)\n"
+            "  - feedback: explicit corrections OR validated approaches the user "
+            "confirmed (include WHY in the content)\n"
+            "  - project: ongoing initiatives, deadlines, decisions, incidents "
+            "(use ABSOLUTE dates, not 'tomorrow')\n"
+            "  - reference: pointers to external systems (Linear projects, "
+            "dashboards, channels)\n\n"
+            "Do NOT save: code patterns, file paths, debugging recipes, "
+            "ephemeral task state, or anything obvious from reading the repo.\n\n"
+            "Return a JSON array (and NOTHING else) of objects with keys: "
+            "name, type, description, content. Empty array [] if nothing "
+            "qualifies. Limit to 5 facts max.\n\n"
+            f"--- TRANSCRIPT ---\n{rendered}"
+        )
+        from langchain_core.messages import HumanMessage
+
+        try:
+            resp = self._summarizer_model.invoke([HumanMessage(content=prompt)])
+        except Exception as e:  # noqa: BLE001 — extraction must never crash a turn
+            _log.warning("memory extraction failed (%s: %s); skipping", type(e).__name__, e)
+            return []
+        raw = (getattr(resp, "content", None) or "").strip()
+        # Strip code fences if the model wrapped JSON in ``` blocks.
+        if raw.startswith("```"):
+            raw = re.sub(r"^```(?:json)?\s*|\s*```\s*$", "", raw, flags=re.DOTALL).strip()
+        try:
+            facts = json.loads(raw)
+        except (json.JSONDecodeError, TypeError):
+            _log.info("memory extraction returned non-JSON; skipping (head=%r)", raw[:160])
+            return []
+        if not isinstance(facts, list):
+            return []
+        saved: list[dict] = []
+        for f in facts[:5]:
+            if not isinstance(f, dict):
+                continue
+            try:
+                store.save(
+                    name=str(f.get("name", "")).strip(),
+                    type_=str(f.get("type", "project")).strip(),
+                    description=str(f.get("description", "")).strip(),
+                    content=str(f.get("content", "")).strip(),
+                )
+                saved.append(f)
+            except (ValueError, OSError) as e:
+                _log.info("memory save skipped (%s: %s)", type(e).__name__, e)
+        if saved:
+            _log.info(
+                "extracted %d durable fact(s) to .koda/memory/ pre-compaction",
+                len(saved),
+            )
+        return saved
 
     def _compact_if_needed(self, messages: list[dict]) -> bool:
         """Fold older history into a single summary system message in place.
@@ -367,8 +789,12 @@ class CodingAgent:
         ``KODA_COMPACT_THRESHOLD_CHARS`` (default 50k). Cuts only on user-
         message boundaries so the assistant ``tool_calls`` ↔ ``tool``
         pairing the next ``astream`` call requires stays intact. Preserves
-        ``messages[0]`` (the system prompt) verbatim. Returns ``True`` iff
-        a compaction actually fired (caller can use this for telemetry).
+        ``messages[0]`` (the system prompt) verbatim.
+
+        Before the lossy summary, runs :meth:`_extract_durable_facts` so
+        memory-worthy facts in the slice are persisted to
+        ``.koda/memory/`` before being dropped. Returns ``True`` iff a
+        compaction actually fired.
         """
         if _COMPACT_DISABLED:
             return False
@@ -381,6 +807,9 @@ class CodingAgent:
         start, cut = cut_info
 
         slice_to_compact = messages[start:cut]
+        # Persist durable facts first so they survive the upcoming drop.
+        saved_facts = self._extract_durable_facts(slice_to_compact)
+
         rendered = _render_for_summary(slice_to_compact)
         prompt = (
             f"You are a memory compactor. Summarise the following coding-agent "
@@ -402,17 +831,21 @@ class CodingAgent:
 
         if not summary.strip():
             return False
+        memory_note = (
+            f" + {len(saved_facts)} fact(s) saved to .koda/memory/"
+            if saved_facts else ""
+        )
         summary_msg = {
             "role": "system",
             "content": (
                 f"[compacted {len(slice_to_compact)} prior message(s); "
-                f"~{total} chars folded]\n\n{summary}"
+                f"~{total} chars folded{memory_note}]\n\n{summary}"
             ),
         }
         messages[start:cut] = [summary_msg]
         _log.info(
-            "compacted %d msgs (~%d chars) into 1 summary msg",
-            len(slice_to_compact), total,
+            "compacted %d msgs (~%d chars) into 1 summary msg (+%d memory)",
+            len(slice_to_compact), total, len(saved_facts),
         )
         return True
 
@@ -506,7 +939,9 @@ class CodingAgent:
         prompt reflects the *current* repo state — branch, dirty paths,
         recent commits — rather than a snapshot taken at construction.
         """
-        composed_sp = _compose_instructions_cached(self._raw_system_prompt, self.project_root)
+        composed_sp = _compose_instructions_cached(
+            self._raw_system_prompt, self.project_root, model_name=self.model
+        )
         msgs: list[dict] = [{"role": "system", "content": composed_sp}]
         for h in history:
             role = h.get("role")
