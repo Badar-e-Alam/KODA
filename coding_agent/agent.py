@@ -9,6 +9,7 @@ built-in filesystem tools. Model resolution (including `kimi:` /
 from __future__ import annotations
 
 import hashlib
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -22,6 +23,41 @@ from coding_agent.model import resolve_model
 from coding_agent.system_prompt_v2 import SYSTEM_PROMPT_V2
 from coding_agent.tools import EXTRA_TOOLS
 from coding_agent.tracing import langfuse_callbacks
+
+
+def _needs_bootstrap(root: Path) -> bool:
+    """True when ``<root>/AGENTS.md`` is missing or whitespace-only.
+
+    Whitespace-only counts as empty so a stray ``\\n`` from ``touch
+    AGENTS.md`` doesn't suppress the first-turn bootstrap. Anything
+    with real content (frontmatter, prose, even a single non-whitespace
+    char) is taken as "user-authored, don't overwrite." An unreadable
+    file is *not* bootstrapped — we'd rather surface the error than
+    clobber whatever's there.
+    """
+    agents_md = root / "AGENTS.md"
+    if not agents_md.exists():
+        return True
+    try:
+        return not agents_md.read_text(encoding="utf-8").strip()
+    except (OSError, UnicodeDecodeError):
+        return False
+
+
+def _render_system_prompt(root: Path) -> str:
+    """Substitute the per-session template fields into ``SYSTEM_PROMPT_V2``.
+
+    Session-start granularity (not per-turn): the date is captured once
+    when ``build_agent`` runs and stays stable across the compiled
+    graph's lifetime. A session crossing midnight gets a stale date
+    until the next ``koda`` launch — accepted to keep the prompt cache
+    hot across turns.
+    """
+    return SYSTEM_PROMPT_V2.format(
+        current_date=datetime.now(timezone.utc).strftime("%Y-%m-%d"),
+        cwd=str(root.resolve()),
+        bootstrap_required="true" if _needs_bootstrap(root) else "false",
+    )
 
 
 # ── Persistent memory (LangGraph checkpointer + thread scoping) ────────
@@ -108,9 +144,10 @@ async def build_agent(
         pass
 
     root = Path(cwd) if cwd else Path.cwd()
-    backend, store = build_backend(root, timeout=timeout, inherit_env=inherit_env)
+    backend = build_backend(root, timeout=timeout, inherit_env=inherit_env)
+    checkpointer = _build_checkpointer(root)
 
-    return create_deep_agent(
+    graph = create_deep_agent(
         model=resolve_model(model),
         backend=backend,
         # Extras layered on top of the deepagents defaults (`execute`,
@@ -120,22 +157,29 @@ async def build_agent(
         # Skill files live under the FilesystemBackend mounted at /skills/
         # inside the composite backend (see coding_agent/backend.py).
         skills=["/skills/"],
-        system_prompt=SYSTEM_PROMPT_V2,
+        # System prompt is rendered per-session with current_date / cwd /
+        # bootstrap_required substituted in. See _render_system_prompt
+        # and coding_agent/system_prompt_v2.py for the template.
+        system_prompt=_render_system_prompt(root),
         # Load AGENTS.md from the project root as durable project context.
         # deepagents' MemoryMiddleware silently skips this if the file doesn't
         # exist, and injects the contents under <agent_memory> in the system
-        # prompt. Path is relative to the backend root (cwd).
+        # prompt. Path is relative to the backend root (cwd). When AGENTS.md
+        # is missing or whitespace-only, _render_system_prompt sets
+        # bootstrap_required=true so the agent writes one on its first turn.
         memory=["/AGENTS.md"],
         # Persist graph state to disk so conversations survive restarts.
         # Caller must pass ``configurable.thread_id`` on invoke/stream;
         # ``run()`` below derives one from cwd via ``_thread_id_for``.
-        checkpointer=_build_checkpointer(root),
-        # Store backing the /memories/ route in the composite backend.
-        # Must be the same instance build_backend() returned so the
-        # namespace factory resolves against it at tool-call time.
-        store=store,
+        checkpointer=checkpointer,
         name="coding_agent",
     )
+    # Stash the aiosqlite Connection on the graph so the adapter can
+    # close it on shutdown. aiosqlite's worker thread is non-daemon, so
+    # without an explicit ``await conn.close()`` it pins the process
+    # open after Textual unmounts (terminal appears to hang).
+    graph._koda_checkpointer_conn = checkpointer.conn  # type: ignore[attr-defined]
+    return graph
 
 
 async def run(

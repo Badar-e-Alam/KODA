@@ -36,6 +36,16 @@ def _build_langfuse_handler() -> BaseCallbackHandler | None:
     """
     if not os.environ.get("LANGFUSE_PUBLIC_KEY"):
         return None
+
+    # Langfuse v4 reads ``LANGFUSE_HOST``; older project ``.env`` files
+    # tend to use ``LANGFUSE_BASE_URL``. Promote one to the other if only
+    # the legacy name is set so traces ship to the right place even when
+    # callers haven't migrated yet.
+    if not os.environ.get("LANGFUSE_HOST"):
+        legacy = os.environ.get("LANGFUSE_BASE_URL")
+        if legacy:
+            os.environ["LANGFUSE_HOST"] = legacy
+
     try:
         # Lazy: Langfuse v4 → ``langfuse.langchain.CallbackHandler``. We
         # don't import at module top-level so users without Langfuse

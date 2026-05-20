@@ -67,7 +67,7 @@ coding_agent/
 | `agent.py` | `build_agent()` constructs the compiled graph; `run()` is a one-shot helper; `invocation_config()` builds the per-call config dict (thread_id, callbacks). | `build_agent`, `run`, `invocation_config` |
 | `backend.py` | `build_backend(root)` returns `(CompositeBackend, BaseStore)`. Owns the routing table. | `build_backend`, `SKILLS_DIR` |
 | `model.py` | `resolve_model(spec)` returns either a passthrough string or an eagerly-built `BaseChatModel` (for `kimi:` / `ollama:`). | `resolve_model`, `DEFAULT_MODEL` |
-| `tools.py` | LangChain `@tool` functions layered on top of the deepagents defaults: `think`, `multi_edit`, `web_fetch`, `web_search` (Tavily), git read-only, `run_tests`. | `EXTRA_TOOLS` |
+| `tools.py` | LangChain `@tool` functions layered on top of the deepagents defaults: `think`, `multi_edit`, `web_fetch`, `web_search` (Tavily), read-only `git` + `git_diff`, `run_tests`, `run_type_check`, `run_lint`. | `EXTRA_TOOLS` |
 | `tracing.py` | Lazy Langfuse `CallbackHandler`. Returns `[]` when `LANGFUSE_PUBLIC_KEY` is unset. | `langfuse_callbacks` |
 | `system_prompt_v2.py` | Static policy: EXPLORE → PLAN → EXECUTE → VERIFY workflow, tool inventory, OS-aware guidance. | `SYSTEM_PROMPT_V2` |
 | `skills/` | Filesystem mount for skill markdown the agent loads on-demand. Ships with the package. | (directory) |
@@ -95,37 +95,51 @@ build_agent
   │                                       │
   │                                       └─► BaseChatModel  (kimi: / ollama:)
   │
-  ├─ build_backend(root)              ─►  (CompositeBackend, BaseStore)
+  ├─ build_backend(root)              ─►  CompositeBackend
   │     ├─ default:    LocalShellBackend(root_dir=cwd, virtual_mode=True)
-  │     ├─ /memories/: StoreBackend(namespace=per-project)
+  │     ├─ /memories/: FilesystemBackend(root_dir=<cwd>/.koda/memories/)
   │     └─ /skills/:   FilesystemBackend(root_dir=coding_agent/skills/)
   │
-  ├─ _build_checkpointer(root)        ─►  SqliteSaver at <root>/.koda/checkpoints.db
+  ├─ _build_checkpointer(root)        ─►  AsyncSqliteSaver at <root>/.koda/checkpoints.db
+  │
+  ├─ _render_system_prompt(root)      ─►  SYSTEM_PROMPT_V2.format(
+  │                                          current_date=…,
+  │                                          cwd=…,
+  │                                          bootstrap_required=…,
+  │                                       )
   │
   └─ create_deep_agent(
          model,             tools=EXTRA_TOOLS,    backend=composite,
          skills=["/skills/"],   memory=["/AGENTS.md"],
-         system_prompt=SYSTEM_PROMPT_V2,
-         checkpointer=sqlite, store=base_store,
+         system_prompt=<rendered>,
+         checkpointer=sqlite,
          name="coding_agent",
      )                                ─►  CompiledStateGraph
 ```
 
-Two things are worth explicit calling-out here:
+Three things are worth explicit calling-out here:
 
-- **The `store` passed to `create_deep_agent` is the same instance
-  returned by `build_backend`.** `StoreBackend` doesn't hold its own
-  store handle — it pulls one off the LangGraph `Runtime` at tool-call
-  time. If you wired a different store into `create_deep_agent`, writes
-  under `/memories/` would land in a different namespace tree than the
-  one `_project_namespace` set up. The factory keeps them in sync.
+- **`/memories/` is now project-local disk, not a `BaseStore`.** Every
+  write under `/memories/<name>.md` lands at
+  `<cwd>/.koda/memories/<name>.md`. Switching projects (running `koda`
+  in a different cwd) automatically gets a fresh memories tree — no
+  cross-project leakage. The on-disk files are `cat`/`git diff`-able,
+  which the prior `BaseStore` design wasn't.
+
+- **The system prompt is rendered per session, not static.**
+  `_render_system_prompt` substitutes `{current_date}`, `{cwd}`, and
+  `{bootstrap_required}` into the `SYSTEM_PROMPT_V2` template at
+  `build_agent` time. Session-start granularity (not per-turn) so the
+  prompt cache stays hot across turns.
 
 - **`memory=["/AGENTS.md"]` is a deepagents-side feature, not a backend
   route.** `MemoryMiddleware` reads that path through whatever backend
   serves it (the default `LocalShellBackend` here) and injects the
   content into the system prompt under `<agent_memory>`. It's
-  read-only context, not a writable surface. The `/memories/` route in
-  the composite backend is the writable counterpart.
+  read-only context relative to the framework; the agent can still
+  `edit_file`/`write_file` to update it. When the file is missing or
+  whitespace-only, `_needs_bootstrap` flips `bootstrap_required=true`
+  in the prompt and the model writes one on its first turn.
 
 ---
 
@@ -151,8 +165,8 @@ loop            SkillsMiddleware → resolves /skills/, injects on demand
                         execute / read_file / write_file / edit_file /
                         ls / glob / grep / write_todos / task        ──►  backend
                         think / multi_edit / web_fetch / web_search /
-                        git_status / git_diff / git_log / git_blame /
-                        run_tests                                    ──►  python @tool fns
+                        git / git_diff /
+                        run_tests / run_type_check / run_lint        ──►  python @tool fns
    │
    ▼
 checkpoint      SqliteSaver writes graph state after every super-step
@@ -192,7 +206,7 @@ deepagents built-ins — goes through `CompositeBackend.<op>` first.
 agent tool call ──►   route by longest-prefix match  │
                   │                                  │
                   │   /skills/*    ──►  Filesystem   ──►  coding_agent/skills/
-                  │   /memories/*  ──►  StoreBackend ──►  BaseStore (per-project ns)
+                  │   /memories/*  ──►  Filesystem   ──►  <cwd>/.koda/memories/
                   │   (default)    ──►  LocalShell   ──►  cwd  (+ subprocess execute)
                   └──────────────────────────────────┘
 ```
@@ -201,7 +215,7 @@ agent tool call ──►   route by longest-prefix match  │
 |---|---|---|---|---|
 | default (everything else) | `LocalShellBackend(root_dir=cwd, virtual_mode=True)` | the real filesystem | read/write/execute | the project the agent is operating on |
 | `/skills/` | `FilesystemBackend(root_dir=coding_agent/skills/)` | package directory | read-mostly | skill markdown loaded by the framework's `SkillsMiddleware` |
-| `/memories/` | `StoreBackend(namespace=…)` | LangGraph `BaseStore` (in-memory by default) | append-mostly | durable notes the agent authors across turns and projects |
+| `/memories/` | `FilesystemBackend(root_dir=<cwd>/.koda/memories/)` | project-local disk | read/write | durable notes the agent authors; survive process restarts |
 
 Two design choices that matter:
 
@@ -211,12 +225,14 @@ with the agent, not with the project. Drop a `.md` into
 guidance lives in `AGENTS.md` at the project root and is loaded via the
 `memory=["/AGENTS.md"]` declaration, not via `/skills/`.
 
-**Memory namespace is hashed cwd.** `_project_namespace` returns
-`("coding_agent", "memories", sha256(cwd)[:16])`. Same project → same
-slice of the store; different projects → isolated slices. The store
-itself defaults to `InMemoryStore` (lives for the process lifetime);
-swap for a Postgres/Redis-backed `BaseStore` to get true cross-process
-durability.
+**Memories are project-local files on disk.** Anything the agent
+writes under `/memories/<name>.md` lands at
+`<cwd>/.koda/memories/<name>.md`. Different projects → isolated
+trees automatically (no namespace logic needed). On-disk markdown
+beats the prior `BaseStore` design for three reasons: you can
+`cat`/`git diff`/share the files, durability is free, and the agent
+itself can `read_file`/`edit_file` them through the same interface it
+uses for project code.
 
 The `BackendProtocol` is documented at
 <https://docs.langchain.com/oss/python/deepagents/backends>. Adding a
@@ -231,31 +247,55 @@ without taking the others down.
 
 ### 6.1 LangGraph checkpoints — `<root>/.koda/checkpoints.db`
 
-`SqliteSaver` keyed by `thread_id`. Every super-step writes the full
-graph state. `_thread_id_for(root)` derives a stable thread id from
-the project cwd hash, so running the agent twice in the same directory
-resumes the same conversation. A different directory is a fresh thread.
+`AsyncSqliteSaver` (over `aiosqlite`) keyed by `thread_id`. Every
+super-step writes the full graph state. `_thread_id_for(root)` derives
+a stable thread id from the project cwd hash, so running the agent
+twice in the same directory resumes the same conversation. A different
+directory is a fresh thread.
 
 `check_same_thread=False` on the sqlite connection — LangGraph may
 invoke from different threads under an async loop. The connection is
-process-long-lived; we don't `.close()` it.
+process-long-lived; we don't `.close()` it. Construction binds to the
+running event loop, so `build_agent` is async and the TUI adapter
+defers graph construction to its first async path.
 
-### 6.2 Memory store — `/memories/...` via `StoreBackend`
+### 6.2 Memories — `<root>/.koda/memories/*.md`
 
-For notes the agent writes to remember between turns. Backed by
-whatever `BaseStore` instance was passed into `build_backend`. Default
-`InMemoryStore` is fine for local dev; swap in
-`langgraph.store.postgres.PostgresStore` (or similar) for durability.
-Namespace partitions per-project so memories don't leak between repos.
+For durable notes the agent writes to remember between turns and
+sessions. The `/memories/` route in the composite backend points at
+`<cwd>/.koda/memories/` via `FilesystemBackend`, so each write under
+`/memories/<name>.md` is a real on-disk file in the project.
+Different projects get isolated trees by virtue of being in different
+directories — no namespace bookkeeping. Markdown is `cat`/`git diff`-
+friendly and the agent can `read_file`/`edit_file` them through the
+same interface it uses for project source.
 
-### 6.3 AGENTS.md — read-only context injection
+### 6.3 AGENTS.md — project context, auto-bootstrapped
 
 `memory=["/AGENTS.md"]` on the deepagents factory wires
 `MemoryMiddleware` into the loop. Each turn it re-reads the file (via
-the backend) and injects the contents into the system prompt under
-`<agent_memory>`. A missing file is silently skipped. **Edits the
-agent makes to `/AGENTS.md` write to the real `<project>/AGENTS.md`**
-through the default `LocalShellBackend`.
+the default `LocalShellBackend`) and injects the contents into the
+system prompt under `<agent_memory>`.
+
+**Bootstrap.** At `build_agent` time, `_needs_bootstrap(root)` checks
+whether `<cwd>/AGENTS.md` is missing or whitespace-only. If so, the
+template sets `<env>.bootstrap_required = true` in the rendered system
+prompt. The model reads that flag and — before answering the first
+user turn — announces "Building understanding of this project — one
+moment…", runs an EXPLORE pass (read `pyproject.toml` / `package.json`
+/ `README.md`, sample a few source files), then `write_file`s a
+populated `AGENTS.md` with YAML frontmatter (`last_updated`,
+`version`, `generated_by`). Subsequent sessions see the file is
+populated, `bootstrap_required = false`, and the bootstrap block in
+the prompt becomes a no-op.
+
+**Updates.** The prompt also carries an update policy: after a change
+that contradicts a fact in `AGENTS.md` (renamed a build command, moved
+a module, introduced a convention), the agent `edit_file`s the
+specific line and bumps the `last_updated` frontmatter to today's date
+(`<env>.current_date`) plus the `version` integer. Trivial fact
+changes are autonomous; deletions/restructures should be confirmed
+with the user first.
 
 The split between the three is:
 
@@ -303,9 +343,9 @@ The total tool surface is the **deepagents built-ins** plus the
 
 | From `deepagents` | From `coding_agent/tools.py` |
 |---|---|
-| `execute` (shell), `read_file`, `write_file`, `edit_file`, `ls`, `glob`, `grep`, `write_todos`, `task` | `think`, `multi_edit`, `web_fetch`, `web_search`, `git_status`, `git_diff`, `git_log`, `git_blame`, `run_tests` |
+| `execute` (shell), `read_file`, `write_file`, `edit_file`, `ls`, `glob`, `grep`, `write_todos`, `task` | `think`, `multi_edit`, `web_fetch`, `web_search`, `git`, `git_diff`, `run_tests`, `run_type_check`, `run_lint` |
 
-Two semantics worth pinning:
+Three semantics worth pinning:
 
 **`edit_file` is strict, `multi_edit` is atomic.** Both come from
 either the framework (`edit_file`) or this package (`multi_edit`) with
@@ -319,14 +359,28 @@ tool requests `search_depth="advanced"` and
 `include_answer="advanced"`, so the response carries both a synthesised
 answer (rendered first when present) and per-source snippets. Returns
 `[error] TAVILY_API_KEY is not set in the environment` when the key is
-missing — never silently degrades.
+missing — never silently degrades. A hard 20 s timeout (overridable via
+`KODA_WEB_SEARCH_TIMEOUT`) prevents a slow query from wedging a turn.
 
-**`run_tests` auto-detects** pytest / jest / cargo / go / npm-test and
-pipes the output through a small summariser. Subshells inherit a
-`_enriched_env()` PATH that prepends version-manager bin dirs
-(`.nvm/versions/node/*/bin`, `.cargo/bin`, `.pyenv/shims`, `.local/bin`,
-`.bun/bin`, `.deno/bin`) so the agent can use toolchains it just
-installed without sourcing rc files.
+**`git` is whitelisted.** A single read-only entry-point with a fixed
+allowlist of subcommands (`status`, `log`, `blame`, `show`, `branch`,
+`tag`, `ls-files`, `rev-parse`, `rev-list`, `describe`, `remote`,
+`shortlog`, `reflog`, `config`). Anything that could mutate the repo is
+rejected — the model is pushed toward `execute` with explicit intent
+for those. `git_diff` is kept as its own tool because its flag shape
+(`--cached`, `-- <path>`) is the one models get wrong most often
+through a generic interface.
+
+**Runner tools share a shape.** `run_tests` (pytest / jest / cargo / go /
+npm-test), `run_type_check` (mypy / pyright / tsc), and `run_lint`
+(ruff / eslint) all auto-detect the framework from project files, run
+with a hard timeout (600 / 300 / 180 s respectively), and return a
+small structured header plus the *tail* of the output (~4 KB) so
+failure detail lands in the model's context without bloating it.
+Subshells inherit a `_enriched_env()` PATH that prepends
+version-manager bin dirs (`.nvm/versions/node/*/bin`, `.cargo/bin`,
+`.pyenv/shims`, `.local/bin`, `.bun/bin`, `.deno/bin`) so the agent
+can use toolchains it just installed without sourcing rc files.
 
 The framework owns the `execute` (shell) tool; this package doesn't
 implement its own. Process-wide approval gating is whatever
@@ -404,16 +458,25 @@ Grouped by what they affect.
 from coding_agent import build_agent, run
 
 # One-shot:
-state = run("read README and summarise", cwd="/path/to/repo")
+state = await run("read README and summarise", cwd="/path/to/repo")
 
 # Long-running / interactive:
-graph = build_agent(model="ollama:kimi-k2.6", cwd="/path/to/repo")
+graph = await build_agent(model="ollama:kimi-k2.6", cwd="/path/to/repo")
 config = invocation_config(thread_id="my-thread")
-state = graph.invoke({"messages": [{"role": "user", "content": "…"}]}, config=config)
+state = await graph.ainvoke({"messages": [{"role": "user", "content": "…"}]}, config=config)
 # or stream:
-for chunk in graph.stream(..., config=config):
+async for chunk in graph.astream(..., config=config):
     ...
 ```
+
+`build_agent` and `run` are async because the `AsyncSqliteSaver`
+checkpointer binds to the running event loop at construction. From a
+sync caller, wrap with `asyncio.run(...)`.
+
+**Project selection.** The cwd you pass to `build_agent` (or the
+shell cwd if you don't) is the project. From `koda`, use
+`koda --cwd /path/to/project` to target a project without `cd`-ing
+into it, or just `cd` + run `koda` as usual.
 
 Everything below `build_agent` (the checkpointer, the composite
 backend, the model router, the tracing handler) is implementation
@@ -430,7 +493,7 @@ detail. Callers should not import directly from `backend.py`,
 | Add a model provider | If LangChain's `init_chat_model` already knows it, *do nothing* — pass the spec through. Only add a branch to `model.py` if the provider needs eager endpoint/auth wiring (like Ollama Cloud). |
 | Add a backend route | `backend.py` — extend the `routes={…}` dict on `CompositeBackend`. Longest-prefix wins. |
 | Change the system prompt | `system_prompt_v2.py`. |
-| Swap the memory store | Pass `store=YourStore()` into `build_backend` (and propagate the same instance into `create_deep_agent(store=…)` in `agent.py`). |
+| Move `/memories/` to a different store | Edit the `/memories/` entry in `backend.py:build_backend`. To go back to a LangGraph `BaseStore`, swap `FilesystemBackend(...)` for `StoreBackend(namespace=…)` and thread the store through to `create_deep_agent(store=…)` in `agent.py`. |
 | Swap the checkpointer | Replace `_build_checkpointer` in `agent.py` with a different `BaseCheckpointSaver` (e.g. `PostgresSaver`). |
 | Add a callback / metric | `tracing.py` — append handlers to `langfuse_callbacks()`'s return list, or build a sibling function and merge in `invocation_config`. |
 | Ship a skill | Drop a `.md` into `coding_agent/skills/`. It will be visible at `/skills/<name>.md`. |
@@ -447,32 +510,31 @@ Explicit trade-offs, not bugs.
    process can do. Acceptable for a developer-owned CLI; not acceptable
    for a multi-tenant deployment.
 
-2. **`InMemoryStore` is the default for `/memories/`.** Memory survives
-   between threads within a single process but not across restarts.
-   Pass a durable `BaseStore` into `build_backend` to fix this — the
-   factory plumbs it through correctly.
-
-3. **`SqliteSaver` connection is never closed.** Process-long-lived;
+2. **AsyncSqlite connection is never closed.** Process-long-lived;
    relies on OS cleanup. Fine for a TUI lifetime, would matter inside
    a long-running daemon hosting many graphs.
 
-4. **AGENTS.md cascading is single-file.** The deepagents
+3. **AGENTS.md cascading is single-file.** The deepagents
    `MemoryMiddleware` reads the listed paths in order. We declare only
    `/AGENTS.md` (project root). If you want a user-level
    `~/.koda/AGENTS.md` or ancestor traversal, extend the `memory=[…]`
    list in `build_agent`.
 
+4. **Bootstrap is prompt-driven, not enforced.** `bootstrap_required`
+   is a flag in the system prompt; the model is *instructed* to write
+   `AGENTS.md` on its first turn. There's no Python-side guard that
+   refuses to answer until the file exists. If the model ignores the
+   instruction (or you `Ctrl+C` mid-bootstrap), the file just won't get
+   written that turn. Re-launching with no AGENTS.md will retry.
+
 5. **No mid-turn model switching.** A new model = a new `build_agent`
    call. The compiled graph holds a bound model; rebuilding is cheap
    (no LLM call, just object construction).
 
-6. **`KODA_DISABLE_BOOTSTRAP` and other historical envs are gone.**
-   The earlier hand-rolled `CodingAgent` had project-bootstrap logic,
-   character-based compaction, and depth-1 explore subagents. Those
-   responsibilities now live in `deepagents` / LangGraph and are
-   configured via their primitives (`memory=`, the recursion limit,
-   `task` / subagents). If you need to tweak compaction or context
-   budgets, that's an upstream knob.
+6. **Session-start date, not per-turn.** `<env>.current_date` is
+   captured once at `build_agent` time. A session crossing midnight
+   has a stale date until the next launch. Per-turn injection would
+   invalidate the prompt cache for a 1-bit win.
 
 ---
 
