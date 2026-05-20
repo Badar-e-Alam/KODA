@@ -63,3 +63,21 @@ Copy `.env.example` to `.env` and set API keys:
 - **Session management** uses JSONL trees stored at `~/.koda/sessions/`
 - **Model discovery** caches provider model lists (24h TTL) at `~/.koda/models/`
 - Backend switching via `--agent` flag or `/model` TUI command
+
+## Claude Code Skills
+
+### `/attach-agent <path>`
+
+Attaches any LangGraph agent (or custom agent class) to KODA's TUI frontend.
+Point it at an agent file and it will:
+
+1. Analyze the agent (LangGraph graph, custom class, raw SDK, or HTTP)
+2. Generate the adapter in `koda/adapters/`
+3. Register it in `koda/__main__.py`
+4. Validate with `agent_workspace/skills/koda-adapter/scripts/validate.py`
+
+Key files for the adapter contract:
+- `koda/agent_api.py` — `KodaAgent` Protocol + 6 event dataclasses
+- `koda/adapters/base.py` — `BaseAdapter` (cancel, usage, error, Done)
+- `koda/adapters/langgraph.py` — `LangGraphAdapter` (wraps compiled graphs)
+- `koda/__main__.py` — `_build_adapter_factory()` resolves `--agent` specs
