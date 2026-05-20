@@ -233,3 +233,38 @@ StatusBar {
     color: $muted;
     padding: 0 1;
 }
+
+/* ── Responsive breakpoints ─────────────────────────────────────
+ * KodaApp.on_resize toggles `-short` and `-narrow` on #app-root based
+ * on the live terminal size. The rules below collapse non-essential
+ * chrome so VS Code's embedded shell (often ~20 rows × 80 cols) keeps
+ * messages + input visible. The fixed sizes elsewhere in this sheet
+ * are sized for a normal terminal; these overrides win by specificity.
+ */
+
+/* Short terminals (< 24 rows): kill the banner outright and shrink
+ * the suggestion popup so the message scroll + input + status bar
+ * always fit. Banner already hides via .-compact post-first-turn;
+ * this just extends that to small-screen sessions before the first
+ * user message.
+ */
+#app-root.-short KodaBanner {
+    display: none;
+}
+
+#app-root.-short SuggestionPopup {
+    max-height: 8;
+}
+
+#app-root.-short SuggestionPopup > OptionList {
+    max-height: 5;
+}
+
+/* Narrow terminals (< 100 cols): hide the sidebar even if the user
+ * toggled it open with Ctrl+B. Both selectors are needed because the
+ * `.visible` rule above sets `display: block` and we must beat it.
+ */
+#app-root.-narrow #sidebar-host,
+#app-root.-narrow #sidebar-host.visible {
+    display: none;
+}

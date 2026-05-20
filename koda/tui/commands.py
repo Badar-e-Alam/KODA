@@ -46,7 +46,7 @@ async def _clear(app: "KodaApp", _args: str) -> bool:
 
 async def _model(app: "KodaApp", args: str) -> bool:
     if not args:
-        app.action_open_model_picker()
+        await app.mount_message(AppMessage(f"Current model: {app._model}"))
         return True
     await app.switch_model(args)
     return True
@@ -107,6 +107,56 @@ async def _reload_memory(app: "KodaApp", _args: str) -> bool:
     return True
 
 
+async def _agents(app: "KodaApp", _args: str) -> bool:
+    from koda.agent_api import describe_agent
+
+    if app._adapter is None:
+        await app.mount_message(AppMessage("No agent loaded yet — give it a moment."))
+        return True
+    desc = describe_agent(app._adapter)
+    caps: list[str] = []
+    if desc.supports_thinking:
+        caps.append("thinking")
+    if desc.supports_vision:
+        caps.append("vision")
+    caps_str = ", ".join(caps) if caps else "—"
+    lines = [
+        "Current agent:",
+        f"  name:         {desc.name}",
+        f"  backend:      {desc.backend}",
+        f"  capabilities: {caps_str}",
+        f"  tools:        {len(desc.tools)}",
+    ]
+    if desc.system_prompt_preview:
+        preview = desc.system_prompt_preview.replace("\n", " ").strip()
+        lines.append(f"  system:       {preview}")
+    await app.mount_message(AppMessage("\n".join(lines)))
+    return True
+
+
+async def _tools(app: "KodaApp", _args: str) -> bool:
+    from koda.agent_api import describe_agent
+
+    if app._adapter is None:
+        await app.mount_message(AppMessage("No agent loaded yet — give it a moment."))
+        return True
+    desc = describe_agent(app._adapter)
+    if not desc.tools:
+        await app.mount_message(
+            AppMessage(f"{desc.name}: no tool surface reported by this adapter.")
+        )
+        return True
+    width = max(len(t.name) for t in desc.tools)
+    lines = [f"Tools ({len(desc.tools)}):"]
+    for tool in desc.tools:
+        if tool.description:
+            lines.append(f"  {tool.name:<{width}}  — {tool.description}")
+        else:
+            lines.append(f"  {tool.name}")
+    await app.mount_message(AppMessage("\n".join(lines)))
+    return True
+
+
 _HELP: dict[str, tuple[Handler, str]] = {
     "clear": (_clear, "start a new chat session"),
     "model": (_model, "[provider:model] — switch model or show current"),
@@ -114,6 +164,8 @@ _HELP: dict[str, tuple[Handler, str]] = {
     "copy": (_copy, "copy the last assistant response to clipboard"),
     "theme": (_theme, "[name] — switch color theme (or list)"),
     "usage": (_usage, "show cumulative token usage"),
+    "agents": (_agents, "describe the active agent (backend, capabilities, tool count)"),
+    "tools": (_tools, "list the active agent's tools"),
     "reload-memory": (_reload_memory, "re-read AGENTS.md (mid-session)"),
     "help": (_help, "list all slash commands"),
     "quit": (_quit, "exit KODA"),

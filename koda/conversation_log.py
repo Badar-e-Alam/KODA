@@ -24,12 +24,7 @@ _log = logging.getLogger("koda.conversation")
 
 
 class ConversationLog:
-    """Append-only markdown conversation log.
-
-    The file handle is opened once in append-mode and reused for the
-    lifetime of the object — every ``_append()`` then costs one ``write``
-    + ``flush`` syscall instead of a full open/close cycle.
-    """
+    """Append-only markdown conversation log."""
 
     def __init__(self, path: str | Path, *, model: str = "") -> None:
         self._path = Path(path)
@@ -37,9 +32,6 @@ class ConversationLog:
         self._step = 0
         self._model = model
         self._write_header()
-        # Reopen in append mode — the header was written via write_text,
-        # which truncates. From here on we keep the handle alive.
-        self._fh = self._path.open("a", encoding="utf-8")
 
     # ── Public API ────────────────────────────────────────────────────
 
@@ -91,23 +83,10 @@ class ConversationLog:
 
     def _append(self, text: str) -> None:
         try:
-            self._fh.write(text)
-            self._fh.flush()
-        except (OSError, ValueError) as exc:  # ValueError: write to closed handle
+            with self._path.open("a", encoding="utf-8") as f:
+                f.write(text)
+        except OSError as exc:
             _log.debug("Conversation log write failed: %s", exc)
-
-    def close(self) -> None:
-        """Close the underlying file handle. Idempotent."""
-        fh = getattr(self, "_fh", None)
-        if fh is not None and not fh.closed:
-            try:
-                fh.close()
-            except OSError:
-                pass
-
-    def __del__(self) -> None:
-        # Best-effort flush on GC; explicit close() is preferred.
-        self.close()
 
     @staticmethod
     def _ts() -> str:

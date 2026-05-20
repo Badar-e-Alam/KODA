@@ -73,10 +73,6 @@ class SessionTree:
         self._leaf_id: str | None = None
         self._path = path
         self._session_id = uuid.uuid4().hex[:12]
-        # Tracks whether the file already exists on disk so ``_save_entry``
-        # can skip a per-write ``exists()`` syscall. Set true by ``_load``
-        # (file existed) or after the first successful write.
-        self._chmod_done = False
 
         if path and path.exists():
             self._load()
@@ -269,22 +265,19 @@ class SessionTree:
         self._children.setdefault(entry.parent_id, []).append(entry.id)
 
     def _save_entry(self, entry: SessionEntry) -> None:
-        if not self._path:
-            return
-        with open(self._path, "a", encoding="utf-8") as f:
-            f.write(entry.to_json() + "\n")
-        if not self._chmod_done:
-            try:
-                os.chmod(self._path, 0o600)
-            except OSError:
-                pass
-            self._chmod_done = True
+        if self._path:
+            existed = self._path.exists()
+            with open(self._path, "a", encoding="utf-8") as f:
+                f.write(entry.to_json() + "\n")
+            if not existed:
+                try:
+                    os.chmod(self._path, 0o600)
+                except OSError:
+                    pass
 
     def _load(self) -> None:
         if not self._path or not self._path.exists():
             return
-        # File already existed when we got here, so chmod has been applied.
-        self._chmod_done = True
         with open(self._path, "r", encoding="utf-8") as f:
             for line in f:
                 line = line.strip()

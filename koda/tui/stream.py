@@ -69,15 +69,6 @@ async def run_turn(
                 await thinking.remove()
             except Exception:
                 pass
-        # Drain any deltas still in the buffer of the most recent assistant
-        # widget so the final word(s) of the response don't sit in-buffer
-        # until the next mount_message triggers a refresh.
-        last = getattr(app, "_last_assistant_widget", None)
-        if last is not None:
-            try:
-                last.finalize()
-            except Exception:
-                pass
 
     return "".join(final_text_parts)
 
@@ -90,17 +81,27 @@ async def _dispatch(
     final_text_parts: list[str],
 ) -> None:
     if isinstance(ev, TextDelta):
+        # Capture "was the user following the stream?" BEFORE mutating
+        # the widget. Once ``append`` grows it, ``max_scroll_y`` has
+        # already shifted and we can't tell whether they were pinned to
+        # the bottom or scrolled up a few lines reading earlier output.
+        follow = _is_following(app)
         if current_assistant is None:
             current_assistant = AssistantMessage()
-            # Keep the viewport pinned each time the buffered widget flushes
-            # (~30 Hz) instead of every TextDelta. mount_message scrolls once
-            # at mount; from then on the widget itself drives scroll-pinning
-            # at the same cadence as its repaints.
-            current_assistant.set_on_flush(lambda: _scroll_to_end(app))
             await app.mount_message(current_assistant)
             app._last_assistant_widget = current_assistant
         current_assistant.append(ev.content)
         final_text_parts.append(ev.content)
+        # Mirror onto the app so the cancel handler in on_input_submitted
+        # can recover the partial reply if the user interrupts mid-stream.
+        # See KodaApp._partial_reply for the rationale.
+        app._partial_reply = "".join(final_text_parts)
+        # Only auto-scroll when the user was already at the bottom.
+        # Unconditional ``scroll_end`` on every chunk snatches the
+        # viewport away from anyone who scrolled up — looks like a freeze
+        # because every scroll attempt is undone before they see anything.
+        if follow:
+            _scroll_to_end(app)
 
     elif isinstance(ev, ThinkingDelta):
         # For now, reasoning is silent. Future: dedicated ThinkingMessage.
@@ -114,27 +115,27 @@ async def _dispatch(
     elif isinstance(ev, ToolResult):
         widget = pending_tools.get(ev.tool_id)
         if widget is not None:
+            follow = _is_following(app)
             widget.set_result(ev.output, is_error=ev.is_error)
-            _scroll_to_end(app)
+            if follow:
+                _scroll_to_end(app)
         else:
             # Orphan result — the adapter fabricated one for a graph-level
             # failure (connection refused, auth error, ...). Render it as
             # a proper ErrorMessage with a humanized hint so the user sees
             # *what* went wrong and *what to do* instead of a raw trace.
+            follow = _is_following(app)
             text = _humanize_adapter_error(ev.output)
             await app.mount_message(ErrorMessage(text))
-            _scroll_to_end(app)
+            if follow:
+                _scroll_to_end(app)
 
     elif isinstance(ev, Usage):
         if app._status_bar is not None:
-            # Mid-stream Usage events are coalesced to ~1 Hz so the
-            # status bar doesn't repaint on every token.
-            app._status_bar.update_usage_throttled(ev)
+            app._status_bar.update_usage(ev)
 
     elif isinstance(ev, Done):
         if ev.usage and app._status_bar is not None:
-            # Final flush — apply any pending mid-stream delta plus the
-            # ``Done`` totals in one synchronous repaint.
             app._status_bar.update_usage(ev.usage)
 
 
@@ -170,6 +171,30 @@ def _scroll_to_end(app: "KodaApp") -> None:
             container.scroll_end(animate=False)
         except Exception:
             pass
+
+
+def _is_following(app: "KodaApp") -> bool:
+    """True when the user is pinned at (or within a couple of lines of)
+    the bottom of the messages container.
+
+    "Following the stream" means we should keep auto-scrolling as new
+    content arrives. As soon as the user scrolls up to read earlier
+    output we stop snapping the viewport back — otherwise every text
+    delta cancels their scroll and the TUI feels frozen.
+
+    The 2-line tolerance covers a one-frame gap between a previous chunk
+    appending content (which bumps ``max_scroll_y``) and the next chunk
+    arriving before the autoscroll has caught up. Without it, fast
+    streams can flip the follow state to False between deltas even when
+    the user hasn't touched anything.
+    """
+    container = getattr(app, "_messages_container", None)
+    if container is None:
+        return True
+    try:
+        return container.scroll_y >= container.max_scroll_y - 2
+    except Exception:
+        return True
 
 
 def _active_assistant(

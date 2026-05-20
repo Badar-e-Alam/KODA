@@ -20,6 +20,7 @@ from textual import work
 from textual.app import App, ComposeResult
 from textual.binding import Binding, BindingType
 from textual.containers import Horizontal, Vertical, VerticalScroll
+from textual.events import Resize
 
 from koda import __version__
 from koda.agent_api import KodaAgent
@@ -28,6 +29,7 @@ from koda.model_config import (
     ModelSpec,
     has_provider_credentials,
     probe_provider,
+    warm_cache_in_background,
 )
 from koda.session import SessionTree
 from koda.session_panel import ConfirmDeleteScreen, SessionPanel
@@ -83,6 +85,13 @@ class KodaApp(App):
     TITLE = "KODA"
     CSS_PATH = "app.tcss"
 
+    # Responsive breakpoints — read by _apply_responsive_classes. Chosen
+    # to keep VS Code's embedded shell usable: that pane is often ~20
+    # rows tall, and at <100 cols the 34-col sidebar leaves <50 cols of
+    # chat which is too narrow for tool output.
+    _SHORT_SCREEN_ROWS = 24
+    _NARROW_SCREEN_COLS = 100
+
     BINDINGS: ClassVar[list[BindingType]] = [
         Binding("ctrl+c", "copy_or_interrupt", "Copy/Interrupt", show=False, priority=True),
         Binding("ctrl+d", "quit_app", "Quit", show=False, priority=True),
@@ -110,7 +119,6 @@ class KodaApp(App):
             self._adapter = LangGraphAdapter(graph=agent, model=model, thread_id=thread_id)
         self._model = model or (self._adapter.model_name() if self._adapter else "")
         self._auto_approve = auto_approve
-        self._koda_thread_id = thread_id or uuid.uuid4().hex
         # Factory used by /model to rebuild the adapter for a new model.
         # Signature: factory(model: str, thread_id: str) -> KodaAgent
         # Defaults to the built-in deep adapter — overridable so that
@@ -120,6 +128,14 @@ class KodaApp(App):
 
         self._koda_session = SessionTree(path=self._new_session_path())
         self._conv_log = self._new_conversation_log()
+        # Bind the LangGraph thread_id to the KODA session_id (1:1) by
+        # default so the checkpointer's per-thread state lines up with what
+        # the user sees in the sidebar. Picking a session → that thread's
+        # checkpoint resumes; "New chat" → fresh session_id → fresh thread
+        # → empty checkpoint. An explicitly-passed ``thread_id`` still wins
+        # (used by tests and programmatic embedders) — caller-supplied beats
+        # the smart default.
+        self._koda_thread_id = thread_id or self._koda_session.session_id or uuid.uuid4().hex
 
         self._history: list[dict[str, Any]] = []
         self._chat_input: ChatInput | None = None
@@ -130,6 +146,13 @@ class KodaApp(App):
         self._popup: SuggestionPopup | None = None
         self._last_assistant_widget: AssistantMessage | None = None
         self._turn_task: asyncio.Task | None = None
+        # Live mirror of the assistant text streamed during the current turn.
+        # The streaming coroutine (run_turn → _dispatch) appends every TextDelta
+        # here so that if the user interrupts mid-turn, the cancel handler can
+        # still commit the partial reply to _history / _koda_session / _conv_log.
+        # Without this, an interrupted turn leaves a hole in history (only the
+        # user message is recorded; the agent's partial work is lost).
+        self._partial_reply: str = ""
         # Once the user sends a message the banner collapses permanently.
         # Guards `_set_banner_compact(False)` from restoring the tall banner.
         self._chat_started: bool = False
@@ -204,8 +227,13 @@ class KodaApp(App):
             self._banner.set_connected()
         self._chat_input.focus()
 
-        # Note: the model-discovery cache is already warmed in
-        # ``koda/__main__.py`` before app boot, so no second warm here.
+        # Warm model-discovery cache off the hot path so /model is instant.
+        warm_cache_in_background()
+
+        # Apply size-dependent layout now that #app-root + the banner are
+        # mounted — on_resize only fires on actual size changes, so a
+        # cold start on an already-tiny terminal would otherwise miss it.
+        self._apply_responsive_classes(self.size.width, self.size.height)
 
         # Build the real adapter in a worker thread so the TUI is
         # interactive immediately. Heavy imports (langgraph, langchain,
@@ -235,7 +263,98 @@ class KodaApp(App):
             await loading.remove()
         except Exception:
             pass
+        self._refresh_capability_badges()
         await self.mount_message(AppMessage(f"Agent ready ({self._model})"))
+
+    async def _rebuild_adapter_for_thread(self, *, resume: bool) -> None:
+        """Rebuild the adapter against ``self._koda_thread_id``.
+
+        Called whenever the active session changes (new chat, sidebar
+        pick). Heavy graph compilation runs in a worker thread so the UI
+        stays responsive.
+
+        ``resume=True`` marks the new adapter as already seeded so it
+        doesn't re-forward ``self._history`` on the next turn — the
+        LangGraph checkpointer for that thread already holds the prior
+        messages. Pass ``resume=False`` for a brand-new thread (empty
+        checkpoint) so seeding remains available if some adapter
+        variant needs it later.
+        """
+        factory = self._adapter_factory or _default_adapter_factory
+        try:
+            new_adapter = await asyncio.to_thread(
+                factory, self._model, self._koda_thread_id
+            )
+        except Exception as e:
+            _log.exception("Adapter rebuild failed")
+            await self.mount_message(
+                ErrorMessage(f"Failed to rebuild agent: {e}")
+            )
+            return
+        if resume:
+            mark = getattr(new_adapter, "mark_seeded", None)
+            if callable(mark):
+                mark()
+        self._adapter = new_adapter
+        self._refresh_capability_badges()
+
+    def _refresh_capability_badges(self) -> None:
+        """Push the current adapter's :meth:`describe` output into the status bar."""
+        if self._status_bar is None:
+            return
+        if self._adapter is None:
+            self._status_bar.set_capabilities(None)
+            return
+        from koda.agent_api import describe_agent
+
+        try:
+            self._status_bar.set_capabilities(describe_agent(self._adapter))
+        except Exception:
+            _log.debug("capability refresh failed", exc_info=True)
+            self._status_bar.set_capabilities(None)
+
+    # ── Responsive layout ────────────────────────────────────────────
+
+    def on_resize(self, event: Resize) -> None:
+        """Re-evaluate breakpoints when the terminal resizes.
+
+        Textual reflows widgets automatically on resize, but the
+        hard-coded sizes on the banner (10 rows) and sidebar (34 cols)
+        ignore the new viewport. This hook layers screen-size classes
+        on top so the stylesheet can hide them on cramped terminals.
+        """
+        self._apply_responsive_classes(event.size.width, event.size.height)
+
+    def _apply_responsive_classes(self, width: int, height: int) -> None:
+        """Toggle ``-short`` / ``-narrow`` on ``#app-root`` for the CSS,
+        and force the banner compact on short screens.
+
+        Banner handling is split: ``_set_banner_compact`` already
+        manages ``-compact`` for chat-started + popup-open. Here we
+        layer in the size dimension — once height drops below the
+        breakpoint we *add* ``-compact``, and we only *remove* it when
+        height is back above the breakpoint AND neither of the other
+        two reasons-to-compact applies. Without that AND we'd flicker
+        the banner back on every resize during a streaming reply.
+        """
+        if self._banner is not None:
+            popup_visible = self._popup is not None and self._popup.is_visible
+            if height < self._SHORT_SCREEN_ROWS:
+                self._banner.add_class("-compact")
+            elif not self._chat_started and not popup_visible:
+                self._banner.remove_class("-compact")
+        try:
+            root = self.query_one("#app-root")
+        except Exception:
+            return
+        if width < self._NARROW_SCREEN_COLS:
+            root.add_class("-narrow")
+        else:
+            root.remove_class("-narrow")
+        if height < self._SHORT_SCREEN_ROWS:
+            root.add_class("-short")
+        else:
+            root.remove_class("-short")
 
     # ── Theme ────────────────────────────────────────────────────────
 
@@ -366,13 +485,63 @@ class KodaApp(App):
             return
 
         self._history.append({"role": "user", "content": message})
+        self._partial_reply = ""
         self._turn_task = asyncio.create_task(
             run_turn(self, self._adapter, message, self._history[:-1])
         )
+        # Hard upper bound on a single turn. Catches every silent-hang
+        # mode (model stream that never closes, slow-token-trickle from a
+        # cloud endpoint, recursion-limit-bound tool loop, an `execute`
+        # whose subprocess blocks indefinitely on a non-killable child).
+        # Default 1800 s = 30 min; override via ``KODA_TURN_TIMEOUT``
+        # (set to ``0`` to disable, e.g. for long ``run_tests`` cycles).
+        _turn_timeout_raw = os.environ.get("KODA_TURN_TIMEOUT", "1800")
         try:
-            reply = await self._turn_task
+            _turn_timeout = float(_turn_timeout_raw)
+        except ValueError:
+            _turn_timeout = 1800.0
+        try:
+            if _turn_timeout > 0:
+                reply = await asyncio.wait_for(self._turn_task, timeout=_turn_timeout)
+            else:
+                reply = await self._turn_task
+        except asyncio.TimeoutError:
+            # asyncio.wait_for cancels the wrapped task on timeout, but the
+            # cancellation is async — best-effort wait for the streaming
+            # generator to unwind so partial state lands in history.
+            try:
+                self._turn_task.cancel()
+                await asyncio.wait_for(asyncio.shield(self._turn_task), timeout=2)
+            except (asyncio.CancelledError, asyncio.TimeoutError):
+                pass
+            partial = self._partial_reply
+            self._partial_reply = ""
+            await self.mount_message(
+                ErrorMessage(
+                    f"Turn timed out after {int(_turn_timeout)}s — agent likely stuck "
+                    "(model stream stall, slow tool, or tool loop). Try again or "
+                    "raise KODA_TURN_TIMEOUT if this was a legitimately long task."
+                )
+            )
+            if partial.strip():
+                marked = partial.rstrip() + "\n\n[turn timed out — partial reply]"
+                self._history.append({"role": "assistant", "content": marked})
+                self._koda_session.add_message("assistant", marked)
+                self._conv_log.assistant(marked)
+            return
         except asyncio.CancelledError:
+            # Preserve whatever the agent streamed before the interrupt so
+            # the next turn isn't blind to its prior work. The marker makes
+            # it explicit (to both the user reading logs and the model on
+            # the next turn) that the turn was cut short.
+            partial = self._partial_reply
+            self._partial_reply = ""
             await self.mount_message(AppMessage("(interrupted)"))
+            if partial.strip():
+                marked = partial.rstrip() + "\n\n[interrupted — partial reply]"
+                self._history.append({"role": "assistant", "content": marked})
+                self._koda_session.add_message("assistant", marked)
+                self._conv_log.assistant(marked)
             return
         finally:
             self._turn_task = None
@@ -443,12 +612,26 @@ class KodaApp(App):
             await self.mount_message(ErrorMessage(f"Failed to switch model: {e}"))
             return
 
+        # Switching models in the middle of a conversation: the checkpoint
+        # already holds every prior turn. Mark the rebuilt adapter as
+        # seeded so it doesn't re-forward ``self._history`` on the next
+        # turn (LangGraph's add_messages reducer would otherwise duplicate
+        # the transcript).
+        mark = getattr(new_adapter, "mark_seeded", None)
+        if callable(mark):
+            mark()
+        # Release the prior adapter's non-daemon resources (e.g. the
+        # coding-agent backend's aiosqlite worker thread) before
+        # dropping the reference. Otherwise those threads accumulate
+        # over the session and pin the process open at exit.
+        await self._shutdown_adapter()
         self._adapter = new_adapter
         self._model = display
         if self._status_bar is not None:
             p = parsed.provider if parsed else ""
             m = parsed.model if parsed else display
             self._status_bar.set_model(provider=p, model=m)
+        self._refresh_capability_badges()
         await self.mount_message(AppMessage(f"Switched to {display}"))
 
     async def reload_memory(self) -> None:
@@ -468,7 +651,14 @@ class KodaApp(App):
             _log.exception("Memory reload failed")
             await self.mount_message(ErrorMessage(f"Failed to reload memory: {e}"))
             return
+        # Same reasoning as switch_model: the checkpoint holds the
+        # transcript, so don't let the new adapter re-seed from history.
+        mark = getattr(new_adapter, "mark_seeded", None)
+        if callable(mark):
+            mark()
+        await self._shutdown_adapter()
         self._adapter = new_adapter
+        self._refresh_capability_badges()
         await self.mount_message(AppMessage("Memory reloaded"))
 
     # ── Actions ──────────────────────────────────────────────────────
@@ -481,6 +671,10 @@ class KodaApp(App):
         self._history.clear()
         self._koda_session = SessionTree(path=self._new_session_path())
         self._conv_log = self._new_conversation_log()
+        # Fresh session → fresh LangGraph thread → empty checkpoint. Rebuild
+        # the adapter so its checkpointer is bound to the new thread_id
+        # instead of carrying state from the cleared one.
+        self._koda_thread_id = self._koda_session.session_id
         self._last_assistant_widget = None
         self._chat_started = False
         if self._banner is not None:
@@ -490,144 +684,22 @@ class KodaApp(App):
         self._update_last_user_preview("")
         await self.mount_message(AppMessage("New session started"))
         self._refresh_session_panel()
+        if self._adapter_factory is not None:
+            await self._rebuild_adapter_for_thread(resume=False)
 
     @work(exclusive=True)
     async def action_open_tree(self) -> None:
-        """Open the session tree, then truncate history to the picked node.
-
-        Two-step modal:
-          1. TreeScreen → user picks a target node
-          2. CompressionChoiceScreen → compress (summarize) or keep full
-
-        After the user confirms, the active path is moved to ``target_id``,
-        ``self._history`` is rebuilt from ``get_messages_for_agent()`` so the
-        next agent turn only sees messages up to that point, and the adapter
-        is reset so any cross-turn state (e.g. LangGraph's checkpointer) is
-        forgotten.
-        """
+        """Open the session tree modal. Runs in a worker for push_screen_wait."""
         has_messages = any(
             e.type == "message" for e in self._koda_session.entries.values()
         )
         if not has_messages:
             await self.mount_message(AppMessage("No messages yet — tree is empty"))
             return
-        from koda.tree_widget import CompressionChoiceScreen, TreeScreen
+        from koda.tree_widget import TreeScreen
 
-        target_id = await self.push_screen_wait(TreeScreen(self._koda_session))
-        if not target_id:
-            return
-        if target_id == self._koda_session.leaf_id:
-            await self.mount_message(
-                AppMessage("Already on the selected node — nothing to do.")
-            )
-            return
-
-        target_entry = self._koda_session.entries.get(target_id)
-        if target_entry is None:
-            return
-        preview = (target_entry.content or "").replace("\n", " ").strip()
-        if len(preview) > 60:
-            preview = preview[:57] + "..."
-
-        mode = await self.push_screen_wait(CompressionChoiceScreen(preview))
-        if mode not in ("compress", "keep"):
-            return
-
-        await self._jump_to_node(target_id, mode)
-
-    async def _jump_to_node(self, target_id: str, mode: str) -> None:
-        """Move the active leaf to ``target_id`` and resync UI + adapter.
-
-        ``mode`` is ``"compress"`` (summarize the path up to target into one
-        system message) or ``"keep"`` (send the full path up to target).
-        """
-        assert self._messages_container is not None
-        session = self._koda_session
-
-        session.navigate_to(target_id)
-
-        if mode == "compress":
-            messages_to_compress = session.get_messages_for_agent()
-            if messages_to_compress:
-                await self.mount_message(AppMessage("Summarizing previous memory…"))
-                try:
-                    from koda.summarizer import summarize_messages
-
-                    summary = await summarize_messages(
-                        messages_to_compress, self._model
-                    )
-                except Exception as e:
-                    _log.exception("tree-jump compaction failed")
-                    await self.mount_message(
-                        ErrorMessage(f"Compaction failed: {e} — keeping full history.")
-                    )
-                else:
-                    session.add_compaction(
-                        summary=summary,
-                        source_message_count=len(messages_to_compress),
-                    )
-
-        # Rebuild the agent-facing history from the (possibly compacted) active path.
-        self._history = list(session.get_messages_for_agent())
-
-        # Repaint the messages area to mirror the active path. Walk the path
-        # directly so we can render a marker for the compaction node instead
-        # of leaving the user staring at the pre-jump UI.
-        for child in list(self._messages_container.children):
-            await child.remove()
-        self._last_assistant_widget = None
-        for entry in session.get_active_path():
-            if entry.type == "compaction":
-                await self.mount_message(
-                    AppMessage(
-                        f"[Earlier conversation summarized — "
-                        f"{entry.metadata.get('source_message_count', 0)} messages compacted]"
-                    )
-                )
-                continue
-            if entry.type != "message" or entry.role not in ("user", "assistant"):
-                continue
-            if entry.role == "user":
-                await self.mount_message(UserMessage(entry.content))
-                self._update_last_user_preview(entry.content)
-            else:
-                await self.mount_message(AssistantMessage(entry.content))
-
-        # Forget cross-turn state on the adapter so it doesn't replay the
-        # abandoned branch from its own cache (LangGraph checkpointer).
-        if self._adapter is not None:
-            try:
-                new_thread = uuid.uuid4().hex
-                self._adapter.reset_history(new_thread)
-                self._koda_thread_id = new_thread
-            except AttributeError:
-                # Older adapters predate reset_history — best-effort, skip.
-                pass
-
-        self._conv_log = self._new_conversation_log()
-        await self.mount_message(
-            AppMessage(
-                f"Jumped to selected node ({mode}). "
-                f"Next message will see {len(self._history)} prior message(s)."
-            )
-        )
-
-    @work(exclusive=True)
-    async def action_open_model_picker(self) -> None:
-        """Open the model picker modal. Runs in a worker for push_screen_wait.
-
-        Called by ``/model`` with no arguments. On selection, switches to the
-        picked ``provider:model`` via ``switch_model``.
-        """
-        from koda.tui.model_picker import ModelPickerScreen
-
-        picked = await self.push_screen_wait(ModelPickerScreen(current=self._model))
-        if not picked:
-            return
-        if picked == self._model:
-            await self.mount_message(AppMessage(f"Already on {picked}"))
-            return
-        await self.switch_model(picked)
+        screen = TreeScreen(self._koda_session)
+        await self.push_screen_wait(screen)
 
     async def action_yank_last(self) -> None:
         if self._last_assistant_widget is None:
@@ -685,6 +757,12 @@ class KodaApp(App):
         except OSError as e:
             await self.mount_message(ErrorMessage(f"Failed to delete: {e}"))
             return
+        # Best-effort: drop the matching LangGraph thread so we don't leave
+        # orphan checkpoints in .koda/checkpoints.db. Silent failure is
+        # fine — the JSONL is already gone, the row just sits there as
+        # dead weight until the next vacuum.
+        if info.session_id and self._adapter is not None:
+            await self._delete_agent_thread(info.session_id)
         await self.mount_message(AppMessage(f"Deleted session {info.display_time}"))
         # If we just deleted the current session, start a fresh one
         if info.session_id == self._koda_session.session_id:
@@ -692,14 +770,40 @@ class KodaApp(App):
         else:
             self._refresh_session_panel()
 
+    async def _delete_agent_thread(self, thread_id: str) -> None:
+        """Drop a LangGraph thread's checkpoint, if the adapter exposes one.
+
+        Walks ``adapter._graph.checkpointer`` and calls ``adelete_thread``.
+        Adapters that don't follow the LangGraph layout (custom KodaAgents,
+        HTTP adapters) silently no-op. The lookup is defensive on purpose
+        — we don't want a missing attribute to break the user's delete.
+        """
+        adapter = self._adapter
+        graph = getattr(adapter, "_graph", None)
+        ckpt = getattr(graph, "checkpointer", None) if graph is not None else None
+        adelete = getattr(ckpt, "adelete_thread", None) if ckpt is not None else None
+        if not callable(adelete):
+            return
+        try:
+            await adelete(thread_id)
+        except Exception:
+            _log.debug("checkpoint thread delete failed", exc_info=True)
+
     # ── Session load / helpers ───────────────────────────────────────
 
     async def _load_session(self, path: Path) -> None:
-        """Load a previously-saved session into the UI."""
+        """Load a previously-saved session into the UI.
+
+        The JSONL rebuilds the visible transcript only — the agent's
+        actual message state lives in the LangGraph checkpointer, keyed
+        on ``session_id``. We deliberately leave ``self._history`` empty
+        so the rebuilt adapter doesn't double-seed messages the
+        checkpointer is about to replay.
+        """
         assert self._messages_container is not None
         new_tree = SessionTree(path=path)
         self._koda_session = new_tree
-        # Rebuild message history for the agent + UI
+        self._koda_thread_id = new_tree.session_id
         for child in list(self._messages_container.children):
             await child.remove()
         self._history.clear()
@@ -707,7 +811,6 @@ class KodaApp(App):
         for entry in new_tree.get_active_path():
             if entry.type != "message" or entry.role not in ("user", "assistant"):
                 continue
-            self._history.append({"role": entry.role, "content": entry.content})
             if entry.role == "user":
                 await self.mount_message(UserMessage(entry.content))
                 self._update_last_user_preview(entry.content)
@@ -715,6 +818,11 @@ class KodaApp(App):
                 await self.mount_message(AssistantMessage(entry.content))
         self._conv_log = self._new_conversation_log()
         self._refresh_session_panel()
+        # Rebuild the adapter so LangGraph's checkpointer resumes the
+        # thread for the picked session. ``resume=True`` keeps the new
+        # adapter from re-injecting transcript messages on first turn.
+        if self._adapter_factory is not None:
+            await self._rebuild_adapter_for_thread(resume=True)
 
     def _refresh_session_panel(self) -> None:
         try:
@@ -747,16 +855,11 @@ class KodaApp(App):
                 await self._adapter.interrupt()
             self._turn_task.cancel()
             return
+        await self._shutdown_adapter()
         self.exit()
 
     def _current_selection_text(self) -> str:
-        """Return the currently mouse-selected text across the screen, or ''.
-
-        Textual 1.0 dropped ``Screen.get_selected_text``; the AttributeError
-        is caught below so Ctrl+C-with-selection silently degrades to the
-        interrupt/exit path. Replace with a 1.0-compatible selection source
-        when one becomes available.
-        """
+        """Return the currently mouse-selected text across the screen, or ''."""
         screen = getattr(self, "screen", None)
         if screen is None:
             return ""
@@ -785,6 +888,45 @@ class KodaApp(App):
         except Exception:
             pass
 
-    def action_quit_app(self) -> None:
-        """Ctrl+D — always exits."""
+    async def action_quit_app(self) -> None:
+        """Ctrl+D — close adapter resources, then exit.
+
+        Closing the adapter is what prevents the post-Textual-unmount
+        process hang on the coding-agent backend: its async SQLite
+        checkpointer holds a non-daemon ``aiosqlite`` worker thread.
+        """
+        await self._shutdown_adapter()
         self.exit()
+
+    async def _shutdown_adapter(self) -> None:
+        """Best-effort cleanup before ``self.exit()``.
+
+        Calls ``adapter.aclose()`` if the active adapter exposes it (it's
+        an optional method on the KodaAgent protocol — only the
+        coding-agent backend needs it today). Failures are logged and
+        swallowed; nothing should prevent the actual exit.
+        """
+        adapter = self._adapter
+        if adapter is None:
+            return
+        aclose = getattr(adapter, "aclose", None)
+        if aclose is None:
+            return
+        try:
+            await aclose()
+        except Exception:
+            _log.debug("adapter aclose() failed during shutdown", exc_info=True)
+
+    async def on_unmount(self) -> None:
+        """Last-chance cleanup hook.
+
+        Textual calls this on **every** shutdown path — Ctrl+D, Ctrl+C,
+        OS signal (SIGHUP from a closed terminal window), even programmatic
+        ``app.exit()``. The action handlers (``action_quit_app`` /
+        ``action_copy_or_interrupt``) already call ``_shutdown_adapter``
+        before ``self.exit()``, but those don't fire for signal-driven
+        exits — so we also do it here. ``aclose()`` is idempotent (the
+        second call is a no-op once the connection is shut), so the
+        belt-and-suspenders pairing is safe.
+        """
+        await self._shutdown_adapter()

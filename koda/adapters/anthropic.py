@@ -15,8 +15,13 @@ from __future__ import annotations
 import os
 from typing import Any, AsyncIterator, Iterable
 
-from koda.adapters.base import BaseAdapter
+from koda.adapters.base import (
+    BaseAdapter,
+    model_supports_thinking,
+    model_supports_vision,
+)
 from koda.agent_api import (
+    AgentDescription,
     AgentEvent,
     TextDelta,
     ThinkingDelta,
@@ -28,6 +33,8 @@ _DEFAULT_MAX_TOKENS = 4096
 
 class AnthropicAdapter(BaseAdapter):
     """Thin async-streaming adapter over the Anthropic Messages API."""
+
+    _backend = "anthropic-sdk"
 
     def __init__(
         self,
@@ -51,6 +58,20 @@ class AnthropicAdapter(BaseAdapter):
         self._system = system
         self._max_tokens = max_tokens
         self._extractors = (_extract_delta, _extract_usage)
+
+    def describe(self) -> AgentDescription:
+        bare_model = self._model.split(":", 1)[-1]
+        preview: str | None = None
+        if self._system:
+            preview = self._system.strip().split("\n", 1)[0][:200] or None
+        return AgentDescription(
+            name=bare_model,
+            backend=self._backend,
+            supports_thinking=model_supports_thinking(bare_model),
+            supports_vision=model_supports_vision(bare_model),
+            tools=(),  # this adapter doesn't wire tools
+            system_prompt_preview=preview,
+        )
 
     async def _native_stream(
         self, message: str, history: list[dict[str, Any]]

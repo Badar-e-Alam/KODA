@@ -55,6 +55,10 @@ _PROVIDER_KEYS: dict[str, str | None] = {
     "google": "GOOGLE_API_KEY",
     "google_genai": "GOOGLE_API_KEY",
     "ollama": None,  # local; uses OLLAMA_HOST/OLLAMA_API_KEY but both optional
+    # Kimi K2 routes through Ollama Cloud (OpenAI-compatible); the coding
+    # agent's build_chat_model honors OLLAMA_BASE_URL/OLLAMA_API_KEY (or a
+    # KIMI_API_KEY override), so we treat the key as optional here too.
+    "kimi": None,
     "openrouter": "OPENROUTER_API_KEY",
     "lmstudio": None,  # local
     "groq": "GROQ_API_KEY",

@@ -10,8 +10,34 @@ stream. See `koda/adapters/` for reference implementations.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, AsyncIterator, Protocol, Union, runtime_checkable
+
+
+@dataclass(frozen=True)
+class ToolDescription:
+    """Public-facing description of a single tool the adapter exposes."""
+
+    name: str
+    description: str = ""
+
+
+@dataclass(frozen=True)
+class AgentDescription:
+    """Capability + tool metadata an adapter reports to the TUI.
+
+    Returned by the optional :meth:`KodaAgent.describe` method and rendered
+    by ``/agents``, ``/tools``, and the status-bar badges. Adapters that
+    don't implement ``describe`` get a synthesized default via
+    :func:`describe_agent` — so every field has a safe fallback value.
+    """
+
+    name: str
+    backend: str = "unknown"
+    supports_thinking: bool = False
+    supports_vision: bool = False
+    tools: tuple[ToolDescription, ...] = field(default_factory=tuple)
+    system_prompt_preview: str | None = None
 
 
 @dataclass
@@ -91,3 +117,34 @@ class KodaAgent(Protocol):
     async def interrupt(self) -> None:
         """Cancel the current stream. Idempotent; safe to call anytime."""
         ...
+
+    # NOTE: Adapters MAY also implement::
+    #
+    #     def describe(self) -> AgentDescription: ...
+    #
+    # to surface backend/capabilities/tools to the TUI (rendered by
+    # ``/agents``, ``/tools``, and the status-bar capability badges).
+    # It is deliberately NOT part of the runtime-checkable Protocol so
+    # adapters predating the extension continue to satisfy
+    # ``isinstance(x, KodaAgent)`` — callers should go through
+    # :func:`describe_agent` which handles the absent / failing cases.
+
+
+def describe_agent(agent: "KodaAgent") -> AgentDescription:
+    """Safely call ``agent.describe()`` with a minimal fallback.
+
+    Adapters predating the ``describe`` extension — or implementations
+    that fail mid-introspection — fall back to a description containing
+    just the model name. This keeps the TUI's adapter-aware paths
+    forward-compatible without forcing every implementation to override.
+    """
+    describe = getattr(agent, "describe", None)
+    if describe is None:
+        return AgentDescription(name=agent.model_name())
+    try:
+        result = describe()
+    except Exception:
+        return AgentDescription(name=agent.model_name())
+    if not isinstance(result, AgentDescription):
+        return AgentDescription(name=agent.model_name())
+    return result

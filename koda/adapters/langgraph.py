@@ -16,11 +16,18 @@ import os
 import uuid
 from typing import Any, AsyncIterator, Iterable
 
-from koda.adapters.base import BaseAdapter
+from koda.adapters.base import (
+    BaseAdapter,
+    model_supports_thinking,
+    model_supports_vision,
+    tools_from_objects,
+)
 from koda.agent_api import (
+    AgentDescription,
     AgentEvent,
     TextDelta,
     ThinkingDelta,
+    ToolDescription,
     ToolResult,
     ToolStart,
     Usage,
@@ -31,11 +38,13 @@ _log = logging.getLogger("koda.adapters.langgraph")
 # LangGraph defaults to 25 steps per turn, which runs out on multi-step
 # research tasks (scrape → parse → convert → write PDF → verify). Bump
 # to 100 by default; override with KODA_RECURSION_LIMIT.
-_DEFAULT_RECURSION_LIMIT = int(os.environ.get("KODA_RECURSION_LIMIT", "100"))
+_DEFAULT_RECURSION_LIMIT = int(os.environ.get("KODA_RECURSION_LIMIT", "1000"))
 
 
 class LangGraphAdapter(BaseAdapter):
     """Wrap a compiled LangGraph graph as a KodaAgent."""
+
+    _backend = "langgraph"
 
     def __init__(self, graph: Any, model: str, thread_id: str | None = None) -> None:
         super().__init__(model=model, thread_id=thread_id)
@@ -51,12 +60,37 @@ class LangGraphAdapter(BaseAdapter):
             _extract_tool_end,
         )
 
-    def reset_history(self, thread_id: str | None = None) -> None:
-        """Rotate the thread_id and re-arm the one-shot seeder so the next
-        turn ignores the old checkpointer state and re-seeds from the
-        truncated history we hand it."""
-        super().reset_history(thread_id or uuid.uuid4().hex)
-        self._seeded = False
+    def mark_seeded(self) -> None:
+        """Declare that the upstream graph already has this thread's history.
+
+        Use after rebuilding the adapter for a thread that already has a
+        checkpoint (model switch, session resume, memory reload). Without
+        this, the next ``_native_stream`` would prepend the caller's
+        ``history`` argument to the input messages and LangGraph's
+        ``add_messages`` reducer would duplicate every prior turn on top
+        of what the checkpointer replays.
+        """
+        self._seeded = True
+
+    def describe(self) -> AgentDescription:
+        return AgentDescription(
+            name=self._model,
+            backend=self._backend,
+            supports_thinking=model_supports_thinking(self._model),
+            supports_vision=model_supports_vision(self._model),
+            tools=_introspect_graph_tools(self._graph),
+            system_prompt_preview=None,
+        )
+
+    def _extra_callbacks(self) -> list[Any]:
+        """Per-adapter callback hook injected into every ``astream_events`` call.
+
+        Default is empty so the base adapter stays agent-agnostic. Subclasses
+        override to attach tracing (e.g. ``CodingAgentAdapter`` returns
+        ``coding_agent.tracing.langfuse_callbacks()`` so every turn lands in
+        Langfuse without the TUI knowing).
+        """
+        return []
 
     async def _native_stream(
         self, message: str, history: list[dict[str, Any]]
@@ -75,10 +109,13 @@ class LangGraphAdapter(BaseAdapter):
         by a user via ``--agent``). If the graph has no thread state yet
         and history is non-empty, we seed the first call with it.
         """
-        config = {
+        config: dict[str, Any] = {
             "configurable": {"thread_id": self._thread_id},
             "recursion_limit": _DEFAULT_RECURSION_LIMIT,
         }
+        extra_cbs = self._extra_callbacks()
+        if extra_cbs:
+            config["callbacks"] = extra_cbs
 
         input_messages: list[dict[str, Any]] = [
             {"role": "user", "content": message}
@@ -196,6 +233,44 @@ def _stringify_tool_output(output: Any) -> tuple[str, bool]:
             return str(output["content"]), bool(output.get("is_error", False))
         return repr(output), False
     return str(output), False
+
+
+def _introspect_graph_tools(graph: Any) -> tuple[ToolDescription, ...]:
+    """Best-effort extraction of the tools wired into a compiled LangGraph graph.
+
+    ``create_react_agent`` exposes its tool node at a few different paths
+    depending on the LangGraph version. We try each in turn and silently
+    return an empty tuple if nothing matches — the TUI's ``/tools`` command
+    will just report "no tool surface" instead of crashing.
+    """
+    if graph is None:
+        return ()
+
+    # Common attribute paths across LangGraph versions and graph styles.
+    # The deepagents path (StateNodeSpec.runnable: ToolNode) is tried first
+    # because that's the layout KODA's coding-agent uses; older
+    # ``create_react_agent`` layouts (``.data.tools_by_name``) follow.
+    candidates: list[Any] = []
+    for getter in (
+        lambda g: g.builder.nodes["tools"].runnable.tools_by_name.values(),
+        lambda g: g.nodes["tools"].runnable.tools_by_name.values(),
+        lambda g: g.nodes["tools"].data.tools_by_name.values(),
+        lambda g: g.nodes["tools"].data.tools,
+        lambda g: g.builder.nodes["tools"].data.tools_by_name.values(),
+        lambda g: g.builder.nodes["tools"].data.tools,
+        lambda g: g.get_graph().nodes["tools"].data.tools,
+    ):
+        try:
+            tools = list(getter(graph))
+        except Exception:
+            continue
+        if tools:
+            candidates = tools
+            break
+
+    if not candidates:
+        return ()
+    return tools_from_objects(candidates)
 
 
 __all__ = ["LangGraphAdapter"]

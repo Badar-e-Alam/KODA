@@ -29,9 +29,11 @@ import uuid
 from typing import Any, AsyncIterator, Callable, Iterable, Sequence
 
 from koda.agent_api import (
+    AgentDescription,
     AgentEvent,
     Done,
     KodaAgent,
+    ToolDescription,
     ToolResult,
     Usage,
 )
@@ -67,6 +69,11 @@ class BaseAdapter(KodaAgent):
     # Subclass hook — override with a tuple of Extractor callables.
     _extractors: Sequence[Extractor] = ()
 
+    # Subclasses set this to surface their backend in ``describe()``.
+    # Kept as a class attribute so the default ``describe`` works without
+    # subclass boilerplate when only the backend name needs to change.
+    _backend: str = "unknown"
+
     def __init__(self, model: str, thread_id: str | None = None) -> None:
         self._model = model
         self._thread_id = thread_id or uuid.uuid4().hex
@@ -80,17 +87,21 @@ class BaseAdapter(KodaAgent):
     async def interrupt(self) -> None:
         self._cancel.set()
 
-    def reset_history(self, thread_id: str | None = None) -> None:
-        """Drop any cross-turn state so the next ``stream()`` call starts
-        fresh from the ``history`` argument alone.
+    async def aclose(self) -> None:
+        """Best-effort: release any non-daemon resources held by the adapter.
 
-        Default is a no-op: stateless adapters (coding_agent, anthropic)
-        already redrive themselves from the per-turn ``history``. Adapters
-        that keep state across turns (LangGraph's checkpointer) override
-        this to forget the abandoned branch.
+        Default is a no-op. Subclasses that hold long-lived async resources
+        (notably ``aiosqlite`` connections under a LangGraph checkpointer,
+        whose worker thread is *non-daemon* and otherwise blocks process
+        exit) override this and clean up. KODA's TUI calls this from
+        its quit paths before ``self.exit()``.
         """
-        if thread_id is not None:
-            self._thread_id = thread_id
+        return None
+
+    def describe(self) -> AgentDescription:
+        """Default adapter description. Override to report tools,
+        capability flags, or a system-prompt preview."""
+        return AgentDescription(name=self._model, backend=self._backend)
 
     async def stream(
         self, message: str, history: list[dict[str, Any]]
@@ -136,4 +147,59 @@ class BaseAdapter(KodaAgent):
         yield  # type: ignore[unreachable]
 
 
-__all__ = ["BaseAdapter", "Extractor", "merge_usage"]
+_THINKING_HINTS = (
+    "claude-sonnet-4", "claude-opus-4", "claude-haiku-4",
+    "claude-3-7", "o1-", "o3-", "deepseek-r", "deepseek-v3",
+)
+_VISION_HINTS = (
+    "claude-3", "claude-4", "claude-sonnet", "claude-opus", "claude-haiku",
+    "gpt-4o", "gpt-4-turbo", "gemini", "llava", "qwen-vl",
+)
+
+
+def model_supports_thinking(model: str) -> bool:
+    """Heuristic: does the named model emit reasoning/thinking deltas?
+
+    Best-effort string match used by adapters that don't have a richer
+    capability signal from their SDK. False negatives are fine — the
+    badge just won't show.
+    """
+    low = (model or "").lower()
+    return any(h in low for h in _THINKING_HINTS)
+
+
+def model_supports_vision(model: str) -> bool:
+    """Heuristic: does the named model accept image input?"""
+    low = (model or "").lower()
+    return any(h in low for h in _VISION_HINTS)
+
+
+def tools_from_objects(objs: Iterable[Any]) -> tuple[ToolDescription, ...]:
+    """Best-effort conversion of arbitrary tool objects to ToolDescriptions.
+
+    Adapters wrap a wide variety of tool flavors (LangChain BaseTool,
+    OpenAI-Agents-SDK FunctionTool, raw callables). All we need for the
+    TUI is ``name`` + a one-line ``description`` — grab whichever attrs
+    are present and clamp the description to a single line under 120 chars.
+    """
+    out: list[ToolDescription] = []
+    for t in objs:
+        name = getattr(t, "name", None) or getattr(t, "__name__", None) or repr(t)
+        desc_raw = (
+            getattr(t, "description", None)
+            or getattr(t, "__doc__", None)
+            or ""
+        )
+        desc = (desc_raw or "").strip().split("\n", 1)[0][:120]
+        out.append(ToolDescription(name=str(name), description=desc))
+    return tuple(out)
+
+
+__all__ = [
+    "BaseAdapter",
+    "Extractor",
+    "merge_usage",
+    "model_supports_thinking",
+    "model_supports_vision",
+    "tools_from_objects",
+]

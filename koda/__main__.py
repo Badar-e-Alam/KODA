@@ -30,16 +30,8 @@ def _load_dotenv() -> None:
 
 
 def _default_model() -> str:
-    """Pick a default model.
-
-    ``KODA_DEFAULT_MODEL`` (env or .env) wins if set — that's the per-user /
-    per-project override. Otherwise fall back to the first provider with an
-    API key configured.
-    """
+    """Pick a default model from available API keys."""
     _load_dotenv()
-    override = os.environ.get("KODA_DEFAULT_MODEL")
-    if override:
-        return override
     if os.environ.get("ANTHROPIC_API_KEY"):
         return "anthropic:claude-sonnet-4-6"
     if os.environ.get("OPENAI_API_KEY"):
@@ -141,8 +133,8 @@ def main() -> None:
     )
     parser.add_argument(
         "--agent", "-a",
-        default="deep",
-        help="Agent backend: 'deep' (default), 'coding_agent', or 'module.ClassName'",
+        default="coding_agent",
+        help="Agent backend: 'coding_agent' (default), 'deep', or 'module.ClassName'",
     )
     parser.add_argument(
         "--model", "-m",
@@ -154,7 +146,28 @@ def main() -> None:
         action="store_true",
         help="Auto-approve all tool calls",
     )
+    parser.add_argument(
+        "--cwd", "-C",
+        default=None,
+        metavar="PATH",
+        help=(
+            "Project directory the agent will operate on. Default: the "
+            "shell's current directory. Lets you target a project without "
+            "having to `cd` into it (e.g. `koda --cwd ~/work/meal-planning`)."
+        ),
+    )
     args = parser.parse_args()
+
+    if args.cwd is not None:
+        import os
+        from pathlib import Path as _Path
+
+        target = _Path(args.cwd).expanduser().resolve()
+        if not target.is_dir():
+            parser.error(f"--cwd: not a directory: {target}")
+        # chdir before adapters are built so every cwd-derived path
+        # (AGENTS.md, .koda/, /memories/, checkpoints.db) anchors here.
+        os.chdir(target)
 
     _setup_logging()
 
@@ -168,8 +181,12 @@ def main() -> None:
     except Exception:
         pass  # non-fatal — /model will still work off fallback lists
 
-    import uuid
-    thread_id = uuid.uuid4().hex
+    # ``thread_id`` is intentionally left ``None`` here: ``KodaApp`` derives
+    # it from the freshly-created ``SessionTree.session_id`` so that the
+    # LangGraph checkpointer's thread matches the session shown in the
+    # sidebar. A random UUID at launch would create an orphan thread that
+    # the user could never resume.
+    thread_id = None
     model = args.model or _default_model()
     # Build the factory eagerly (cheap — just resolves a callable) but defer
     # the expensive ``factory(model, thread_id)`` call into a background
@@ -181,15 +198,28 @@ def main() -> None:
     logging.getLogger("koda").info("Starting KODA: agent=%s model=%s", args.agent, model)
 
     import asyncio
-    asyncio.run(_run_app(
-        factory=factory,
-        model=model,
-        thread_id=thread_id,
-        auto_approve=args.auto_approve,
-    ))
+    # Wrap ``asyncio.run`` so Ctrl+C exits cleanly with status 130 (the
+    # conventional exit code for SIGINT) instead of dumping a multi-screen
+    # traceback. On Python 3.11+ ``asyncio.run`` installs its own SIGINT
+    # handler that races with Textual's Ctrl+C keybinding; when asyncio
+    # wins the race, the ``KeyboardInterrupt`` lands inside whatever
+    # Textual code path was running (typically a style-property getter
+    # mid-paint) and bubbles up unhandled. Catching here is the
+    # documented pattern for asyncio scripts. The shutdown side-effects
+    # (adapter aclose, on_unmount, atexit hooks) still run because the
+    # cancellation propagates through ``run_async()`` first.
+    try:
+        asyncio.run(_run_app(
+            factory=factory,
+            model=model,
+            thread_id=thread_id,
+            auto_approve=args.auto_approve,
+        ))
+    except KeyboardInterrupt:
+        sys.exit(130)
 
 
-async def _run_app(*, factory, model: str, thread_id: str, auto_approve: bool = False) -> None:
+async def _run_app(*, factory, model: str, thread_id: str | None = None, auto_approve: bool = False) -> None:
     from koda.tui.app import KodaApp
 
     app = KodaApp(
