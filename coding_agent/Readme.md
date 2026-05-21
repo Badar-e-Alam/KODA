@@ -1,6 +1,6 @@
 # coding_agent
 
-Coding agent built on the OpenAI Agents SDK. **Working.**
+Coding agent built on deepagent SDK. **Working.**
 
 **Goal:** a coding agent that can solve **long-horizon tasks** — multi-file refactors, end-to-end feature work, debugging that spans the codebase.
 
@@ -9,7 +9,7 @@ Coding agent built on the OpenAI Agents SDK. **Working.**
 ## TODO
 
 - [x] Agent integrated, tools added
-- [ ] Loop (the agent is missing an outer control loop)
+- [x] Loop (the agent is missing an outer control loop
 - [ ] Proactive action for the prompt
 - [ ] Human-in-the-loop
 - [ ] Plan mode
