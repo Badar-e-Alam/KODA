@@ -33,7 +33,10 @@ from koda.model_config import (
 )
 from koda.session import SessionTree
 from koda.session_panel import ConfirmDeleteScreen, SessionPanel
+from koda.tools import permissions as _perms
 from koda.tui.commands import dispatch as dispatch_command
+from koda.tui.modes import Mode, next_mode, style_for
+from koda.tui.screens import PermissionScreen
 from koda.tui.stream import run_turn
 from koda.tui.theme import DEFAULT_THEME, THEMES, get as get_theme, to_textual_theme
 from koda.tui.widgets import (
@@ -65,6 +68,16 @@ def _default_adapter_factory(model: str, thread_id: str) -> KodaAgent:
 # "Memory updated" notice so the user knows to /reload-memory for the
 # change to take effect this session.
 _MEMORY_FILES = {"/AGENTS.md", "AGENTS.md"}
+
+
+# One-liner displayed in the chat when the user cycles modes. Helps
+# orient newcomers — Shift+Tab alone is a quiet binding and the badge
+# colour change can be missed on small terminals.
+_MODE_HINT: dict[Mode, str] = {
+    Mode.DEFAULT: "tools run; risky tools ask first",
+    Mode.EDITS:   "file edits run silently; shell still asks",
+    Mode.PLAN:    "advisory only; no writes/shell — Shift+A to apply",
+}
 
 
 def _is_memory_file_edit(widget: "ToolCallMessage") -> bool:
@@ -99,6 +112,10 @@ class KodaApp(App):
         Binding("ctrl+y", "yank_last", "Copy last response", show=False),
         Binding("ctrl+b", "toggle_sidebar", "Toggle sidebar", show=False),
         Binding("ctrl+l", "clear_session", "New chat", show=False),
+        # Claude-Code-style mode controls. ``priority=True`` so the chat
+        # input doesn't swallow shift+tab as "shift + accept-suggestion".
+        Binding("shift+tab", "cycle_agent_mode", "Cycle agent mode", show=False, priority=True),
+        Binding("shift+a", "apply_plan", "Apply last plan", show=False, priority=True),
     ]
 
     def __init__(
@@ -156,6 +173,11 @@ class KodaApp(App):
         # Once the user sends a message the banner collapses permanently.
         # Guards `_set_banner_compact(False)` from restoring the tall banner.
         self._chat_started: bool = False
+        # Agent-mode state. The source of truth lives in
+        # ``koda.tools.permissions`` (so tool threads can read it without
+        # poking the App); we mirror it here as a Textual reactive for the
+        # status bar / composer to subscribe to.
+        self._agent_mode: Mode = Mode.DEFAULT
 
     # ── Session file paths ──────────────────────────────────────────
 
@@ -241,6 +263,15 @@ class KodaApp(App):
         if self._adapter is None and self._adapter_factory is not None:
             asyncio.create_task(self._bootstrap_adapter())
 
+        # Install the permission bridge — see ``_prompt_from_tool_thread``
+        # below. Tools that call ``permissions.check()`` from their
+        # worker thread will now route to the modal screen on this
+        # event loop and block until the user answers.
+        self._ui_loop = asyncio.get_running_loop()
+        _perms.set_prompt_hook(self._prompt_from_tool_thread)
+        # Reflect the current mode in the UI now that everything is mounted.
+        self._apply_agent_mode(self._agent_mode)
+
     async def _bootstrap_adapter(self) -> None:
         """Build the initial adapter without blocking the UI thread."""
         loading = AppMessage(f"Loading agent… ({self._model})")
@@ -312,6 +343,104 @@ class KodaApp(App):
         except Exception:
             _log.debug("capability refresh failed", exc_info=True)
             self._status_bar.set_capabilities(None)
+
+    # ── Agent mode (default / accept-edits / plan) ───────────────────
+
+    def _apply_agent_mode(self, mode: Mode) -> None:
+        """Push the new mode into the permission gate AND mirror it in
+        the UI. Single funnel for every code path that changes mode
+        (Shift+Tab cycle, /plan command, apply-plan reset)."""
+        self._agent_mode = mode
+        _perms.set_mode(mode)
+        if self._status_bar is not None:
+            self._status_bar.agent_mode = mode.value
+        # Composer border tint: one CSS class per mode, applied to
+        # ``#app-root`` so app.tcss can use the descendant selector to
+        # color the ChatInput border without ChatInput needing to know
+        # about modes.
+        try:
+            root = self.query_one("#app-root")
+        except Exception:
+            return
+        for m in Mode:
+            cls = style_for(m).css_class
+            if m is mode:
+                root.add_class(cls)
+            else:
+                root.remove_class(cls)
+
+    async def action_cycle_agent_mode(self) -> None:
+        """Shift+Tab — rotate through default → edits → plan → default …
+
+        Mirrors Claude Code's mode cycling. The mode change is purely
+        ephemeral session state; nothing is persisted to disk.
+        """
+        new = next_mode(self._agent_mode)
+        self._apply_agent_mode(new)
+        s = style_for(new)
+        await self.mount_message(AppMessage(
+            f"Mode → {s.label.lower()} ({_MODE_HINT[new]})"
+        ))
+
+    async def action_apply_plan(self) -> None:
+        """Shift+A — accept the most recent assistant plan and execute.
+
+        Only meaningful in PLAN mode. Switches back to DEFAULT and seeds
+        the next turn with an explicit "apply" instruction quoting the
+        plan so the agent has the full text to work from even on
+        backends without a checkpointer that survives mode changes.
+        """
+        if self._agent_mode is not Mode.PLAN:
+            await self.mount_message(AppMessage(
+                "Shift+A applies a plan — switch to plan mode first (Shift+Tab)."
+            ))
+            return
+        plan_text = ""
+        if self._last_assistant_widget is not None:
+            plan_text = getattr(self._last_assistant_widget, "_content", "") or ""
+        plan_text = plan_text.strip()
+        if not plan_text:
+            await self.mount_message(AppMessage("No plan to apply — send a request first."))
+            return
+        self._apply_agent_mode(Mode.DEFAULT)
+        prompt = (
+            "Apply the plan you just outlined. The plan was:\n\n"
+            f"{plan_text}\n\n"
+            "Execute it now."
+        )
+        await self._handle_user_message(prompt)
+
+    # ── Permission bridge (sync tool thread → asyncio modal) ─────────
+
+    def _prompt_from_tool_thread(self, tool_name: str, args: dict) -> bool:
+        """Bridge called from a LangGraph tool worker thread.
+
+        Schedules ``_show_permission_modal`` on the UI event loop and
+        blocks the calling thread until the user answers. Returns True
+        for allow / always-allow, False for deny. The
+        ``always``-allow path also adds the tool to the session
+        allow-list so subsequent calls skip the prompt entirely.
+        """
+        loop = getattr(self, "_ui_loop", None)
+        if loop is None:
+            # No loop captured (e.g. headless run). Default to allow so
+            # we don't deadlock waiting on a modal that won't appear.
+            return True
+        fut = asyncio.run_coroutine_threadsafe(
+            self._show_permission_modal(tool_name, args), loop
+        )
+        try:
+            outcome = fut.result()  # blocks the tool thread
+        except Exception:
+            _log.exception("permission modal raised")
+            return False
+        if outcome == "always":
+            _perms.allow_tool(tool_name)
+        return outcome in ("allow", "always")
+
+    async def _show_permission_modal(self, tool_name: str, args: dict) -> str:
+        """Push the modal and await the user's choice. Runs on the UI loop."""
+        return await self.push_screen_wait(PermissionScreen(tool_name, args))
 
     # ── Responsive layout ────────────────────────────────────────────
 
@@ -682,6 +811,11 @@ class KodaApp(App):
         if self._status_bar is not None:
             self._status_bar.reset_usage()
         self._update_last_user_preview("")
+        # A new session shouldn't carry over the prior session's
+        # always-allow permission grants — those are explicit user
+        # decisions about *this* conversation.
+        _perms.clear_session_allow()
+        self._apply_agent_mode(Mode.DEFAULT)
         await self.mount_message(AppMessage("New session started"))
         self._refresh_session_panel()
         if self._adapter_factory is not None:
@@ -851,6 +985,13 @@ class KodaApp(App):
             return
 
         if self._turn_task and not self._turn_task.done():
+            # Immediate visual feedback — the cancel signal propagates
+            # asynchronously and on slow streams the actual stop can be
+            # 1-2 seconds away. Without this banner the UI looks dead.
+            try:
+                await self.mount_message(AppMessage("⏹ Interrupting…"))
+            except Exception:
+                pass
             if self._adapter is not None:
                 await self._adapter.interrupt()
             self._turn_task.cancel()

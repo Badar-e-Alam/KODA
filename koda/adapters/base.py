@@ -107,14 +107,64 @@ class BaseAdapter(KodaAgent):
         self, message: str, history: list[dict[str, Any]]
     ) -> AsyncIterator[AgentEvent]:
         """Run one turn end-to-end. Emits events, cleans up cancel state,
-        always yields a final ``Done``."""
+        always yields a final ``Done``.
+
+        The chunk loop is built around ``asyncio.wait`` so the cancel
+        signal interrupts a stalled stream within ~50 ms instead of
+        waiting for the next ``__anext__`` to resolve. Without this,
+        Ctrl+C looks dead during slow LLM responses or long tool
+        executions because ``async for`` blocks on the awaitable from
+        the native stream and never re-enters the loop body to see
+        ``self._cancel.is_set()``.
+        """
         self._cancel.clear()
         usage = Usage()
 
+        stream_iter = self._native_stream(message, history).__aiter__()
         try:
-            async for chunk in self._native_stream(message, history):
-                if self._cancel.is_set():
+            while True:
+                next_task = asyncio.ensure_future(stream_iter.__anext__())
+                cancel_task = asyncio.ensure_future(self._cancel.wait())
+                try:
+                    done, pending = await asyncio.wait(
+                        {next_task, cancel_task},
+                        return_when=asyncio.FIRST_COMPLETED,
+                    )
+                except asyncio.CancelledError:
+                    # Outer task was cancelled (Ctrl+C → ``self._turn_task.cancel()``).
+                    next_task.cancel()
+                    cancel_task.cancel()
+                    raise
+
+                # Whichever future didn't complete needs to be cancelled
+                # so we don't leak a pending ``__anext__`` waiting on the
+                # SDK forever. ``cancel_task`` is just an Event.wait() —
+                # cheap to cancel.
+                for p in pending:
+                    p.cancel()
+
+                if cancel_task in done:
+                    # User asked to stop. Best-effort cleanup of the
+                    # native iterator before breaking out.
+                    next_task.cancel()
+                    aclose = getattr(stream_iter, "aclose", None)
+                    if aclose is not None:
+                        try:
+                            await aclose()
+                        except Exception:
+                            pass
                     break
+
+                # Native stream produced a chunk (or raised).
+                try:
+                    chunk = next_task.result()
+                except StopAsyncIteration:
+                    break
+                except asyncio.CancelledError:
+                    # next_task was cancelled out from under us — treat
+                    # as a stop signal.
+                    break
+
                 for extractor in self._extractors:
                     produced = extractor(chunk)
                     if not produced:

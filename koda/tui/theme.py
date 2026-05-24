@@ -26,7 +26,30 @@ class Palette:
     surface: str        # panels / cards
 
 
+# Palette lifted from the KODA TUI redesign reference (true-black bg,
+# warm-white foreground, orange accent, muted tagline greys). Hex values
+# correspond 1:1 to the `:root` CSS variables in the design HTML:
+#   --bg #000000   --bg-soft #0c0c0c   --fg #e8e6e1   --fg-3 #8a8780
+#   --accent #fb923c   --accent-2 #c2410c
+#   --ok #84a86b   --err #d97474
 DARK_KODA = Palette(
+    primary="#e8e6e1",   # --fg  (banner / headings)
+    accent="#fb923c",    # --accent  (orange highlight)
+    assistant="#e8e6e1", # --fg
+    user="#84a86b",      # --ok  (green border for user msg)
+    tool="#c2410c",      # --accent-2  (deeper orange for tool headers)
+    tool_ok="#84a86b",   # --ok
+    tool_err="#d97474",  # --err
+    error="#d97474",     # --err
+    muted="#8a8780",     # --fg-3
+    background="#000000",# --bg
+    surface="#0c0c0c",   # --bg-soft
+)
+
+# Tokyo Night kept as its own palette (was previously an alias to DARK_KODA;
+# the redesign moved DARK_KODA off the Tokyo Night colors so we restore the
+# original blues here for users who explicitly pick "tokyo-night").
+TOKYO_NIGHT = Palette(
     primary="#7aa2f7",
     accent="#bb9af7",
     assistant="#c0caf5",
@@ -39,8 +62,6 @@ DARK_KODA = Palette(
     background="#1a1b26",
     surface="#24283b",
 )
-
-TOKYO_NIGHT = DARK_KODA  # alias
 
 DRACULA = Palette(
     primary="#bd93f9",

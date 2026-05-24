@@ -19,6 +19,8 @@ from pathlib import Path
 
 from langchain.tools import tool
 
+from koda.tools.permissions import check as _permission_check
+
 # ── Workspace root ─────────────────────────────────────────────────────
 
 _DEFAULT_ROOT = Path(os.environ.get(
@@ -145,6 +147,9 @@ def write_file(file_path: str, content: str) -> str:
         file_path: Absolute path starting with '/'.
         content: Text content to write.
     """
+    refusal = _permission_check("write_file", {"file_path": file_path, "content": content})
+    if refusal:
+        return refusal
     target = _resolve(file_path)
     target.parent.mkdir(parents=True, exist_ok=True)
     try:
@@ -172,6 +177,13 @@ def edit_file(
         new_string: Replacement text.
         replace_all: If True, replace every occurrence. Else old_string must be unique.
     """
+    refusal = _permission_check(
+        "edit_file",
+        {"file_path": file_path, "old_string": old_string, "new_string": new_string,
+         "replace_all": replace_all},
+    )
+    if refusal:
+        return refusal
     target = _resolve(file_path)
     if not target.exists():
         return f"Error: file not found: {file_path}"
@@ -288,6 +300,9 @@ def execute(command: str, timeout: int | None = 120) -> str:
         command: Shell command to run. Use absolute paths.
         timeout: Seconds before the command is killed. None for no timeout.
     """
+    refusal = _permission_check("execute", {"command": command, "timeout": timeout})
+    if refusal:
+        return refusal
     try:
         result = subprocess.run(
             command,

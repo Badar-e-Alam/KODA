@@ -130,6 +130,13 @@ class LangGraphAdapter(BaseAdapter):
         async for event in self._graph.astream_events(
             {"messages": input_messages}, config=config, version="v2"
         ):
+            # Closest-to-source cancel check. BaseAdapter.stream races
+            # ``__anext__`` against ``self._cancel.wait()`` for the
+            # primary cut-off; this extra check breaks the LangGraph
+            # loop the moment the next event lands rather than waiting
+            # for the race to be re-armed. Belt and suspenders.
+            if self._cancel.is_set():
+                break
             yield event
 
 

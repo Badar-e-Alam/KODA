@@ -9,11 +9,11 @@
  * tuning them per-theme can come later; for now the semantic colors
  * (user=green, tool=amber, error=red) are consistent in every palette.
  */
-$user: #9ece6a;
-$tool: #e0af68;
-$tool-ok: #73daca;
-$tool-err: #f7768e;
-$muted: #565f89;
+$user: #84a86b;
+$tool: #c2410c;
+$tool-ok: #84a86b;
+$tool-err: #d97474;
+$muted: #8a8780;
 
 Screen {
     background: $background;
@@ -71,7 +71,7 @@ Screen {
  */
 KodaBanner {
     height: auto;
-    max-height: 10;
+    max-height: 12;
     padding: 1 2;
     color: $primary;
     overflow: hidden;
@@ -167,6 +167,22 @@ ChatInput.-shell {
 
 ChatInput.-command {
     border: round $accent;
+}
+
+/* ── Agent-mode border tint ───────────────────────────────────────────
+ * Mode classes are added to ``#app-root`` by ``KodaApp._apply_agent_mode``
+ * so the same modifier covers the composer regardless of which input-
+ * mode (-shell / -command) it's also in. The plan-mode tint is the
+ * strongest visual cue because plan mode silently blocks writes — we
+ * want the user to *see* they're in it. Hex literals are intentional
+ * here so the tint survives a /theme switch.
+ */
+#app-root.-mode-edits ChatInput {
+    border: round #84a86b;
+}
+#app-root.-mode-plan ChatInput {
+    border: round #b48ac4;
+    background: #1a1322;
 }
 
 /* ── Suggestion popup ─────────────────────────────────────────

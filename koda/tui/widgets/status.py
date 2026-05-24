@@ -11,6 +11,7 @@ from textual.reactive import reactive
 from textual.widgets import Static
 
 from koda.agent_api import AgentDescription, Usage
+from koda.tui.modes import Mode, style_for
 
 
 def _fmt(n: int) -> str:
@@ -24,6 +25,10 @@ def _fmt(n: int) -> str:
 class StatusBar(Static):
     model: reactive[str] = reactive("")
     mode: reactive[str] = reactive("chat")
+    # Agent operating mode (default / edits / plan) — separate from the
+    # input-mode reactive above which tracks the chat-input prefix
+    # (chat / shell / command). Switched via Shift+Tab; see koda.tui.modes.
+    agent_mode: reactive[str] = reactive(Mode.DEFAULT.value)
     input_tokens: reactive[int] = reactive(0)
     output_tokens: reactive[int] = reactive(0)
     cache_read: reactive[int] = reactive(0)
@@ -38,6 +43,9 @@ class StatusBar(Static):
         self._refresh_display()
 
     def watch_mode(self, *_a) -> None:
+        self._refresh_display()
+
+    def watch_agent_mode(self, *_a) -> None:
         self._refresh_display()
 
     def watch_input_tokens(self, *_a) -> None:
@@ -123,9 +131,19 @@ class StatusBar(Static):
         if self.cache_read:
             tokens += f" cache {_fmt(self.cache_read)}"
         mode = self.mode or "chat"
+
+        # Agent-mode pill: colored uppercase badge so users can see at a
+        # glance which permission regime the next tool call will hit.
+        try:
+            am_style = style_for(Mode(self.agent_mode))
+        except ValueError:
+            am_style = style_for(Mode.DEFAULT)
+        agent_pill = f"[reverse {am_style.color}] {am_style.label} [/]"
+
         segments = [model]
         if badges:
             segments.append(badges)
         segments.append(tokens)
         segments.append(mode)
+        segments.append(agent_pill)
         self.update(f" {'  ·  '.join(segments)} ")

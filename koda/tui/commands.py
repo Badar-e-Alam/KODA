@@ -107,6 +107,39 @@ async def _reload_memory(app: "KodaApp", _args: str) -> bool:
     return True
 
 
+async def _set_mode(app: "KodaApp", mode_name: str) -> bool:
+    """Slash-command path to switch agent mode without Shift+Tab cycling."""
+    from koda.tui.modes import Mode, style_for
+
+    aliases = {
+        "default": Mode.DEFAULT, "normal": Mode.DEFAULT,
+        "edits": Mode.EDITS, "edit": Mode.EDITS, "accept-edits": Mode.EDITS,
+        "plan": Mode.PLAN, "planning": Mode.PLAN,
+    }
+    target = aliases.get(mode_name.strip().lower())
+    if target is None:
+        await app.mount_message(ErrorMessage(
+            f"Unknown mode {mode_name!r}. Try: default, edits, plan."
+        ))
+        return True
+    app._apply_agent_mode(target)
+    s = style_for(target)
+    await app.mount_message(AppMessage(f"Mode → {s.label.lower()}"))
+    return True
+
+
+async def _plan(app: "KodaApp", _args: str) -> bool:
+    return await _set_mode(app, "plan")
+
+
+async def _edits(app: "KodaApp", _args: str) -> bool:
+    return await _set_mode(app, "edits")
+
+
+async def _default_mode(app: "KodaApp", _args: str) -> bool:
+    return await _set_mode(app, "default")
+
+
 async def _agents(app: "KodaApp", _args: str) -> bool:
     from koda.agent_api import describe_agent
 
@@ -167,6 +200,9 @@ _HELP: dict[str, tuple[Handler, str]] = {
     "agents": (_agents, "describe the active agent (backend, capabilities, tool count)"),
     "tools": (_tools, "list the active agent's tools"),
     "reload-memory": (_reload_memory, "re-read AGENTS.md (mid-session)"),
+    "plan": (_plan, "switch agent to plan mode (advisory, no writes/shell)"),
+    "edits": (_edits, "switch agent to accept-edits (file writes silent; shell asks)"),
+    "default": (_default_mode, "switch agent back to default mode"),
     "help": (_help, "list all slash commands"),
     "quit": (_quit, "exit KODA"),
     "exit": (_quit, "exit KODA"),

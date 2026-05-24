@@ -15,6 +15,7 @@ Widgets:
 from __future__ import annotations
 
 import json
+import os
 import re
 from typing import Any
 
@@ -61,19 +62,75 @@ class UserMessage(BaseMessage):
 
 
 class AssistantMessage(BaseMessage):
-    """Streaming assistant text. Call `append(delta)` for each TextDelta."""
+    """Streaming assistant text. Call `append(delta)` for each TextDelta.
+
+    ``append`` does NOT immediately repaint — that used to trigger a
+    full transcript re-layout per LLM token, which on token-streaming
+    backends (50–100 deltas/sec) saturated the asyncio loop and made
+    the TUI feel frozen during long replies. Instead, deltas accumulate
+    in ``self._content`` and a one-shot timer flushes the visible text
+    every ``_BATCH_INTERVAL`` seconds (default 50 ms = ~20 repaints/sec,
+    well within terminal refresh budgets). Override with
+    ``KODA_STREAM_BATCH_MS`` if your terminal can't keep up.
+    """
+
+    # 50 ms ≈ one frame at 20 fps — fast enough that streaming still
+    # *feels* live but slow enough that we coalesce 5–10 tokens per
+    # repaint on most backends.
+    _BATCH_INTERVAL = float(os.environ.get("KODA_STREAM_BATCH_MS", "50")) / 1000.0
 
     def __init__(self, content: str = "", **kwargs: Any) -> None:
         super().__init__(content, **kwargs)
         self._content = content
+        self._flush_timer = None  # type: ignore[var-annotated]
 
     def append(self, delta: str) -> None:
         self._content += delta
-        self.update(self._content)
+        # Already a flush scheduled? Just accumulate; the timer will
+        # repaint with the latest content when it fires.
+        if self._flush_timer is not None:
+            return
+        try:
+            # ``set_timer`` (one-shot) is preferred over ``set_interval``
+            # because we want exactly one repaint per batch — repeated
+            # interval ticks would keep firing after the stream ends.
+            self._flush_timer = self.set_timer(self._BATCH_INTERVAL, self._flush)
+        except Exception:
+            # Widget not mounted yet — leave _content accumulating; the
+            # next append after mount will succeed in scheduling, and
+            # _flush() will repaint with everything collected so far.
+            self._flush_timer = None
 
     def set_text(self, text: str) -> None:
+        # Direct setters (e.g. /tree replay) want immediate paint, no batching.
         self._content = text
-        self.update(text)
+        if self._flush_timer is not None:
+            try:
+                self._flush_timer.stop()
+            except Exception:
+                pass
+            self._flush_timer = None
+        try:
+            self.update(text)
+        except Exception:
+            pass
+
+    def _flush(self) -> None:
+        """Paint the accumulated content. Called by the one-shot timer."""
+        self._flush_timer = None
+        try:
+            self.update(self._content)
+        except Exception:
+            pass
+
+    def on_unmount(self) -> None:
+        """Cancel a pending flush so the timer can't fire after teardown."""
+        if self._flush_timer is not None:
+            try:
+                self._flush_timer.stop()
+            except Exception:
+                pass
+            self._flush_timer = None
 
 
 class ToolCallMessage(BaseMessage):
