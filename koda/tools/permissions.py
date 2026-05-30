@@ -23,12 +23,60 @@ use ``asyncio.run_coroutine_threadsafe`` for that bridge — see
 
 from __future__ import annotations
 
+import asyncio
 import logging
+import threading
 from typing import Callable
 
 from koda.tui.modes import Mode
 
 _log = logging.getLogger("koda.permissions")
+
+
+# ── Soft pause: mutating tools wait while a permission prompt is up ────
+#
+# When the gate fires a prompt, every other in-flight mutating backend
+# call must pause so the user can interact with the prompt without the
+# agent stealing focus or piling up more cards behind it. Reads / model
+# streaming / status updates keep flowing — only ``awrite`` / ``aedit``
+# / ``aexecute`` on the backend wait at the gate.
+#
+# Implementation note: we lazy-create the ``asyncio.Event`` on first use
+# because the module is imported before the running event loop exists,
+# and ``asyncio.Event()`` binds to the current loop on first wait.
+
+_pause_event: asyncio.Event | None = None
+_pause_lock = threading.Lock()
+
+
+def _ensure_pause_event() -> asyncio.Event:
+    """Lazily create the pause event. Default state: set (no pause)."""
+    global _pause_event
+    with _pause_lock:
+        if _pause_event is None:
+            _pause_event = asyncio.Event()
+            _pause_event.set()
+    return _pause_event
+
+
+async def wait_until_unpaused() -> None:
+    """Block while a permission prompt is being shown. No-op when none."""
+    await _ensure_pause_event().wait()
+
+
+def mark_prompt_pending() -> None:
+    """Pause: signal that a permission prompt is now visible.
+
+    MUST be called on the asyncio loop's thread (asyncio.Event.clear is
+    not thread-safe in the general case). The TUI bridge uses
+    ``App.call_from_thread`` to satisfy this from the worker thread.
+    """
+    _ensure_pause_event().clear()
+
+
+def mark_prompt_resolved() -> None:
+    """Resume: signal that the prompt has been dismissed."""
+    _ensure_pause_event().set()
 
 # ── Module state — single-process truth source ─────────────────────────
 #
@@ -103,6 +151,20 @@ def check(tool_name: str, args: dict) -> str | None:
     Returns ``None`` to allow the tool to run, or a refusal string that
     the tool should return to the agent (so the model sees *why* the
     call was blocked and can adapt).
+
+    Mode summary:
+      * ``DEFAULT`` — every mutating tool prompts (unless session-allowed).
+      * ``EDITS``   — file edits pass silently; ``execute`` prompts.
+      * ``PLAN``    — every mutating tool is refused outright with no
+        prompt. PLAN is *advisory-only* — the agent's job is to produce
+        a plan; the user reads it and switches mode (Shift+A / Shift+Tab)
+        before any action happens. Prompting to override the refusal
+        defeats the purpose: the agent stalls waiting on the modal and
+        users get noise for exactly the situation where they wanted a
+        clean ``no``. The agent's system prompt (``<PlanMode>`` block in
+        ``coding_agent/system_prompt_v2.py``) instructs it to use
+        read-only equivalents (git log/show/blame, not checkout/reset)
+        so this refusal is rarely hit in well-behaved sessions.
     """
     if tool_name not in MUTATING_TOOLS:
         return None
@@ -122,7 +184,7 @@ def check(tool_name: str, args: dict) -> str | None:
     if tool_name in _session_allow:
         return None
 
-    # Default mode (or edits + execute): prompt.
+    # DEFAULT (or EDITS+execute): prompt the user.
     if _prompt_hook is None:
         # Hook not installed — running headless / from tests. Default to
         # allow so non-TUI consumers don't deadlock waiting on a UI that

@@ -20,6 +20,7 @@ from langgraph.graph.state import CompiledStateGraph
 
 from coding_agent.backend import build_backend
 from coding_agent.model import resolve_model
+from coding_agent.subagents import SUBAGENTS
 from coding_agent.system_prompt_v2 import SYSTEM_PROMPT_V2
 from coding_agent.tools import EXTRA_TOOLS
 from coding_agent.tracing import langfuse_callbacks
@@ -172,6 +173,10 @@ async def build_agent(
         # Caller must pass ``configurable.thread_id`` on invoke/stream;
         # ``run()`` below derives one from cwd via ``_thread_id_for``.
         checkpointer=checkpointer,
+        # Specialist subagents (explore / plan / edit) the main agent
+        # dispatches via the built-in ``task`` tool. See
+        # ``coding_agent/subagents.py`` for prompts + tool subsets.
+        subagents=SUBAGENTS,
         name="coding_agent",
     )
     # Stash the aiosqlite Connection on the graph so the adapter can

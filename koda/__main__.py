@@ -30,16 +30,36 @@ def _load_dotenv() -> None:
 
 
 def _default_model() -> str:
-    """Pick a default model from available API keys."""
+    """Pick a default model from available API keys.
+
+    ``KODA_DEFAULT_MODEL`` (env) wins if set so users can pin a default
+    in their ``.env`` without passing ``--model`` on every launch.
+
+    The Ollama split matters: ``OLLAMA_HOST`` points at a daemon
+    (local or self-hosted) where ``llama3.1`` is a reasonable bet;
+    ``OLLAMA_API_KEY`` *alone* means cloud-only — and Ollama Cloud's
+    catalog does not include ``llama3.1``, so falling back to it gives
+    a 404 on the first turn. Pick a small, currently-hosted cloud model
+    instead so the first turn just works.
+    """
     _load_dotenv()
+    explicit = os.environ.get("KODA_DEFAULT_MODEL")
+    if explicit:
+        return explicit
     if os.environ.get("ANTHROPIC_API_KEY"):
         return "anthropic:claude-sonnet-4-6"
     if os.environ.get("OPENAI_API_KEY"):
         return "openai:gpt-4o"
     if os.environ.get("GOOGLE_API_KEY"):
         return "google:gemini-2.5-flash"
-    if os.environ.get("OLLAMA_API_KEY") or os.environ.get("OLLAMA_HOST"):
+    if os.environ.get("OLLAMA_HOST"):
+        # Explicit host — assume the user knows their daemon has llama3.1.
         return "ollama:llama3.1"
+    if os.environ.get("OLLAMA_API_KEY"):
+        # Cloud-only fallback. ``gpt-oss:20b`` is small + fast + present
+        # in the Ollama Cloud catalog. Override with KODA_DEFAULT_MODEL
+        # or ``--model`` for anything bigger.
+        return "ollama:gpt-oss:20b"
     return "anthropic:claude-sonnet-4-6"
 
 

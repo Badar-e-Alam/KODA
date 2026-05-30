@@ -14,6 +14,12 @@ $tool: #c2410c;
 $tool-ok: #84a86b;
 $tool-err: #d97474;
 $muted: #8a8780;
+/* Brand orange — same hue as the KodaBanner. Used as the shared accent
+ * for user-facing widgets (todo list, permission prompt, ask-user card)
+ * so they read as one visual family that stays distinct from streamed
+ * assistant text and tool output. Hex literal (not a theme var) so it
+ * survives /theme switches. */
+$koda: #fb923c;
 
 Screen {
     background: $background;
@@ -73,7 +79,7 @@ KodaBanner {
     height: auto;
     max-height: 12;
     padding: 1 2;
-    color: $primary;
+    color: #fb923c;
     overflow: hidden;
 }
 
@@ -113,6 +119,12 @@ ToolCallMessage.-error {
     color: $tool-err;
 }
 
+TodoMessage {
+    color: $koda;
+    border-left: thick $koda;
+    padding-left: 1;
+}
+
 AppMessage {
     color: $muted;
     text-style: italic;
@@ -130,6 +142,31 @@ ThinkingMessage {
     text-style: italic;
     height: 1;
     padding: 0 1;
+}
+
+/* User-facing prompts (permission + agent question) share the same
+ * "thick orange left bar" treatment as TodoMessage. Three reasons:
+ *   1. Visually groups all user-facing widgets under the KODA brand
+ *      hue, so they're instantly distinguishable from streamed
+ *      assistant text and tool output.
+ *   2. Rounded boxes with a surface background looked heavy and
+ *      "modal" — fought the inline-flow feel we want here.
+ *   3. The thick left border keeps the prompt readable at a glance
+ *      without consuming horizontal real estate (~1 col instead of
+ *      a full padded panel).
+ */
+PermissionPrompt {
+    color: $foreground;
+    border-left: thick $koda;
+    padding: 0 0 0 1;
+    margin: 1 0;
+}
+
+AskUserPrompt {
+    color: $foreground;
+    border-left: thick $koda;
+    padding: 0 0 0 1;
+    margin: 1 0;
 }
 
 /* ── Last-user-message preview ──────────────────────────────── */

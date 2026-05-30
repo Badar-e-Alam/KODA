@@ -162,6 +162,21 @@ class ChatInput(Input):
         if self._popup is not None:
             self._popup.clear()
 
+    def check_action(self, action: str, parameters: tuple) -> bool | None:
+        """Gate the Esc → ``dismiss_popup`` binding on popup visibility.
+
+        Without this, ChatInput unconditionally consumes Esc (it has
+        focus by default), which silently swallowed the app-level
+        ``escape`` → ``interrupt_turn`` binding any time the user
+        tried to stop the agent from inside the composer. Returning
+        ``False`` from ``check_action`` tells Textual to skip the
+        binding for this dispatch, so Esc bubbles up to the app and
+        ``KodaApp.action_interrupt_turn`` fires as intended.
+        """
+        if action == "dismiss_popup":
+            return self._popup is not None and self._popup.is_visible
+        return True
+
     def action_paste(self) -> None:
         """Ctrl+V — paste from the OS clipboard into the input at the cursor.
 

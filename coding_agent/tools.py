@@ -614,6 +614,40 @@ def run_lint(linter: str = "auto", extra_args: str = "", path: str = ".") -> str
 # ── Registry ───────────────────────────────────────────────────────────
 
 
+@tool
+def ask_user(question: str, options: list[str] | None = None) -> str:
+    """Ask the user a clarifying question and wait for their answer.
+
+    Encouraged in **PLAN mode** before drafting — when the user's
+    request is ambiguous, the agent should ask one focused question
+    instead of guessing at a requirement. Also useful at decision
+    points anywhere (which approach, which library, where to put X)
+    when an arbitrary pick would be costly to revisit.
+
+    Args:
+        question: A focused, single-sentence question. Don't stack
+            multiple questions — call ``ask_user`` again if you need
+            another answer.
+        options: Optional list of 2-9 short choices. The user can
+            navigate with arrow keys or jump with number keys 1-9.
+            If omitted, the user acknowledges with Enter or cancels
+            with Esc; phrase the question so an "okay/cancel"
+            response is meaningful.
+
+    Returns:
+        The user's chosen option (verbatim text) when they pick one,
+        ``"(acknowledged)"`` when they hit Enter on an options-less
+        prompt, or an empty string when they cancel with Esc.
+
+    Examples:
+        ``ask_user("Should this use SQLite or Postgres for storage?", ["SQLite", "Postgres"])``
+        ``ask_user("This change touches public API. Add a deprecation period?", ["Yes, deprecate first", "No, break now"])``
+    """
+    from koda.tools import ask_user as _ask
+
+    return _ask.ask(question, options or [])
+
+
 EXTRA_TOOLS = [
     think,
     multi_edit,
@@ -624,6 +658,7 @@ EXTRA_TOOLS = [
     run_tests,
     run_type_check,
     run_lint,
+    ask_user,
 ]
 
 

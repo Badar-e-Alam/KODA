@@ -12,6 +12,7 @@ import logging
 import os
 import subprocess
 import uuid
+from concurrent.futures import Future as ThreadFuture
 from datetime import datetime
 from pathlib import Path
 from typing import Any, ClassVar
@@ -33,19 +34,21 @@ from koda.model_config import (
 )
 from koda.session import SessionTree
 from koda.session_panel import ConfirmDeleteScreen, SessionPanel
+from koda.tools import ask_user as _ask_user
 from koda.tools import permissions as _perms
 from koda.tui.commands import dispatch as dispatch_command
 from koda.tui.modes import Mode, next_mode, style_for
-from koda.tui.screens import PermissionScreen
 from koda.tui.stream import run_turn
 from koda.tui.theme import DEFAULT_THEME, THEMES, get as get_theme, to_textual_theme
 from koda.tui.widgets import (
     AppMessage,
+    AskUserPrompt,
     AssistantMessage,
     BaseMessage,
     ChatInput,
     ErrorMessage,
     KodaBanner,
+    PermissionPrompt,
     StatusBar,
     SuggestionPopup,
     UserMessage,
@@ -112,6 +115,12 @@ class KodaApp(App):
         Binding("ctrl+y", "yank_last", "Copy last response", show=False),
         Binding("ctrl+b", "toggle_sidebar", "Toggle sidebar", show=False),
         Binding("ctrl+l", "clear_session", "New chat", show=False),
+        # Esc interrupts a running turn (Claude-Code-style stop). The
+        # PermissionPrompt's ``escape→deny`` binding is ``priority=True``
+        # so when a prompt is up it consumes Esc first; same for the
+        # ChatInput suggestions popup. Only when neither is visible AND a
+        # turn is in flight does this fire — a no-op otherwise.
+        Binding("escape", "interrupt_turn", "Stop", show=False),
         # Claude-Code-style mode controls. ``priority=True`` so the chat
         # input doesn't swallow shift+tab as "shift + accept-suggestion".
         Binding("shift+tab", "cycle_agent_mode", "Cycle agent mode", show=False, priority=True),
@@ -161,6 +170,9 @@ class KodaApp(App):
         self._banner: KodaBanner | None = None
         self._sidebar_host = None
         self._popup: SuggestionPopup | None = None
+        # Most recent inline todo block; the stream pump updates it in place
+        # while it's still the last message, else starts a fresh one.
+        self._active_todo_widget: Any | None = None
         self._last_assistant_widget: AssistantMessage | None = None
         self._turn_task: asyncio.Task | None = None
         # Live mirror of the assistant text streamed during the current turn.
@@ -269,6 +281,11 @@ class KodaApp(App):
         # event loop and block until the user answers.
         self._ui_loop = asyncio.get_running_loop()
         _perms.set_prompt_hook(self._prompt_from_tool_thread)
+        # Same bridge pattern for the agent's ``ask_user`` tool — the
+        # tool worker thread calls into ``koda.tools.ask_user.ask``,
+        # which delegates to this hook to render the AskUserPrompt
+        # widget and block until the user picks.
+        _ask_user.set_hook(self._ask_user_from_tool_thread)
         # Reflect the current mode in the UI now that everything is mounted.
         self._apply_agent_mode(self._agent_mode)
 
@@ -415,32 +432,87 @@ class KodaApp(App):
     def _prompt_from_tool_thread(self, tool_name: str, args: dict) -> bool:
         """Bridge called from a LangGraph tool worker thread.
 
-        Schedules ``_show_permission_modal`` on the UI event loop and
-        blocks the calling thread until the user answers. Returns True
-        for allow / always-allow, False for deny. The
-        ``always``-allow path also adds the tool to the session
-        allow-list so subsequent calls skip the prompt entirely.
+        Mounts an inline ``PermissionPrompt`` widget in the messages
+        container (Claude-Code style — *not* a full-screen modal), blocks
+        the calling worker thread until the user picks an option, and
+        returns True for allow / always-allow, False for deny. ``always``
+        adds the tool to the session allow-list so subsequent calls skip
+        the prompt entirely.
+
+        Worker-thread → UI-loop bridge: the backend's async gate calls
+        ``_perms.check`` via ``asyncio.to_thread``, so we land here on a
+        worker. ``self.call_from_thread`` schedules the widget mount on
+        the UI loop (without it, ``PermissionPrompt.compose`` would raise
+        ``NoActiveAppError``); the widget's choice callback fires on the
+        UI loop and resolves a plain ``concurrent.futures.Future`` that
+        this worker blocks on. The previous full-screen ``ModalScreen``
+        approach wedged because the chat input kept focus and absorbed
+        ``y`` / ``n`` keystrokes — inline widget with ``priority=True``
+        bindings (see ``PermissionPrompt.BINDINGS``) routes keys ahead of
+        any focused widget.
         """
-        loop = getattr(self, "_ui_loop", None)
-        if loop is None:
-            # No loop captured (e.g. headless run). Default to allow so
-            # we don't deadlock waiting on a modal that won't appear.
+        if getattr(self, "_ui_loop", None) is None:
+            # No loop captured (e.g. headless run). Default to allow so we
+            # don't block on a prompt that will never render.
             return True
-        fut = asyncio.run_coroutine_threadsafe(
-            self._show_permission_modal(tool_name, args), loop
-        )
+
+        outcome_future: ThreadFuture[str] = ThreadFuture()
+        widget_ref: list[PermissionPrompt | None] = [None]
+
+        def _on_choice(outcome: str) -> None:
+            # Runs on the UI loop (PermissionPrompt's action handlers).
+            # Tear the prompt off the messages container, release the
+            # soft pause so any other mutating tools waiting in line
+            # resume, and return focus to the composer.
+            w = widget_ref[0]
+            widget_ref[0] = None
+            if w is not None:
+                try:
+                    w.remove()
+                except Exception:
+                    pass
+            try:
+                _perms.mark_prompt_resolved()
+            except Exception:
+                _log.debug("mark_prompt_resolved failed", exc_info=True)
+            if self._chat_input is not None:
+                try:
+                    self._chat_input.focus()
+                except Exception:
+                    pass
+            if not outcome_future.done():
+                outcome_future.set_result(outcome)
+
+        def _open() -> None:
+            # Runs on the UI loop via call_from_thread.
+            container = self._messages_container
+            if container is None:
+                # No container yet — pre-mount race. Default to allow so
+                # we don't deadlock.
+                if not outcome_future.done():
+                    outcome_future.set_result("allow")
+                return
+            # Engage the soft pause BEFORE mounting so any in-flight
+            # backend mutation that's about to ask for a gate check sees
+            # the pause and waits instead of stacking a second prompt.
+            try:
+                _perms.mark_prompt_pending()
+            except Exception:
+                _log.debug("mark_prompt_pending failed", exc_info=True)
+            widget = PermissionPrompt(tool_name, args, _on_choice)
+            widget_ref[0] = widget
+            container.mount(widget)
+            container.scroll_end(animate=False)
+
         try:
-            outcome = fut.result()  # blocks the tool thread
+            self.call_from_thread(_open)
+            outcome = outcome_future.result()  # blocks the worker thread
         except Exception:
-            _log.exception("permission modal raised")
+            _log.exception("permission prompt failed")
             return False
         if outcome == "always":
             _perms.allow_tool(tool_name)
         return outcome in ("allow", "always")
-
-    async def _show_permission_modal(self, tool_name: str, args: dict) -> str:
-        """Push the modal and await the user's choice. Runs on the UI loop."""
-        return await self.push_screen_wait(PermissionScreen(tool_name, args))
 
     # ── Responsive layout ────────────────────────────────────────────
 
@@ -577,6 +649,22 @@ class KodaApp(App):
         if notice is not None:
             await self._messages_container.mount(notice)
         self._messages_container.scroll_end(animate=False)
+
+        # Focus protection: if an interactive prompt is currently
+        # waiting for the user — either a PermissionPrompt (gate) or an
+        # AskUserPrompt (agent question) — we just stole focus from it
+        # by mounting a new widget. Restore focus so the prompt's key
+        # bindings keep responding. Skip when *we* are the prompt; its
+        # own ``on_mount`` already focuses itself.
+        if not isinstance(widget, (PermissionPrompt, AskUserPrompt)):
+            try:
+                active = list(self.query(PermissionPrompt)) + list(
+                    self.query(AskUserPrompt)
+                )
+                if active:
+                    active[-1].focus()
+            except Exception:
+                pass
 
     # ── Core turn ────────────────────────────────────────────────────
 
@@ -806,6 +894,9 @@ class KodaApp(App):
         self._koda_thread_id = self._koda_session.session_id
         self._last_assistant_widget = None
         self._chat_started = False
+        # Inline todo blocks live in #messages and were just removed above;
+        # drop the stale reference so the next turn starts a fresh block.
+        self._active_todo_widget = None
         if self._banner is not None:
             self._banner.remove_class("-compact")
         if self._status_bar is not None:
@@ -964,6 +1055,101 @@ class KodaApp(App):
         except Exception:
             return
         panel.set_active_session(self._koda_session.session_id)
+
+    def _ask_user_from_tool_thread(self, question: str, options: list[str]) -> str:
+        """Bridge for the agent's ``ask_user`` tool.
+
+        Same shape as ``_prompt_from_tool_thread``: mounts an
+        ``AskUserPrompt`` widget on the UI loop and blocks the calling
+        worker thread until the user picks. Returns the selected
+        option's verbatim text, ``""`` on cancel, or a sentinel string
+        when there's no UI loop (headless / eval harness).
+
+        The soft-pause flag from ``koda.tools.permissions`` is also
+        engaged here so other in-flight mutating tool calls wait
+        while the user is answering — same focus-protection rationale
+        as for the permission prompt.
+        """
+        if getattr(self, "_ui_loop", None) is None:
+            return (
+                "[ask_user unavailable] No UI loop captured (headless?). "
+                "Proceed with your best guess."
+            )
+
+        outcome_future: ThreadFuture[str] = ThreadFuture()
+        widget_ref: list[AskUserPrompt | None] = [None]
+
+        def _on_answer(answer: str) -> None:
+            w = widget_ref[0]
+            widget_ref[0] = None
+            if w is not None:
+                try:
+                    w.remove()
+                except Exception:
+                    pass
+            try:
+                _perms.mark_prompt_resolved()
+            except Exception:
+                _log.debug("mark_prompt_resolved failed (ask_user)", exc_info=True)
+            if self._chat_input is not None:
+                try:
+                    self._chat_input.focus()
+                except Exception:
+                    pass
+            if not outcome_future.done():
+                outcome_future.set_result(answer)
+
+        def _open() -> None:
+            container = self._messages_container
+            if container is None:
+                if not outcome_future.done():
+                    outcome_future.set_result("")
+                return
+            try:
+                _perms.mark_prompt_pending()
+            except Exception:
+                _log.debug("mark_prompt_pending failed (ask_user)", exc_info=True)
+            widget = AskUserPrompt(question, options, _on_answer)
+            widget_ref[0] = widget
+            container.mount(widget)
+            container.scroll_end(animate=False)
+
+        try:
+            self.call_from_thread(_open)
+            answer = outcome_future.result()
+        except Exception:
+            _log.exception("ask_user prompt failed")
+            return ""
+        return answer
+
+    async def action_interrupt_turn(self) -> None:
+        """Esc: stop the currently running agent turn, if any.
+
+        Soft cousin of ``action_copy_or_interrupt``: same interrupt path
+        (adapter signal + task cancel + ``⏹ Interrupting…`` banner) but
+        never exits the app and never touches the clipboard. Silent no-op
+        when no turn is in flight, so the user can hit Esc reflexively
+        without surprises.
+
+        Why this is safe alongside the ``PermissionPrompt`` escape→deny
+        binding: that one is ``priority=True`` (set on the widget itself,
+        see ``koda/tui/widgets/permission_prompt.py``), so it consumes
+        Esc *before* this app-level binding runs. Same for the
+        ``ChatInput`` suggestions popup, which calls ``event.stop()`` on
+        Esc when visible. Only when neither is showing does Esc bubble
+        up here.
+        """
+        if self._turn_task and not self._turn_task.done():
+            try:
+                await self.mount_message(AppMessage("⏹ Interrupting…"))
+            except Exception:
+                pass
+            if self._adapter is not None:
+                try:
+                    await self._adapter.interrupt()
+                except Exception:
+                    _log.debug("adapter.interrupt() raised", exc_info=True)
+            self._turn_task.cancel()
 
     async def action_copy_or_interrupt(self) -> None:
         """Ctrl+C:

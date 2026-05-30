@@ -17,6 +17,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import time
 from typing import Any
 
 from textual.widgets import Static
@@ -197,21 +198,87 @@ class ErrorMessage(BaseMessage):
         self._content = content
 
 
-class ThinkingMessage(BaseMessage):
-    """Pulsing placeholder shown while the agent is preparing its response.
+_TODO_GLYPHS = {
+    "pending": "○",
+    "in_progress": "◐",
+    "completed": "✓",
+}
 
-    Removed as soon as the first TextDelta or ToolStart event arrives.
+
+class TodoMessage(BaseMessage):
+    """Inline todo checklist, fed by the agent's ``write_todos`` calls.
+
+    Rendered as a normal message in the transcript so it flows with the
+    conversation (like Claude). The stream pump updates the most recent
+    TodoMessage in place while it's still the last message, otherwise it
+    mounts a fresh block — so progress shows where it happens in the flow.
+
+    Each todo is ``{"content": str, "status": "pending"|"in_progress"|"completed"}``.
+    """
+
+    def __init__(self, todos: list[dict[str, Any]] | None = None, **kwargs: Any) -> None:
+        super().__init__("", **kwargs)
+        self._todos: list[dict[str, Any]] = []
+        self.set_todos(todos)
+
+    def set_todos(self, todos: list[dict[str, Any]] | None) -> None:
+        # Keep only well-formed items so a malformed payload can't crash render.
+        self._todos = [t for t in (todos or []) if isinstance(t, dict)]
+        self._refresh_display()
+
+    def _refresh_display(self) -> None:
+        if not self._todos:
+            self.update("[dim]· (no tasks)[/]")
+            return
+        done = sum(1 for t in self._todos if t.get("status") == "completed")
+        lines = [f"[b]Tasks[/] [dim]({done}/{len(self._todos)})[/]"]
+        for todo in self._todos:
+            status = str(todo.get("status", "pending"))
+            glyph = _TODO_GLYPHS.get(status, _TODO_GLYPHS["pending"])
+            content = str(todo.get("content", "")).strip()
+            if status == "completed":
+                lines.append(f"  [dim strike]{glyph} {content}[/]")
+            elif status == "in_progress":
+                lines.append(f"  [b]{glyph} {content}[/]")
+            else:
+                lines.append(f"  {glyph} {content}")
+        self.update("\n".join(lines))
+
+
+class ThinkingMessage(BaseMessage):
+    """Pulsing 'agent is working' indicator.
+
+    The stream pump (``koda/tui/stream.py``) keeps one of these mounted at
+    the bottom of the messages container for the entire turn so the user
+    always has visual confirmation the agent is alive — between tool calls,
+    during slow TTFT on a cold cloud model, while a long ``run_tests``
+    blocks, etc. The pump re-mounts a fresh instance after each new
+    widget lands so the spinner stays pinned to the bottom.
+
+    ``start_time`` is the turn's monotonic start so the clock keeps
+    counting across re-mounts (a fresh instance per event would otherwise
+    reset to ``0:00`` and hide that time is actually passing).
     """
 
     _FRAMES = ("·   ", "··  ", "··· ", " ···", "  ··", "   ·")
 
-    def __init__(self, label: str = "Thinking", **kwargs: Any) -> None:
+    def __init__(
+        self,
+        label: str = "Thinking",
+        start_time: float | None = None,
+        **kwargs: Any,
+    ) -> None:
         super().__init__("", **kwargs)
         self._label = label
         self._frame = 0
         self._timer = None
+        # If the caller passes a start_time we anchor the elapsed clock to it;
+        # otherwise (first mount of the turn) we anchor to mount time.
+        self._start = start_time
 
     def on_mount(self) -> None:
+        if self._start is None:
+            self._start = time.monotonic()
         self._tick()
         self._timer = self.set_interval(0.15, self._tick)
 
@@ -222,7 +289,11 @@ class ThinkingMessage(BaseMessage):
     def _tick(self) -> None:
         frame = self._FRAMES[self._frame % len(self._FRAMES)]
         self._frame += 1
-        self.update(f"[dim italic]{self._label} {frame}[/]")
+        elapsed = time.monotonic() - (self._start or time.monotonic())
+        mins = int(elapsed) // 60
+        secs = int(elapsed) % 60
+        ts = f"{mins}:{secs:02d}"
+        self.update(f"[dim italic]{self._label} {ts} {frame}[/]")
 
 
 def _format_args(args: dict[str, Any]) -> str:

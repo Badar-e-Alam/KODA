@@ -8,6 +8,7 @@ between events so the UI stays responsive.
 from __future__ import annotations
 
 import logging
+import time
 from typing import TYPE_CHECKING, Any
 
 from koda.agent_api import (
@@ -24,6 +25,7 @@ from koda.tui.widgets.messages import (
     AssistantMessage,
     ErrorMessage,
     ThinkingMessage,
+    TodoMessage,
     ToolCallMessage,
 )
 
@@ -39,27 +41,80 @@ async def run_turn(
     message: str,
     history: list[dict[str, Any]],
 ) -> str:
-    """Stream one user turn. Returns the final assistant text."""
+    """Stream one user turn. Returns the final assistant text.
+
+    Keeps a ``ThinkingMessage`` pinned at the bottom of the messages
+    container for the *entire* turn so the TUI never looks dead. The
+    previous behaviour removed the spinner on the first event and left
+    nothing visible during slow TTFT on cloud models or between tool
+    calls — that's what makes the terminal feel frozen. We now re-pin
+    a fresh spinner after every new message widget mounts, threading a
+    single ``turn_start`` timestamp through so the elapsed clock stays
+    continuous across re-mounts.
+    """
     current_assistant: AssistantMessage | None = None
     pending_tools: dict[str, ToolCallMessage] = {}
+    # `write_todos` calls are routed to the pinned TodoPanel instead of an
+    # inline tool widget. We track their ids so the matching ToolResult is
+    # skipped rather than mistaken for an orphaned (error) result below.
+    todo_tool_ids: set[str] = set()
     final_text_parts: list[str] = []
 
-    thinking: ThinkingMessage | None = ThinkingMessage()
+    turn_start = time.monotonic()
+    thinking: ThinkingMessage | None = ThinkingMessage(start_time=turn_start)
     await app.mount_message(thinking)
+
+    async def _repin_thinking() -> None:
+        """Remove the current spinner and mount a fresh one at the bottom.
+
+        Called only when an event materially advances the conversation
+        (new tool call, new assistant message, orphaned-error fallback).
+        Cheap text-delta updates that just append to the existing
+        ``AssistantMessage`` leave the spinner in place — re-mounting on
+        every token would flicker without helping.
+        """
+        nonlocal thinking
+        if thinking is not None:
+            try:
+                await thinking.remove()
+            except Exception:
+                pass
+            thinking = None
+        thinking = ThinkingMessage(start_time=turn_start)
+        await app.mount_message(thinking)
 
     try:
         async for ev in adapter.stream(message, history):
-            # First real event → remove the thinking placeholder
-            if thinking is not None and isinstance(
-                ev, (TextDelta, ThinkingDelta, ToolStart, ToolResult)
-            ):
+            # Take the spinner down ahead of any event that's about to
+            # mount a new widget. TextDelta only mounts on the FIRST
+            # delta of a streak (when ``current_assistant`` is still
+            # None); subsequent deltas just append.
+            will_mount_new = isinstance(ev, (ToolStart,)) or (
+                isinstance(ev, TextDelta) and current_assistant is None
+            )
+            if thinking is not None and will_mount_new:
                 try:
                     await thinking.remove()
                 except Exception:
                     pass
                 thinking = None
-            await _dispatch(app, ev, current_assistant, pending_tools, final_text_parts)
+
+            await _dispatch(
+                app, ev, current_assistant, pending_tools, todo_tool_ids, final_text_parts
+            )
             current_assistant = _active_assistant(app, ev, current_assistant)
+
+            # Re-pin the spinner to the bottom after any event that
+            # changed the message list. We never re-pin after Done — the
+            # finally block tears the spinner down for good there.
+            if isinstance(ev, Done):
+                continue
+            if will_mount_new or (
+                isinstance(ev, ToolResult) and ev.tool_id not in pending_tools
+            ):
+                # ToolResult with no matching pending tool ⇒ orphan path
+                # in _dispatch mounted an ErrorMessage; re-pin too.
+                await _repin_thinking()
     except Exception as e:
         _log.exception("Stream failed")
         await app.mount_message(ErrorMessage(f"Stream failed: {type(e).__name__}: {e}"))
@@ -78,6 +133,7 @@ async def _dispatch(
     ev: AgentEvent,
     current_assistant: AssistantMessage | None,
     pending_tools: dict[str, ToolCallMessage],
+    todo_tool_ids: set[str],
     final_text_parts: list[str],
 ) -> None:
     if isinstance(ev, TextDelta):
@@ -108,11 +164,25 @@ async def _dispatch(
         pass
 
     elif isinstance(ev, ToolStart):
+        # `write_todos` carries a full snapshot of the agent's task list.
+        # Render it as an inline checklist in the transcript (like Claude),
+        # suppressing the generic tool widget. Update the existing block in
+        # place while it's still the last message; otherwise start a new one
+        # so progress shows where it happens in the flow.
+        if ev.name == "write_todos":
+            todo_tool_ids.add(ev.tool_id)
+            await _show_todos(app, ev.arguments.get("todos", []))
+            return
         widget = ToolCallMessage(ev.tool_id, ev.name, ev.arguments)
         pending_tools[ev.tool_id] = widget
         await app.mount_message(widget)
 
     elif isinstance(ev, ToolResult):
+        # The paired result for a routed write_todos call carries no useful
+        # display payload ("Updated todo list to ..."); drop it so it isn't
+        # treated as an orphaned error result below.
+        if ev.tool_id in todo_tool_ids:
+            return
         widget = pending_tools.get(ev.tool_id)
         if widget is not None:
             follow = _is_following(app)
@@ -161,6 +231,30 @@ def _humanize_adapter_error(raw: str) -> str:
             head = raw.split(":", 2)[-1].strip()[:120]
             return f"{hint}  ({head})"
     return raw[:240]
+
+
+async def _show_todos(app: "KodaApp", todos: list[dict[str, Any]]) -> None:
+    """Render the agent's todo snapshot inline in the transcript.
+
+    Updates the active TodoMessage in place while it's still the bottom-most
+    message (consecutive write_todos calls collapse into one evolving block);
+    otherwise mounts a fresh block so it appears at the current point in the
+    conversation flow.
+    """
+    follow = _is_following(app)
+    container = getattr(app, "_messages_container", None)
+    active = getattr(app, "_active_todo_widget", None)
+    last = container.children[-1] if (container and container.children) else None
+
+    if active is not None and active is last:
+        active.set_todos(todos)
+    else:
+        widget = TodoMessage(todos)
+        app._active_todo_widget = widget
+        await app.mount_message(widget)
+
+    if follow:
+        _scroll_to_end(app)
 
 
 def _scroll_to_end(app: "KodaApp") -> None:
