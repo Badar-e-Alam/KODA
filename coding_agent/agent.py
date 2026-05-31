@@ -25,24 +25,7 @@ from coding_agent.system_prompt_v2 import SYSTEM_PROMPT_V2
 from coding_agent.tools import EXTRA_TOOLS
 from coding_agent.tracing import langfuse_callbacks
 
-
-def _needs_bootstrap(root: Path) -> bool:
-    """True when ``<root>/AGENTS.md`` is missing or whitespace-only.
-
-    Whitespace-only counts as empty so a stray ``\\n`` from ``touch
-    AGENTS.md`` doesn't suppress the first-turn bootstrap. Anything
-    with real content (frontmatter, prose, even a single non-whitespace
-    char) is taken as "user-authored, don't overwrite." An unreadable
-    file is *not* bootstrapped — we'd rather surface the error than
-    clobber whatever's there.
-    """
-    agents_md = root / "AGENTS.md"
-    if not agents_md.exists():
-        return True
-    try:
-        return not agents_md.read_text(encoding="utf-8").strip()
-    except (OSError, UnicodeDecodeError):
-        return False
+from koda.tools import permissions as _perms
 
 
 def _render_system_prompt(root: Path) -> str:
@@ -53,11 +36,15 @@ def _render_system_prompt(root: Path) -> str:
     graph's lifetime. A session crossing midnight gets a stale date
     until the next ``koda`` launch — accepted to keep the prompt cache
     hot across turns.
+
+    There is no longer a "bootstrap_required" field: KODA does not
+    auto-create ``AGENTS.md`` at startup. The agent builds its knowledge
+    base organically (see the ``<Project knowledge base>`` block in the
+    prompt) only when it has something durable to record.
     """
     return SYSTEM_PROMPT_V2.format(
         current_date=datetime.now(timezone.utc).strftime("%Y-%m-%d"),
         cwd=str(root.resolve()),
-        bootstrap_required="true" if _needs_bootstrap(root) else "false",
     )
 
 
@@ -162,17 +149,31 @@ async def build_agent(
         # bootstrap_required substituted in. See _render_system_prompt
         # and coding_agent/system_prompt_v2.py for the template.
         system_prompt=_render_system_prompt(root),
-        # Load AGENTS.md from the project root as durable project context.
-        # deepagents' MemoryMiddleware silently skips this if the file doesn't
-        # exist, and injects the contents under <agent_memory> in the system
-        # prompt. Path is relative to the backend root (cwd). When AGENTS.md
-        # is missing or whitespace-only, _render_system_prompt sets
-        # bootstrap_required=true so the agent writes one on its first turn.
-        memory=["/AGENTS.md"],
+        # Durable context auto-injected under <agent_memory> every turn:
+        # AGENTS.md (the knowledge-base hub/index) and user_preferences.md
+        # (small, globally relevant). deepagents' MemoryMiddleware silently
+        # skips a file that doesn't exist yet, so listing them before they're
+        # created is safe and there is no startup bootstrap. Topic sub-pages
+        # (architecture.md, frontend.md, api.md, project_history.md, …) are
+        # intentionally NOT auto-loaded — they can grow large and are read on
+        # demand via the links in AGENTS.md. The agent creates any of these
+        # files only when it has durable info to record; see the
+        # <Project knowledge base> block in coding_agent/system_prompt_v2.py.
+        memory=["/AGENTS.md", "/user_preferences.md"],
         # Persist graph state to disk so conversations survive restarts.
         # Caller must pass ``configurable.thread_id`` on invoke/stream;
         # ``run()`` below derives one from cwd via ``_thread_id_for``.
         checkpointer=checkpointer,
+        # Human-in-the-loop gate for mutating tools. deepagents wires
+        # ``HumanInTheLoopMiddleware`` so that before any of these tools
+        # runs, the graph hits ``interrupt()`` — it pauses and checkpoints
+        # its state instead of mutating. KODA's adapter
+        # (``koda/adapters/langgraph.py``) surfaces that as a
+        # ``PermissionRequest`` to the TUI and resumes via
+        # ``Command(resume=…)`` once the user decides. The gated-tool set
+        # and the approve/reject/ask policy both live in
+        # ``koda/tools/permissions.py`` so they stay in one place.
+        interrupt_on=_perms.INTERRUPT_ON,
         # Specialist subagents (explore / plan / edit) the main agent
         # dispatches via the built-in ``task`` tool. See
         # ``coding_agent/subagents.py`` for prompts + tool subsets.

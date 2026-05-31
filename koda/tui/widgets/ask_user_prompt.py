@@ -103,6 +103,19 @@ class AskUserPrompt(Static):
         # the empty answer and can decide whether to retry or proceed.
         self._resolve("")
 
+    def try_key(self, key: str) -> bool:
+        """Run the action this key maps to; return True if handled. Used by
+        the app-level focus-independent fallback (see ``PermissionPrompt.try_key``)."""
+        nav = {"up": "prev", "k": "prev", "down": "next", "j": "next",
+               "enter": "confirm", "escape": "cancel"}
+        if key in nav:
+            getattr(self, f"action_{nav[key]}")()
+            return True
+        if len(key) == 1 and key in "123456789":
+            getattr(self, f"action_pick_{key}")()
+            return True
+        return False
+
     def __getattr__(self, name: str):
         # Wires number-key actions to ``_resolve(self._options[n-1])``.
         # Defined as ``__getattr__`` instead of nine separate methods so

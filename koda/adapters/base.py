@@ -98,6 +98,17 @@ class BaseAdapter(KodaAgent):
         """
         return None
 
+    async def _ensure_graph(self) -> None:
+        """Hook for adapters whose backend graph is built lazily.
+
+        Default no-op. ``CodingAgentAdapter`` overrides it to build its
+        compiled LangGraph on first async use (its ``AsyncSqliteSaver``
+        must bind to a running loop). ``LangGraphAdapter._native_stream``
+        awaits this before streaming, and the TUI warms it at startup so
+        the first turn never pays the build cost mid-stream.
+        """
+        return None
+
     def describe(self) -> AgentDescription:
         """Default adapter description. Override to report tools,
         capability flags, or a system-prompt preview."""

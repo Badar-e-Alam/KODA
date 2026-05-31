@@ -11,10 +11,13 @@ reusable plumbing (cancel, usage, error handling, final Done) lives in
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 import uuid
 from typing import Any, AsyncIterator, Iterable
+
+from langgraph.types import Command
 
 from koda.adapters.base import (
     BaseAdapter,
@@ -25,6 +28,8 @@ from koda.adapters.base import (
 from koda.agent_api import (
     AgentDescription,
     AgentEvent,
+    PermissionItem,
+    PermissionRequest,
     TextDelta,
     ThinkingDelta,
     ToolDescription,
@@ -32,6 +37,7 @@ from koda.agent_api import (
     ToolStart,
     Usage,
 )
+from koda.tools import permissions as _perms
 
 _log = logging.getLogger("koda.adapters.langgraph")
 
@@ -39,6 +45,11 @@ _log = logging.getLogger("koda.adapters.langgraph")
 # research tasks (scrape → parse → convert → write PDF → verify). Bump
 # to 100 by default; override with KODA_RECURSION_LIMIT.
 _DEFAULT_RECURSION_LIMIT = int(os.environ.get("KODA_RECURSION_LIMIT", "1000"))
+
+# Marker yielded by ``_native_stream`` to inject a ``PermissionRequest``
+# into the typed event stream. It's a plain dict so the other extractors
+# (which all start with ``event.get("event") != …``) skip it cleanly.
+_PERM_KEY = "__koda_permission__"
 
 
 class LangGraphAdapter(BaseAdapter):
@@ -53,8 +64,14 @@ class LangGraphAdapter(BaseAdapter):
         # _native_stream for the rationale. Flipped to True after the
         # first turn so subsequent turns don't re-forward history.
         self._seeded: bool = False
+        # Set while the graph is paused on a human-in-the-loop interrupt and
+        # we're waiting for the TUI to deliver the user's decisions. Resolved
+        # by ``provide_decisions`` (called on the UI loop from the prompt's
+        # choice callback). ``None`` whenever no prompt is outstanding.
+        self._pending_decision_future: asyncio.Future | None = None
         # Bind per-instance so subclasses (or tests) can swap them out.
         self._extractors = (
+            _extract_permission,
             _extract_chat_stream,
             _extract_tool_start,
             _extract_tool_end,
@@ -108,7 +125,18 @@ class LangGraphAdapter(BaseAdapter):
         stateless-adapter case (e.g. a graph built without a checkpointer
         by a user via ``--agent``). If the graph has no thread state yet
         and history is non-empty, we seed the first call with it.
+
+        Pause/resume: if the graph hits a human-in-the-loop ``interrupt()``
+        (a gated tool awaiting approval), the ``astream_events`` pass ends
+        cleanly with the graph paused and its state checkpointed. We detect
+        that via ``aget_state``, surface a ``PermissionRequest`` (emitting a
+        marker the permission extractor turns into the typed event), await
+        the user's decisions, then re-enter ``astream_events`` with
+        ``Command(resume=…)`` to continue from the checkpoint. The loop
+        repeats until the graph finishes with no pending interrupt.
         """
+        await self._ensure_graph()
+
         config: dict[str, Any] = {
             "configurable": {"thread_id": self._thread_id},
             "recursion_limit": _DEFAULT_RECURSION_LIMIT,
@@ -127,17 +155,96 @@ class LangGraphAdapter(BaseAdapter):
             input_messages = _history_to_langchain(history) + input_messages
         self._seeded = True
 
-        async for event in self._graph.astream_events(
-            {"messages": input_messages}, config=config, version="v2"
-        ):
-            # Closest-to-source cancel check. BaseAdapter.stream races
-            # ``__anext__`` against ``self._cancel.wait()`` for the
-            # primary cut-off; this extra check breaks the LangGraph
-            # loop the moment the next event lands rather than waiting
-            # for the race to be re-armed. Belt and suspenders.
+        # First pass takes the new message; resume passes take a Command.
+        graph_input: Any = {"messages": input_messages}
+
+        while True:
+            async for event in self._graph.astream_events(
+                graph_input, config=config, version="v2"
+            ):
+                # Closest-to-source cancel check. BaseAdapter.stream races
+                # ``__anext__`` against ``self._cancel.wait()`` for the
+                # primary cut-off; this extra check breaks the LangGraph
+                # loop the moment the next event lands rather than waiting
+                # for the race to be re-armed. Belt and suspenders.
+                if self._cancel.is_set():
+                    return
+                yield event
+
             if self._cancel.is_set():
-                break
-            yield event
+                return
+
+            # The pass ended: the graph either finished or paused on an
+            # interrupt. ``aget_state`` tells us which (and carries the
+            # interrupt payload). Graphs without a checkpointer can't be
+            # inspected — treat those as "done" so they keep working.
+            state = await self._aget_state_safe(config)
+            if state is None or not getattr(state, "next", None):
+                return
+
+            hitl_requests = _collect_hitl_requests(state)
+            if not hitl_requests:
+                # Paused, but not on a HITL approval request we understand.
+                # Returning avoids an infinite resume loop / hang.
+                _log.warning("graph paused with no HITL interrupt; ending turn")
+                return
+
+            # Split this batch of gated calls into auto-resolved decisions
+            # (mode / session-allow) and the ones that need the human.
+            decisions, human = _plan_decisions(hitl_requests)
+
+            if human:
+                loop = asyncio.get_running_loop()
+                self._pending_decision_future = loop.create_future()
+                # Surface the human-needed items to the TUI via the typed
+                # stream (the permission extractor turns this marker into a
+                # PermissionRequest). Then await the user's answers.
+                yield {_PERM_KEY: [item for _, item in human]}
+                try:
+                    answers = await self._pending_decision_future
+                finally:
+                    # Clear on every exit (normal, cancel, or abandon) so a
+                    # stray late provide_decisions() can't resolve a stale
+                    # future on the next pause.
+                    self._pending_decision_future = None
+                if answers is None:  # cancelled / abandoned
+                    return
+                for (idx, _item), answer in zip(human, answers):
+                    decisions[idx] = answer
+
+            # Every slot must be filled (one decision per gated tool call) or
+            # the HITL middleware raises on the count mismatch.
+            if any(d is None for d in decisions):
+                _log.error("incomplete permission decisions; ending turn")
+                return
+            graph_input = Command(resume={"decisions": decisions})
+
+    def provide_decisions(self, decisions: list[dict[str, Any]] | None) -> None:
+        """Deliver the user's permission decisions back to a paused turn.
+
+        Called on the UI event loop from the prompt's choice callback (see
+        ``KodaApp._on_permission_choice``). Resolves the future that
+        ``_native_stream`` is awaiting so the graph resumes. ``decisions``
+        is one entry per *human-needed* item, in the order they were sent;
+        ``None`` aborts (treated like a cancel). Safe to call when no prompt
+        is outstanding — it's a no-op.
+        """
+        fut = self._pending_decision_future
+        if fut is not None and not fut.done():
+            fut.set_result(decisions)
+
+    async def _aget_state_safe(self, config: dict[str, Any]) -> Any | None:
+        """``aget_state`` that returns None instead of raising.
+
+        Stateless graphs (no checkpointer, e.g. a user ``--agent`` with no
+        saver) raise on ``aget_state``; those simply don't support pausing,
+        so we report "no state" and let the turn end normally.
+        """
+        try:
+            return await self._graph.aget_state(config)
+        except Exception:
+            _log.debug("aget_state unavailable (no checkpointer?)", exc_info=True)
+            return None
 
 
 # ── Extractors ──────────────────────────────────────────────────────
@@ -145,6 +252,15 @@ class LangGraphAdapter(BaseAdapter):
 # Each takes one raw LangGraph event dict and yields zero or more
 # AgentEvents. They are stateless — any accumulation (Usage, tool
 # pairing) is handled by BaseAdapter or downstream in the TUI.
+
+
+def _extract_permission(event: dict[str, Any]) -> Iterable[AgentEvent] | None:
+    """Turn the ``_PERM_KEY`` marker (yielded by ``_native_stream`` when the
+    graph pauses on a gated tool) into a typed ``PermissionRequest``."""
+    items = event.get(_PERM_KEY)
+    if items is None:
+        return None
+    return (PermissionRequest(items=list(items)),)
 
 
 def _extract_chat_stream(event: dict[str, Any]) -> Iterable[AgentEvent] | None:
@@ -177,6 +293,67 @@ def _extract_tool_end(event: dict[str, Any]) -> Iterable[AgentEvent] | None:
 
 
 # ── Helpers ─────────────────────────────────────────────────────────
+
+def _collect_hitl_requests(state: Any) -> list[dict[str, Any]]:
+    """Pull human-in-the-loop interrupt payloads out of a paused graph state.
+
+    ``HumanInTheLoopMiddleware`` interrupts with a ``HITLRequest`` dict —
+    ``{"action_requests": [...], "review_configs": [...]}`` — stored on the
+    pending tasks. We only keep dicts that look like that, so an unrelated
+    ``interrupt()`` from a custom tool doesn't get mistaken for an approval
+    batch.
+    """
+    out: list[dict[str, Any]] = []
+    for task in getattr(state, "tasks", ()) or ():
+        for it in getattr(task, "interrupts", ()) or ():
+            val = getattr(it, "value", None)
+            if isinstance(val, dict) and "action_requests" in val:
+                out.append(val)
+    return out
+
+
+def _plan_decisions(
+    hitl_requests: list[dict[str, Any]],
+) -> tuple[list[dict[str, Any] | None], list[tuple[int, PermissionItem]]]:
+    """Split one batch of gated tool calls into auto-decisions + human-needed.
+
+    Returns ``(decisions, human)`` where ``decisions`` is one slot per
+    ``action_request`` in order (``None`` for slots awaiting the user) and
+    ``human`` is ``[(index, PermissionItem)]`` for the slots that need a
+    prompt. deepagents batches a model step's gated calls into one request,
+    so we handle the first and log if there were more.
+    """
+    if len(hitl_requests) > 1:
+        _log.warning("multiple HITL requests in one pause; handling the first")
+    req = hitl_requests[0]
+    action_requests = list(req.get("action_requests") or [])
+    review_configs = list(req.get("review_configs") or [])
+
+    decisions: list[dict[str, Any] | None] = [None] * len(action_requests)
+    human: list[tuple[int, PermissionItem]] = []
+
+    for i, ar in enumerate(action_requests):
+        name = ar.get("name") or "tool"
+        args = ar.get("args") or {}
+        allowed: tuple[str, ...] = ("approve", "reject")
+        if i < len(review_configs):
+            allowed = tuple(review_configs[i].get("allowed_decisions") or allowed)
+        verdict = _perms.decide(name, args)
+        if verdict == "approve":
+            decisions[i] = {"type": "approve"}
+        elif verdict == "reject":
+            decisions[i] = {"type": "reject", "message": _perms.reject_message(name)}
+        else:  # "ask" — needs the human
+            human.append(
+                (i, PermissionItem(
+                    tool_name=name,
+                    args=args if isinstance(args, dict) else {"input": args},
+                    allowed_decisions=allowed,
+                    description=str(ar.get("description") or ""),
+                ))
+            )
+    return decisions, human
+
 
 def _history_to_langchain(history: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Pass through {role, content} dicts — LangGraph accepts them directly."""

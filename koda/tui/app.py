@@ -21,7 +21,7 @@ from textual import work
 from textual.app import App, ComposeResult
 from textual.binding import Binding, BindingType
 from textual.containers import Horizontal, Vertical, VerticalScroll
-from textual.events import Resize
+from textual.events import Key, Resize
 
 from koda import __version__
 from koda.agent_api import KodaAgent
@@ -186,10 +186,16 @@ class KodaApp(App):
         # Guards `_set_banner_compact(False)` from restoring the tall banner.
         self._chat_started: bool = False
         # Agent-mode state. The source of truth lives in
-        # ``koda.tools.permissions`` (so tool threads can read it without
+        # ``koda.tools.permissions`` (so the adapter can read it without
         # poking the App); we mirror it here as a Textual reactive for the
         # status bar / composer to subscribe to.
         self._agent_mode: Mode = Mode.DEFAULT
+        # Permission-pause state. While the agent is paused on a gated tool
+        # (LangGraph interrupt), ``_perm_queue`` holds the items being
+        # decided and ``_awaiting_permission`` flags that the turn clock
+        # should not count this idle time against the turn timeout.
+        self._perm_queue: dict[str, Any] | None = None
+        self._awaiting_permission: bool = False
 
     # ── Session file paths ──────────────────────────────────────────
 
@@ -275,10 +281,14 @@ class KodaApp(App):
         if self._adapter is None and self._adapter_factory is not None:
             asyncio.create_task(self._bootstrap_adapter())
 
-        # Install the permission bridge — see ``_prompt_from_tool_thread``
-        # below. Tools that call ``permissions.check()`` from their
-        # worker thread will now route to the modal screen on this
-        # event loop and block until the user answers.
+        # The default ``coding_agent`` graph gates tools via LangGraph's
+        # human-in-the-loop interrupt, surfaced as a ``PermissionRequest``
+        # event the stream pump routes to ``handle_permission_request`` — the
+        # agent pauses, nothing blocks. The ``deep`` adapter, however, wires
+        # plain synchronous ``@tool`` functions (``koda/tools/fs.py``) that
+        # can't pause a graph, so they keep using the blocking prompt bridge
+        # below (``_prompt_from_tool_thread``) — which blocks only the tool's
+        # worker thread, never the event loop.
         self._ui_loop = asyncio.get_running_loop()
         _perms.set_prompt_hook(self._prompt_from_tool_thread)
         # Same bridge pattern for the agent's ``ask_user`` tool — the
@@ -311,6 +321,9 @@ class KodaApp(App):
             await loading.remove()
         except Exception:
             pass
+        # Build the graph now (off the first turn's hot path) so the first
+        # message streams immediately instead of freezing on a cold build.
+        await self._warm_graph()
         self._refresh_capability_badges()
         await self.mount_message(AppMessage(f"Agent ready ({self._model})"))
 
@@ -344,6 +357,7 @@ class KodaApp(App):
             if callable(mark):
                 mark()
         self._adapter = new_adapter
+        await self._warm_graph()
         self._refresh_capability_badges()
 
     def _refresh_capability_badges(self) -> None:
@@ -425,45 +439,236 @@ class KodaApp(App):
             f"{plan_text}\n\n"
             "Execute it now."
         )
-        await self._handle_user_message(prompt)
+        # Run in a worker (not awaited) for the same reason as
+        # on_chat_input_submitted — don't block the message pump with the turn.
+        self.run_worker(
+            self._handle_user_message(prompt),
+            name="koda-turn",
+            group="koda-turn",
+            exclusive=True,
+        )
 
-    # ── Permission bridge (sync tool thread → asyncio modal) ─────────
+    # ── Permission flow (LangGraph interrupt → inline prompt → resume) ─
+
+    def _focus_widget(self, widget: Any) -> None:
+        """Focus a widget, swallowing the occasional Textual focus race."""
+        try:
+            widget.focus()
+        except Exception:
+            pass
+
+    def _active_prompt_widget(self) -> Any | None:
+        """The permission / ask card currently awaiting an answer, or None."""
+        q = self._perm_queue
+        if q is not None and q.get("widget") is not None:
+            return q["widget"]
+        try:
+            asks = list(self.query(AskUserPrompt))
+        except Exception:
+            asks = []
+        return asks[-1] if asks else None
+
+    def on_key(self, event: Key) -> None:
+        """Focus-independent fallback so a card's keys always land on it.
+
+        While a card is up the composer is disabled, so it can't eat the
+        keys; if the card itself holds focus, its own (priority) bindings
+        fire and consume the key before it ever reaches here. This handler
+        only runs for the leftover case — a focus race left nothing useful
+        focused, so the key bubbled all the way up to the app — and routes
+        it to the active card. The card's one-shot resolve guard makes the
+        belt-and-suspenders safe even if both paths fire.
+        """
+        widget = self._active_prompt_widget()
+        if widget is None:
+            return
+        try_key = getattr(widget, "try_key", None)
+        if try_key is None:
+            return
+        try:
+            if try_key(event.key):
+                event.stop()
+                event.prevent_default()
+        except Exception:
+            _log.debug("prompt key fallback failed", exc_info=True)
+
+    def _lock_composer(self, locked: bool) -> None:
+        """Lock the chat composer while a prompt is awaiting an answer.
+
+        A focused ``ChatInput`` (an ``Input``) eats the prompt's keys —
+        ``y``/``a``/``n`` become typed text and ``↑``/``↓`` scroll history —
+        and the prompt's ``priority=True`` bindings only fire when the
+        *prompt itself* holds focus (priority bindings are gathered from the
+        focus chain, and the prompt is a sibling of the composer, not an
+        ancestor). So while any prompt is up we disable the composer: it
+        leaves the focus chain and can no longer grab keys. On resolve we
+        re-enable it and hand focus back. This is what lets ↑/↓ and y/a/n
+        reach the prompt in the live TUI (a focus race could otherwise leave
+        the composer focused and swallowing every keystroke).
+        """
+        ci = self._chat_input
+        if ci is None:
+            return
+        try:
+            ci.disabled = locked
+        except Exception:
+            return
+        if not locked:
+            self._focus_widget(ci)
+
+    async def handle_permission_request(self, request: Any) -> None:
+        """Render the inline prompt for a paused (interrupt-gated) turn.
+
+        Called from the stream pump when a ``PermissionRequest`` event
+        arrives. The agent is paused with its state checkpointed; this
+        mounts the first prompt and wires the choice callback. It returns
+        immediately — the adapter's stream is awaiting the decision and the
+        UI stays fully interactive while the user decides. Multiple gated
+        calls in one batch are shown one after another.
+        """
+        items = list(getattr(request, "items", []) or [])
+        if not items or self._adapter is None:
+            # Nothing to ask (shouldn't happen) — release the wait so the
+            # turn doesn't hang.
+            if self._adapter is not None:
+                getattr(self._adapter, "provide_decisions", lambda d: None)(None)
+            return
+        self._perm_queue = {
+            "items": items,
+            "decisions": [],
+            "i": 0,
+            "adapter": self._adapter,
+            "widget": None,
+        }
+        self._awaiting_permission = True
+        self._mount_permission_prompt(items[0])
+
+    def _mount_permission_prompt(self, item: Any) -> None:
+        """Mount one permission card and give it the keyboard.
+
+        Fire-and-forget (sync) so it works equally from the async request
+        handler and the sync choice callback. The widget focuses itself in
+        ``on_mount``; we also lock the composer (so it can't swallow the
+        prompt's keys) and re-assert focus after the mount settles, which is
+        the belt-and-suspenders that fixes ↑/↓ + y/a/n not registering when a
+        focus race leaves the composer focused.
+        """
+        container = self._messages_container
+        if container is None:
+            return
+        widget = PermissionPrompt(
+            item.tool_name, item.args, self._on_permission_choice
+        )
+        if self._perm_queue is not None:
+            self._perm_queue["widget"] = widget
+        container.mount(widget)
+        container.scroll_end(animate=False)
+        self._lock_composer(True)
+        self.call_after_refresh(self._focus_widget, widget)
+
+    def _on_permission_choice(self, outcome: str) -> None:
+        """Map an allow/always/deny choice to a HITL decision and advance.
+
+        Runs on the UI loop (the prompt's action handler). For the last
+        item in the batch it hands the full decision list back to the
+        adapter via ``provide_decisions``, which resumes the graph from its
+        checkpoint. Widget mount/remove are fire-and-forget (the same
+        pattern the old bridge used from a sync context).
+        """
+        q = self._perm_queue
+        if q is None:
+            return
+        idx = q["i"]
+        items = q["items"]
+        if idx >= len(items):
+            return
+        item = items[idx]
+
+        if outcome == "always":
+            _perms.allow_tool(item.tool_name)
+            decision = {"type": "approve"}
+        elif outcome == "allow":
+            decision = {"type": "approve"}
+        else:  # "deny"
+            decision = {"type": "reject", "message": _perms.reject_message(item.tool_name)}
+        q["decisions"].append(decision)
+
+        # Tear down the answered prompt.
+        w = q.get("widget")
+        if w is not None:
+            try:
+                w.remove()
+            except Exception:
+                pass
+            q["widget"] = None
+
+        q["i"] = idx + 1
+        if q["i"] < len(items):
+            # More gated calls in this batch — show the next one.
+            self._mount_permission_prompt(items[q["i"]])
+            return
+
+        # All decided — resume the graph and clear the pause.
+        decisions = list(q["decisions"])
+        adapter = q["adapter"]
+        self._perm_queue = None
+        self._awaiting_permission = False
+        try:
+            adapter.provide_decisions(decisions)
+        except Exception:
+            _log.exception("provide_decisions failed")
+        # Re-enable the composer and hand focus back now the prompt is gone.
+        self._lock_composer(False)
+
+    def _clear_pending_permission(self) -> None:
+        """Drop any outstanding permission prompt and abort its wait.
+
+        Called when a turn ends for any reason (normal finish, interrupt,
+        timeout). On a normal finish the prompt was already torn down by
+        ``_on_permission_choice``; this is the safety net for cancel/timeout
+        so we never leave a dead prompt on screen or the adapter blocked.
+        """
+        q = self._perm_queue
+        self._perm_queue = None
+        self._awaiting_permission = False
+        # Always re-enable the composer (harmless if it wasn't locked).
+        self._lock_composer(False)
+        if q is None:
+            return
+        w = q.get("widget")
+        if w is not None:
+            try:
+                w.remove()
+            except Exception:
+                pass
+        adapter = q.get("adapter")
+        provide = getattr(adapter, "provide_decisions", None)
+        if callable(provide):
+            try:
+                provide(None)  # abort the wait
+            except Exception:
+                _log.debug("provide_decisions(None) failed", exc_info=True)
 
     def _prompt_from_tool_thread(self, tool_name: str, args: dict) -> bool:
-        """Bridge called from a LangGraph tool worker thread.
+        """Blocking permission prompt for sync-``@tool`` backends (``deep``).
 
-        Mounts an inline ``PermissionPrompt`` widget in the messages
-        container (Claude-Code style — *not* a full-screen modal), blocks
-        the calling worker thread until the user picks an option, and
-        returns True for allow / always-allow, False for deny. ``always``
-        adds the tool to the session allow-list so subsequent calls skip
-        the prompt entirely.
-
-        Worker-thread → UI-loop bridge: the backend's async gate calls
-        ``_perms.check`` via ``asyncio.to_thread``, so we land here on a
-        worker. ``self.call_from_thread`` schedules the widget mount on
-        the UI loop (without it, ``PermissionPrompt.compose`` would raise
-        ``NoActiveAppError``); the widget's choice callback fires on the
-        UI loop and resolves a plain ``concurrent.futures.Future`` that
-        this worker blocks on. The previous full-screen ``ModalScreen``
-        approach wedged because the chat input kept focus and absorbed
-        ``y`` / ``n`` keystrokes — inline widget with ``priority=True``
-        bindings (see ``PermissionPrompt.BINDINGS``) routes keys ahead of
-        any focused widget.
+        The ``deep`` adapter's filesystem tools (``koda/tools/fs.py``) call
+        ``_perms.check`` synchronously from a LangGraph tool worker thread;
+        ``check`` routes the ``"ask"`` case here. We mount an inline
+        ``PermissionPrompt`` on the UI loop via ``call_from_thread`` and block
+        *this worker thread* (never the event loop) on a
+        ``concurrent.futures.Future`` until the user picks. Returns True for
+        allow / always (and adds to the session allow-list for always), False
+        for deny. The default ``coding_agent`` graph does NOT use this — it
+        pauses via ``interrupt_on`` and ``handle_permission_request`` instead.
         """
         if getattr(self, "_ui_loop", None) is None:
-            # No loop captured (e.g. headless run). Default to allow so we
-            # don't block on a prompt that will never render.
-            return True
+            return True  # headless — don't block on a prompt that can't render
 
         outcome_future: ThreadFuture[str] = ThreadFuture()
         widget_ref: list[PermissionPrompt | None] = [None]
 
         def _on_choice(outcome: str) -> None:
-            # Runs on the UI loop (PermissionPrompt's action handlers).
-            # Tear the prompt off the messages container, release the
-            # soft pause so any other mutating tools waiting in line
-            # resume, and return focus to the composer.
             w = widget_ref[0]
             widget_ref[0] = None
             if w is not None:
@@ -475,26 +680,17 @@ class KodaApp(App):
                 _perms.mark_prompt_resolved()
             except Exception:
                 _log.debug("mark_prompt_resolved failed", exc_info=True)
-            if self._chat_input is not None:
-                try:
-                    self._chat_input.focus()
-                except Exception:
-                    pass
+            # Re-enable the composer and hand focus back.
+            self._lock_composer(False)
             if not outcome_future.done():
                 outcome_future.set_result(outcome)
 
         def _open() -> None:
-            # Runs on the UI loop via call_from_thread.
             container = self._messages_container
             if container is None:
-                # No container yet — pre-mount race. Default to allow so
-                # we don't deadlock.
                 if not outcome_future.done():
                     outcome_future.set_result("allow")
                 return
-            # Engage the soft pause BEFORE mounting so any in-flight
-            # backend mutation that's about to ask for a gate check sees
-            # the pause and waits instead of stacking a second prompt.
             try:
                 _perms.mark_prompt_pending()
             except Exception:
@@ -503,6 +699,10 @@ class KodaApp(App):
             widget_ref[0] = widget
             container.mount(widget)
             container.scroll_end(animate=False)
+            # Lock the composer so it can't swallow y/a/n/↑/↓, and force
+            # focus to the prompt after the mount settles.
+            self._lock_composer(True)
+            self.call_after_refresh(self._focus_widget, widget)
 
         try:
             self.call_from_thread(_open)
@@ -513,6 +713,24 @@ class KodaApp(App):
         if outcome == "always":
             _perms.allow_tool(tool_name)
         return outcome in ("allow", "always")
+
+    async def _warm_graph(self) -> None:
+        """Build the adapter's graph now, off the turn's hot path.
+
+        The coding-agent graph builds lazily on first async use (its
+        ``AsyncSqliteSaver`` binds to the running loop). Doing it here, at
+        startup / after a rebuild, means the first user turn doesn't pay the
+        multi-second build cost mid-stream — which is what made the TUI look
+        frozen the moment you sent your first message.
+        """
+        adapter = self._adapter
+        ensure = getattr(adapter, "_ensure_graph", None)
+        if ensure is None:
+            return
+        try:
+            await ensure()
+        except Exception:
+            _log.debug("graph warm failed", exc_info=True)
 
     # ── Responsive layout ────────────────────────────────────────────
 
@@ -574,8 +792,23 @@ class KodaApp(App):
 
     # ── Input event ──────────────────────────────────────────────────
 
-    async def on_chat_input_submitted(self, event: ChatInput.Submitted) -> None:
-        await self._handle_user_message(event.value)
+    def on_chat_input_submitted(self, event: ChatInput.Submitted) -> None:
+        # Run the turn in a WORKER — do NOT await it in this handler.
+        #
+        # Awaiting the whole turn here blocks Textual's message pump for the
+        # turn's entire duration, so no key events get dispatched while the
+        # agent is working. At a permission prompt that *deadlocks*: the turn
+        # pauses waiting for the user's y/a/n, but the keypress can never be
+        # processed because the pump is stuck awaiting this very handler —
+        # which is the "terminal frozen, can't answer the permission" bug.
+        # A worker runs the turn off the pump, so the prompt (and Esc/Ctrl+C)
+        # stay responsive. ``exclusive`` keeps one turn at a time.
+        self.run_worker(
+            self._handle_user_message(event.value),
+            name="koda-turn",
+            group="koda-turn",
+            exclusive=True,
+        )
 
     async def on_chat_input_suggestions_requested(
         self, event: ChatInput.SuggestionsRequested
@@ -718,10 +951,7 @@ class KodaApp(App):
         except ValueError:
             _turn_timeout = 1800.0
         try:
-            if _turn_timeout > 0:
-                reply = await asyncio.wait_for(self._turn_task, timeout=_turn_timeout)
-            else:
-                reply = await self._turn_task
+            reply = await self._await_turn_with_timeout(self._turn_task, _turn_timeout)
         except asyncio.TimeoutError:
             # asyncio.wait_for cancels the wrapped task on timeout, but the
             # cancellation is async — best-effort wait for the streaming
@@ -762,11 +992,50 @@ class KodaApp(App):
             return
         finally:
             self._turn_task = None
+            # Whatever ended the turn (finish, interrupt, timeout), make sure
+            # no permission prompt is left dangling and the adapter isn't
+            # still blocked awaiting a decision.
+            self._clear_pending_permission()
 
         if reply:
             self._history.append({"role": "assistant", "content": reply})
             self._koda_session.add_message("assistant", reply)
             self._conv_log.assistant(reply)
+
+    async def _await_turn_with_timeout(self, task: asyncio.Task, timeout: float):
+        """Await ``task`` with a *progress-aware* turn timeout.
+
+        The old code wrapped the whole turn in ``asyncio.wait_for`` — which
+        also counted time the agent spent paused on a permission prompt, so
+        leaving a prompt open could get the turn killed mid-decision. Here we
+        poll with ``asyncio.shield`` and only spend the budget while the turn
+        is actually running; ``_awaiting_permission`` freezes the clock.
+
+        ``timeout <= 0`` disables the cap entirely (``KODA_TURN_TIMEOUT=0``).
+        Raises ``asyncio.TimeoutError`` (after cancelling ``task``) when the
+        active-work budget is exhausted, matching the caller's handling.
+        Cancellation of ``task`` (Esc / Ctrl+C) propagates as
+        ``CancelledError`` through the shield, as before.
+        """
+        if timeout <= 0:
+            return await task
+        poll = 5.0
+        remaining = timeout
+        while True:
+            try:
+                return await asyncio.wait_for(
+                    asyncio.shield(task), timeout=min(poll, remaining)
+                )
+            except asyncio.TimeoutError:
+                if task.done():
+                    return task.result()
+                if self._awaiting_permission:
+                    # Paused on a prompt — don't spend the budget.
+                    continue
+                remaining -= poll
+                if remaining <= 0:
+                    task.cancel()
+                    raise
 
     async def _run_shell(self, cmd: str) -> None:
         """Execute a shell command and mount the output as an AssistantMessage."""
@@ -848,6 +1117,7 @@ class KodaApp(App):
             p = parsed.provider if parsed else ""
             m = parsed.model if parsed else display
             self._status_bar.set_model(provider=p, model=m)
+        await self._warm_graph()
         self._refresh_capability_badges()
         await self.mount_message(AppMessage(f"Switched to {display}"))
 
@@ -875,6 +1145,7 @@ class KodaApp(App):
             mark()
         await self._shutdown_adapter()
         self._adapter = new_adapter
+        await self._warm_graph()
         self._refresh_capability_badges()
         await self.mount_message(AppMessage("Memory reloaded"))
 
@@ -1091,11 +1362,8 @@ class KodaApp(App):
                 _perms.mark_prompt_resolved()
             except Exception:
                 _log.debug("mark_prompt_resolved failed (ask_user)", exc_info=True)
-            if self._chat_input is not None:
-                try:
-                    self._chat_input.focus()
-                except Exception:
-                    pass
+            # Re-enable the composer and hand focus back.
+            self._lock_composer(False)
             if not outcome_future.done():
                 outcome_future.set_result(answer)
 
@@ -1113,6 +1381,10 @@ class KodaApp(App):
             widget_ref[0] = widget
             container.mount(widget)
             container.scroll_end(animate=False)
+            # Lock the composer so it can't swallow the prompt's keys, and
+            # force focus to the prompt after the mount settles.
+            self._lock_composer(True)
+            self.call_after_refresh(self._focus_widget, widget)
 
         try:
             self.call_from_thread(_open)

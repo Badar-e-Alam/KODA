@@ -15,6 +15,7 @@ from koda.agent_api import (
     AgentEvent,
     Done,
     KodaAgent,
+    PermissionRequest,
     TextDelta,
     ThinkingDelta,
     ToolResult,
@@ -92,7 +93,11 @@ async def run_turn(
             will_mount_new = isinstance(ev, (ToolStart,)) or (
                 isinstance(ev, TextDelta) and current_assistant is None
             )
-            if thinking is not None and will_mount_new:
+            # A permission pause takes the spinner down too — the agent is
+            # waiting on the user now, not "thinking". A fresh spinner gets
+            # re-pinned by the normal path once the graph resumes and the
+            # next tool/text event lands.
+            if thinking is not None and (will_mount_new or isinstance(ev, PermissionRequest)):
                 try:
                     await thinking.remove()
                 except Exception:
@@ -199,6 +204,14 @@ async def _dispatch(
             await app.mount_message(ErrorMessage(text))
             if follow:
                 _scroll_to_end(app)
+
+    elif isinstance(ev, PermissionRequest):
+        # The graph paused on a gated tool (state checkpointed). Mount the
+        # inline prompt(s) and wire the user's choice back to the adapter,
+        # which resumes from the checkpoint. This returns immediately —
+        # it does NOT block the stream; the adapter's generator is awaiting
+        # the decision, and the loop stays fully responsive meanwhile.
+        await app.handle_permission_request(ev)
 
     elif isinstance(ev, Usage):
         if app._status_bar is not None:

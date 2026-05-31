@@ -41,9 +41,11 @@ from coding_agent.tools import (
 # here, and ``write_todos`` via ``TodoListMiddleware``. So the ``tools``
 # field below carries only the EXTRA_TOOLS callables we want available
 # in each subagent. The read-only contract for ``explore`` / ``plan`` is
-# enforced by (a) their system prompts and (b) the backend permission
-# gate when the user is in PLAN mode (``coding_agent/backend.py``
-# ``_GatedBackend``).
+# enforced by (a) their system prompts and (b) the permission gate when
+# the user is in PLAN mode — subagents inherit the main graph's
+# ``interrupt_on`` (deepagents propagates it to declarative SubAgent specs),
+# and a sub-agent ``interrupt()`` surfaces to the top-level adapter, where
+# ``koda.tools.permissions.decide`` rejects mutations in PLAN mode.
 
 
 EXPLORE_PROMPT = """\

@@ -24,14 +24,12 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import time
-from typing import Any, AsyncIterator
+from typing import Any
 
 from coding_agent.agent import build_agent
 from coding_agent.tracing import langfuse_callbacks
 
 from koda.adapters.langgraph import LangGraphAdapter
-from koda.timing import TurnTimings
 
 _log = logging.getLogger("koda.adapters.coding_agent")
 
@@ -73,13 +71,6 @@ class CodingAgentAdapter(LangGraphAdapter):
         ``callbacks=`` to the graph and no spans would reach Langfuse.
         """
         return list(langfuse_callbacks())
-
-    async def _native_stream(
-        self, message: str, history: list[dict[str, Any]]
-    ) -> AsyncIterator[dict[str, Any]]:
-        await self._ensure_graph()
-        async for event in super()._native_stream(message, history):
-            yield event
 
     async def aclose(self) -> None:
         """Close the aiosqlite checkpoint connection on shutdown.

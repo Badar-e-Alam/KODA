@@ -6,11 +6,20 @@ Claude-Code style: when the agent calls a mutating tool in DEFAULT mode
 streaming output. The user picks an option with ``y`` / ``a`` / ``n`` /
 ``Esc`` *or* navigates ↑/↓ (also ``j``/``k``) and hits ``Enter``.
 
-The agent's gate runs on a worker thread (the backend wraps
-``_perms.check`` in ``asyncio.to_thread``), so the bridge in
-``KodaApp._prompt_from_tool_thread`` mounts this widget via
-``App.call_from_thread`` and blocks the worker on a
-``concurrent.futures.Future`` that the widget's choice callback resolves.
+This widget is shared by KODA's two permission paths, both of which build
+it with ``(tool_name, args, on_choice)`` and differ only in who mounts it:
+
+  * Default ``coding_agent`` graph — gated by LangGraph's human-in-the-loop
+    ``interrupt()``. The graph pauses (state checkpointed), the adapter
+    emits a ``PermissionRequest`` event, and the stream pump
+    (``KodaApp.handle_permission_request``) mounts this widget. The choice
+    callback (``KodaApp._on_permission_choice``) hands the decision back via
+    ``adapter.provide_decisions``, which resumes the graph. Nothing blocks.
+  * ``deep`` adapter — its synchronous ``@tool`` functions can't pause a
+    graph, so they call ``_perms.check`` from a worker thread, which routes
+    to ``KodaApp._prompt_from_tool_thread``. That mounts this widget via
+    ``App.call_from_thread`` and blocks the *worker thread* (not the event
+    loop) on a ``concurrent.futures.Future`` the choice callback resolves.
 
 ``priority=True`` on every binding is load-bearing: the chat input keeps
 focus while the prompt mounts unless we force focus to ourselves, and
@@ -119,14 +128,40 @@ class PermissionPrompt(Static):
     def action_pick_deny(self) -> None:
         self._resolve("deny")
 
+    # Key → action, for the app-level focus-independent fallback. Mirrors
+    # BINDINGS. The double-fire guard in ``_resolve`` makes it safe even if
+    # the widget's own binding and the app fallback both fire.
+    _KEY_ACTIONS: ClassVar[dict[str, str]] = {
+        "up": "prev", "k": "prev",
+        "down": "next", "j": "next",
+        "enter": "confirm",
+        "y": "pick_allow", "a": "pick_always",
+        "n": "pick_deny", "escape": "pick_deny",
+    }
+
+    def try_key(self, key: str) -> bool:
+        """Run the action this key maps to; return True if it was handled.
+
+        The app calls this when a key bubbles up unconsumed (the composer is
+        disabled while a card is up, so if a focus race left this card
+        unfocused the key reaches the app instead of being eaten). When the
+        card holds focus its own bindings fire and this is never reached.
+        """
+        action = self._KEY_ACTIONS.get(key)
+        if action is None:
+            return False
+        getattr(self, f"action_{action}")()
+        return True
+
     # ── Helpers ──────────────────────────────────────────────────────
 
     def _resolve(self, outcome: str) -> None:
         """Fire the choice callback once and only once.
 
         Guards against double-fire (rapid keypress, ``Enter`` after a
-        hotkey, etc.) so the worker thread blocked on the future doesn't
-        see a stale or conflicting resolution.
+        hotkey, etc.) so the callback never delivers a stale or conflicting
+        decision (whether it resolves a worker-thread future in the ``deep``
+        path or advances the ``coding_agent`` resume in the interrupt path).
         """
         cb = self._on_choice
         if cb is None:

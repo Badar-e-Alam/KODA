@@ -1,202 +1,349 @@
-"""Regression tests for the permission-prompt bridge.
+"""Regression tests for the LangGraph-native permission flow.
 
-The agent's permission gate runs on a worker thread (the backend wraps
-``_perms.check`` in ``asyncio.to_thread``) and calls
-``KodaApp._prompt_from_tool_thread`` to ask the user. The bridge mounts
-an inline ``PermissionPrompt`` widget in the messages container and
-blocks the worker on a ``concurrent.futures.Future`` until the user
-answers.
+KODA gates mutating tools with deepagents' ``interrupt_on``: the graph
+hits a human-in-the-loop ``interrupt()`` before running a gated tool,
+pausing and checkpointing its state. The adapter surfaces that as a
+``PermissionRequest`` event; the TUI shows an inline ``PermissionPrompt``
+and resumes the graph with ``Command(resume=…)`` once the user decides.
 
-Historical bugs these tests pin:
+Nothing blocks — not the event loop, not a worker thread — so the TUI
+stays interactive while the agent is paused. These tests pin three layers:
 
-1. The original implementation scheduled ``push_screen_wait`` via
-   ``run_coroutine_threadsafe`` — a bare loop task outside the app
-   context — so the screen never rendered and the bridge wedged the
-   first time the agent ran a mutating tool.
-2. The full-screen ``PermissionScreen`` modal that replaced it had
-   bindings on a screen whose ``ChatInput`` retained focus, so ``y``,
-   ``a``, ``n`` got typed into the composer instead of routing to the
-   modal's actions.
-
-The current implementation (inline ``PermissionPrompt`` mounted in
-``#messages`` with ``priority=True`` bindings) sidesteps both.
+  1. the decision *policy* (``koda.tools.permissions.decide``),
+  2. the adapter's interrupt → ``PermissionRequest`` → resume loop, and
+  3. the TUI's prompt → ``provide_decisions`` wiring.
 """
 
 from __future__ import annotations
 
-import asyncio
-import threading
+from typing import TypedDict
 
 import pytest
 
+from koda.adapters.langgraph import LangGraphAdapter
+from koda.agent_api import Done, PermissionItem, PermissionRequest
 from koda.tools import permissions as perms
 from koda.tui.app import KodaApp
 from koda.tui.modes import Mode
 from koda.tui.widgets import PermissionPrompt
 
 
-async def _answer_prompt(
-    app: KodaApp, pilot, tool_name: str, key: str
-) -> tuple[object, bool]:
-    """Call the permission bridge from a worker thread, render + answer the
-    inline prompt via ``key``, and return ``(bridge_return_value,
-    prompt_still_mounted)``."""
-    result: dict = {}
+@pytest.fixture(autouse=True)
+def _reset_perms():
+    """Each test starts from DEFAULT mode with an empty allow-list."""
+    perms.set_mode(Mode.DEFAULT)
+    perms.clear_session_allow()
+    yield
+    perms.set_mode(Mode.DEFAULT)
+    perms.clear_session_allow()
 
-    def _worker() -> None:
-        result["outcome"] = app._prompt_from_tool_thread(
-            tool_name, {"file_path": "AGENTS.md"}
+
+# ─── 1. policy ───────────────────────────────────────────────────────
+
+
+def test_decide_default_asks():
+    assert perms.decide("write_file", {}) == "ask"
+    assert perms.decide("execute", {}) == "ask"
+
+
+def test_decide_plan_rejects_all_mutators():
+    perms.set_mode(Mode.PLAN)
+    assert perms.decide("write_file", {}) == "reject"
+    assert perms.decide("edit_file", {}) == "reject"
+    assert perms.decide("execute", {}) == "reject"
+
+
+def test_decide_edits_approves_file_edits_but_asks_execute():
+    perms.set_mode(Mode.EDITS)
+    assert perms.decide("write_file", {}) == "approve"
+    assert perms.decide("edit_file", {}) == "approve"
+    assert perms.decide("multi_edit", {}) == "approve"
+    assert perms.decide("execute", {}) == "ask"  # shell still prompts in EDITS
+
+
+def test_decide_session_allow_approves():
+    perms.allow_tool("execute")
+    assert perms.decide("execute", {}) == "approve"
+
+
+def test_decide_non_mutating_tool_auto_approves():
+    # A tool that isn't gated should never wedge the resume loop.
+    assert perms.decide("read_file", {}) == "approve"
+
+
+def test_reject_message_plan_mode_points_to_apply():
+    perms.set_mode(Mode.PLAN)
+    msg = perms.reject_message("write_file")
+    assert "plan mode" in msg.lower()
+    assert "Shift+A" in msg or "apply" in msg
+
+
+# ─── 2. adapter interrupt → resume ───────────────────────────────────
+
+
+class _S(TypedDict):
+    messages: list
+
+
+def _build_interrupting_graph():
+    """A tiny checkpointed graph that interrupts once with a HITL-shaped
+    payload (mirrors what ``HumanInTheLoopMiddleware`` emits), then finishes
+    after the resume."""
+    import aiosqlite
+    from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
+    from langgraph.graph import END, START, StateGraph
+    from langgraph.types import interrupt
+
+    def node(state: _S):
+        decision = interrupt(
+            {
+                "action_requests": [
+                    {"name": "write_file", "args": {"file_path": "/AGENTS.md"}, "description": "d"}
+                ],
+                "review_configs": [
+                    {"action_name": "write_file", "allowed_decisions": ["approve", "reject"]}
+                ],
+            }
         )
+        return {"messages": [*state["messages"], {"decision": decision}]}
 
-    t = threading.Thread(target=_worker, daemon=True)
-    t.start()
+    g = StateGraph(_S)
+    g.add_node("n", node)
+    g.add_edge(START, "n")
+    g.add_edge("n", END)
+    conn = aiosqlite.connect(":memory:", check_same_thread=False)
+    return g.compile(checkpointer=AsyncSqliteSaver(conn)), conn
 
-    # The prompt must actually mount in the messages container.
-    appeared: PermissionPrompt | None = None
+
+@pytest.mark.asyncio
+async def test_adapter_emits_permission_request_then_resumes_on_approve():
+    graph, conn = _build_interrupting_graph()
+    try:
+        adapter = LangGraphAdapter(graph=graph, model="test:model", thread_id="t-approve")
+        events = []
+        async for ev in adapter.stream("go", []):
+            events.append(ev)
+            if isinstance(ev, PermissionRequest):
+                # Loop stayed responsive; deliver the user's choice.
+                assert ev.items and ev.items[0].tool_name == "write_file"
+                adapter.provide_decisions([{"type": "approve"}])
+        kinds = [type(e).__name__ for e in events]
+        assert "PermissionRequest" in kinds, kinds
+        assert isinstance(events[-1], Done), "stream must finish after resume"
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_adapter_auto_rejects_in_plan_mode_without_prompting():
+    """PLAN mode resolves the interrupt with a reject — no PermissionRequest
+    should ever reach the TUI."""
+    perms.set_mode(Mode.PLAN)
+    graph, conn = _build_interrupting_graph()
+    try:
+        adapter = LangGraphAdapter(graph=graph, model="test:model", thread_id="t-plan")
+        events = [ev async for ev in adapter.stream("go", [])]
+        kinds = [type(e).__name__ for e in events]
+        assert "PermissionRequest" not in kinds, kinds
+        assert isinstance(events[-1], Done)
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_adapter_auto_approves_when_session_allowed():
+    perms.allow_tool("write_file")
+    graph, conn = _build_interrupting_graph()
+    try:
+        adapter = LangGraphAdapter(graph=graph, model="test:model", thread_id="t-allow")
+        events = [ev async for ev in adapter.stream("go", [])]
+        kinds = [type(e).__name__ for e in events]
+        assert "PermissionRequest" not in kinds, kinds
+        assert isinstance(events[-1], Done)
+    finally:
+        await conn.close()
+
+
+# ─── 3. TUI prompt → provide_decisions ───────────────────────────────
+
+
+class _RecordingAdapter:
+    """Stand-in adapter that records the decisions handed back to it."""
+
+    def __init__(self) -> None:
+        self.decisions = None
+        self.calls = 0
+
+    def provide_decisions(self, decisions):
+        self.decisions = decisions
+        self.calls += 1
+
+    def model_name(self) -> str:
+        return "test:model"
+
+
+async def _drive_prompt(app: KodaApp, pilot, tool_name: str, key: str):
+    """Mount a one-item PermissionRequest, press ``key``, return the recording
+    adapter and whether the prompt was cleared."""
+    rec = _RecordingAdapter()
+    app._adapter = rec  # type: ignore[assignment]
+    req = PermissionRequest(
+        items=[PermissionItem(tool_name=tool_name, args={"file_path": "AGENTS.md"})]
+    )
+    await app.handle_permission_request(req)
+
+    appeared = False
     for _ in range(60):
         await pilot.pause()
-        prompts = list(app.query(PermissionPrompt))
-        if prompts:
-            appeared = prompts[0]
+        if list(app.query(PermissionPrompt)):
+            appeared = True
             break
-        await asyncio.sleep(0.02)
-    assert appeared is not None, "PermissionPrompt never mounted — bridge is broken"
+    assert appeared, "PermissionPrompt never mounted"
 
     await pilot.press(key)
-
-    for _ in range(60):
+    for _ in range(30):
         await pilot.pause()
-        if not t.is_alive():
+        if rec.calls:
             break
-        await asyncio.sleep(0.02)
-    t.join(timeout=5)
-    assert not t.is_alive(), "worker thread never unblocked — answer not delivered"
-
-    still_mounted = bool(list(app.query(PermissionPrompt)))
-    return result.get("outcome"), still_mounted
+    cleared = not list(app.query(PermissionPrompt))
+    return rec, cleared
 
 
 @pytest.mark.asyncio
-async def test_permission_allow_routes_back_and_cleans_up() -> None:
-    perms.clear_session_allow()
+async def test_prompt_allow_resumes_with_approve():
     app = KodaApp(model="test:model")
     async with app.run_test() as pilot:
-        outcome, still_mounted = await _answer_prompt(app, pilot, "write_file", "y")
-        assert outcome is True
-        assert not still_mounted, "prompt widget should be removed after answer"
-        assert "write_file" not in perms._session_allow  # "allow once" ≠ remember
+        rec, cleared = await _drive_prompt(app, pilot, "write_file", "y")
+        assert rec.decisions == [{"type": "approve"}]
+        assert cleared
+        assert "write_file" not in perms._session_allow  # allow-once ≠ remember
+        assert app._awaiting_permission is False
 
 
 @pytest.mark.asyncio
-async def test_permission_deny_returns_false() -> None:
-    perms.clear_session_allow()
+async def test_prompt_always_approves_and_remembers():
     app = KodaApp(model="test:model")
     async with app.run_test() as pilot:
-        outcome, still_mounted = await _answer_prompt(app, pilot, "execute", "n")
-        assert outcome is False
-        assert not still_mounted
+        rec, cleared = await _drive_prompt(app, pilot, "edit_file", "a")
+        assert rec.decisions == [{"type": "approve"}]
+        assert cleared
+        assert "edit_file" in perms._session_allow
 
 
 @pytest.mark.asyncio
-async def test_permission_escape_denies() -> None:
-    """Esc should map to deny (matches the on-screen hint)."""
-    perms.clear_session_allow()
+async def test_prompt_deny_resumes_with_reject():
     app = KodaApp(model="test:model")
     async with app.run_test() as pilot:
-        outcome, still_mounted = await _answer_prompt(app, pilot, "execute", "escape")
-        assert outcome is False
-        assert not still_mounted
+        rec, cleared = await _drive_prompt(app, pilot, "execute", "n")
+        assert rec.decisions is not None
+        assert rec.decisions[0]["type"] == "reject"
+        assert cleared
 
 
 @pytest.mark.asyncio
-async def test_permission_always_allows_and_remembers() -> None:
-    perms.clear_session_allow()
+async def test_prompt_escape_denies():
     app = KodaApp(model="test:model")
     async with app.run_test() as pilot:
-        outcome, still_mounted = await _answer_prompt(app, pilot, "edit_file", "a")
-        assert outcome is True
-        assert not still_mounted
-        assert "edit_file" in perms._session_allow  # "always" adds to allow-list
-    perms.clear_session_allow()
+        rec, cleared = await _drive_prompt(app, pilot, "execute", "escape")
+        assert rec.decisions is not None
+        assert rec.decisions[0]["type"] == "reject"
+        assert cleared
+
+
+# ─── 3b. composer lock — keys reach the prompt, not the composer ──────
+#
+# Regression for the live-app bug where the prompt was up but ↑/↓ and
+# y/a/n did nothing: the focused ChatInput swallowed them (y/a/n as text,
+# arrows as history) because the prompt's priority bindings only fire when
+# the prompt holds focus. The fix disables the composer while a prompt is
+# up and forces focus to the prompt.
 
 
 @pytest.mark.asyncio
-async def test_permission_arrow_nav_and_enter() -> None:
-    """↓ + Enter from the first option (allow) should land on always."""
-    perms.clear_session_allow()
+async def test_prompt_locks_composer_and_key_reaches_prompt():
     app = KodaApp(model="test:model")
     async with app.run_test() as pilot:
-        result: dict = {}
+        # Reproduce the real scenario: the composer is focused first.
+        app._chat_input.focus()
+        await pilot.pause()
+        rec = _RecordingAdapter()
+        app._adapter = rec  # type: ignore[assignment]
+        await app.handle_permission_request(
+            PermissionRequest(items=[PermissionItem(tool_name="execute", args={"command": "ls"})])
+        )
+        appeared = False
+        for _ in range(60):
+            await pilot.pause()
+            if list(app.query(PermissionPrompt)):
+                appeared = True
+                break
+        assert appeared
+        # Composer must be locked so it can't eat the prompt's keys.
+        assert app._chat_input.disabled is True
 
-        def _worker() -> None:
-            result["outcome"] = app._prompt_from_tool_thread(
-                "edit_file", {"file_path": "AGENTS.md"}
-            )
+        await pilot.press("y")
+        for _ in range(30):
+            await pilot.pause()
+            if rec.calls:
+                break
+        assert rec.decisions == [{"type": "approve"}]
+        # The 'y' must NOT have been typed into the composer.
+        assert app._chat_input.value == ""
+        # …and the composer is handed back afterwards.
+        assert app._chat_input.disabled is False
 
-        t = threading.Thread(target=_worker, daemon=True)
-        t.start()
 
-        # Wait for prompt to mount.
+@pytest.mark.asyncio
+async def test_prompt_key_routes_via_app_fallback_when_unfocused():
+    """If a focus race leaves the card unfocused, the app-level on_key
+    fallback must still route the key to it (composer is disabled, so the
+    key bubbles to the app instead of being eaten)."""
+    app = KodaApp(model="test:model")
+    async with app.run_test() as pilot:
+        rec = _RecordingAdapter()
+        app._adapter = rec  # type: ignore[assignment]
+        await app.handle_permission_request(
+            PermissionRequest(items=[PermissionItem(tool_name="execute", args={"command": "ls"})])
+        )
         for _ in range(60):
             await pilot.pause()
             if list(app.query(PermissionPrompt)):
                 break
-            await asyncio.sleep(0.02)
-
-        # Default highlight is index 0 (allow). Down once → index 1 (always).
-        await pilot.press("down")
-        await pilot.press("enter")
-
-        for _ in range(60):
+        # Simulate the focus race: nothing is focused.
+        app.set_focus(None)
+        await pilot.pause()
+        await pilot.press("y")
+        for _ in range(30):
             await pilot.pause()
-            if not t.is_alive():
+            if rec.calls:
                 break
-            await asyncio.sleep(0.02)
-        t.join(timeout=5)
-
-        assert result["outcome"] is True
-        assert "edit_file" in perms._session_allow
-    perms.clear_session_allow()
+        assert rec.decisions == [{"type": "approve"}]
 
 
 @pytest.mark.asyncio
-async def test_permission_headless_defaults_to_allow() -> None:
-    """With no UI loop captured (no on_mount), the bridge must not block —
-    it allows so non-TUI consumers don't hang on a prompt that can't render."""
+async def test_prompt_arrow_nav_with_locked_composer():
+    """↓↓ + Enter must navigate the prompt (allow→always→deny) — not the
+    composer's history — and land on deny → reject."""
     app = KodaApp(model="test:model")
-    # Do not run the app → _ui_loop is never set.
-    assert getattr(app, "_ui_loop", None) is None
-    assert app._prompt_from_tool_thread("write_file", {"file_path": "x"}) is True
-
-
-def test_permission_plan_mode_refuses_outright() -> None:
-    """PLAN mode = advisory-only. The gate refuses mutations directly
-    without firing the prompt — no override, no modal — so the agent
-    stalls on the refusal string instead of waiting for the user."""
-    perms.clear_session_allow()
-    perms.set_mode(Mode.PLAN)
-    hook_called: list[bool] = []
-    perms.set_prompt_hook(lambda name, args: (hook_called.append(True), True)[1])
-    try:
-        refusal = perms.check("write_file", {"file_path": "x"})
-        assert refusal is not None
-        assert "plan mode" in refusal.lower()
-        assert "Shift+A" in refusal or "apply" in refusal
-        assert hook_called == [], "PLAN must not call the prompt hook"
-    finally:
-        perms.set_mode(Mode.DEFAULT)
-        perms.set_prompt_hook(None)
-
-
-def test_permission_plan_mode_execute_refused() -> None:
-    """Same contract for ``execute``: PLAN refuses without prompting."""
-    perms.clear_session_allow()
-    perms.set_mode(Mode.PLAN)
-    perms.set_prompt_hook(lambda name, args: True)
-    try:
-        refusal = perms.check("execute", {"command": "git checkout main"})
-        assert refusal is not None
-        assert "plan mode" in refusal.lower()
-    finally:
-        perms.set_mode(Mode.DEFAULT)
-        perms.set_prompt_hook(None)
+    async with app.run_test() as pilot:
+        app._chat_input.focus()
+        await pilot.pause()
+        rec = _RecordingAdapter()
+        app._adapter = rec  # type: ignore[assignment]
+        await app.handle_permission_request(
+            PermissionRequest(items=[PermissionItem(tool_name="write_file", args={"file_path": "x"})])
+        )
+        for _ in range(60):
+            await pilot.pause()
+            if list(app.query(PermissionPrompt)):
+                break
+        await pilot.press("down")
+        await pilot.press("down")
+        await pilot.press("enter")
+        for _ in range(30):
+            await pilot.pause()
+            if rec.calls:
+                break
+        assert rec.decisions is not None
+        assert rec.decisions[0]["type"] == "reject"  # 0=allow →1=always →2=deny
+        assert app._chat_input.value == ""

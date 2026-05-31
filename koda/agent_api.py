@@ -89,7 +89,39 @@ class Done:
     usage: Usage | None = None
 
 
-AgentEvent = Union[TextDelta, ThinkingDelta, ToolStart, ToolResult, Usage, Done]
+@dataclass
+class PermissionItem:
+    """A single tool call awaiting the user's approval.
+
+    Emitted (wrapped in a :class:`PermissionRequest`) when a checkpointed
+    LangGraph graph hits a human-in-the-loop ``interrupt()`` before running
+    a gated tool. ``allowed_decisions`` mirrors the graph's review config
+    (typically ``["approve", "reject"]``); the TUI maps its allow / always /
+    deny buttons onto those.
+    """
+
+    tool_name: str
+    args: dict[str, Any]
+    allowed_decisions: tuple[str, ...] = ("approve", "reject")
+    description: str = ""
+
+
+@dataclass
+class PermissionRequest:
+    """The agent has paused on one or more gated tool calls.
+
+    The graph's state is checkpointed at this point — nothing has run and
+    nothing is blocked. The TUI renders a prompt per item, collects the
+    user's choices, and hands them back via ``adapter.provide_decisions``,
+    which resumes the graph from the checkpoint with ``Command(resume=…)``.
+    """
+
+    items: list[PermissionItem]
+
+
+AgentEvent = Union[
+    TextDelta, ThinkingDelta, ToolStart, ToolResult, Usage, Done, PermissionRequest
+]
 
 
 @runtime_checkable
