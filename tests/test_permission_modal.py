@@ -16,7 +16,8 @@ stays interactive while the agent is paused. These tests pin three layers:
 
 from __future__ import annotations
 
-from typing import TypedDict
+import operator
+from typing import Annotated, TypedDict
 
 import pytest
 
@@ -160,6 +161,60 @@ async def test_adapter_auto_approves_when_session_allowed():
         kinds = [type(e).__name__ for e in events]
         assert "PermissionRequest" not in kinds, kinds
         assert isinstance(events[-1], Done)
+    finally:
+        await conn.close()
+
+
+def _build_multi_interrupt_graph():
+    """A fan-out graph: 3 parallel branches each interrupt (HITL-shaped) at
+    once — models the 'multiple subagents pause concurrently' case, which
+    LangGraph only lets you resume via an interrupt-id-keyed map."""
+    import aiosqlite
+    from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
+    from langgraph.graph import END, START, StateGraph
+    from langgraph.types import Send, interrupt
+
+    class _MS(TypedDict):
+        out: Annotated[list, operator.add]
+
+    def fan(state):
+        return [Send("w", {"id": i}) for i in (1, 2, 3)]
+
+    def w(state):
+        d = interrupt({
+            "action_requests": [{"name": "execute", "args": {"command": f"echo {state['id']}"}}],
+            "review_configs": [{"action_name": "execute", "allowed_decisions": ["approve", "reject"]}],
+        })
+        return {"out": [(state["id"], d)]}
+
+    g = StateGraph(_MS)
+    g.add_node("w", w)
+    g.add_conditional_edges(START, fan, ["w"])
+    g.add_edge("w", END)
+    conn = aiosqlite.connect(":memory:", check_same_thread=False)
+    return g.compile(checkpointer=AsyncSqliteSaver(conn)), conn
+
+
+@pytest.mark.asyncio
+async def test_adapter_handles_multiple_concurrent_interrupts():
+    """Regression: parallel subagents → multiple pending interrupts. They
+    must all surface in one PermissionRequest and resume via an id-keyed map
+    (a single ``resume`` value raises 'must specify the interrupt id')."""
+    graph, conn = _build_multi_interrupt_graph()
+    try:
+        adapter = LangGraphAdapter(graph=graph, model="test:model", thread_id="t-multi")
+        perm_batches = 0
+        items_seen = 0
+        events = []
+        async for ev in adapter.stream("go", []):
+            events.append(ev)
+            if isinstance(ev, PermissionRequest):
+                perm_batches += 1
+                items_seen = len(ev.items)
+                adapter.provide_decisions([{"type": "approve"} for _ in ev.items])
+        assert perm_batches == 1, "all interrupts should batch into one PermissionRequest"
+        assert items_seen == 3, f"expected 3 gated items across the 3 branches, got {items_seen}"
+        assert isinstance(events[-1], Done), "graph must finish after resuming all interrupts"
     finally:
         await conn.close()
 

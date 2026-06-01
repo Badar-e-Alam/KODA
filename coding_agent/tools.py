@@ -628,16 +628,19 @@ def ask_user(question: str, options: list[str] | None = None) -> str:
         question: A focused, single-sentence question. Don't stack
             multiple questions — call ``ask_user`` again if you need
             another answer.
-        options: Optional list of 2-9 short choices. The user can
-            navigate with arrow keys or jump with number keys 1-9.
-            If omitted, the user acknowledges with Enter or cancels
-            with Esc; phrase the question so an "okay/cancel"
-            response is meaningful.
+        options: Optional list of 2-9 short choices. The user selects one
+            with the arrow keys + Enter — OR ignores the options entirely
+            and types a free-text reply in the card's "say something else"
+            field, which is returned verbatim. If omitted, the user can
+            still free-type, acknowledge with Enter, or cancel with Esc.
 
     Returns:
-        The user's chosen option (verbatim text) when they pick one,
-        ``"(acknowledged)"`` when they hit Enter on an options-less
-        prompt, or an empty string when they cancel with Esc.
+        The user's typed reply if they wrote one; otherwise the chosen
+        option's verbatim text; ``"(acknowledged)"`` for Enter on an
+        options-less prompt with no text typed; or an empty string on Esc
+        (declined). Because the user can ALWAYS free-type, treat the answer
+        as free-form text — do not assume it is one of the options you
+        offered.
 
     Examples:
         ``ask_user("Should this use SQLite or Postgres for storage?", ["SQLite", "Postgres"])``

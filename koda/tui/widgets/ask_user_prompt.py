@@ -1,23 +1,32 @@
 """Inline card for the agent's ``ask_user`` tool.
 
-Mirrors ``PermissionPrompt``: mounted in ``#messages``, ``priority=True``
-bindings so the chat input doesn't swallow ``y`` / number / arrow keys.
-The agent passes a question + optional list of choices; the user
-navigates with arrows (or jk / number keys 1-9) and confirms with
-``Enter``. ``Esc`` cancels (returns an empty string).
+Shows the agent's question with optional preset choices **and** a free-text
+field ("say something else…") so the user can either pick an option or type
+a custom reply that goes straight back to the agent.
 
-Encouraged usage from the agent's side: in PLAN mode, before drafting,
-or whenever the agent would otherwise guess at a requirement. The
-system prompt has a ``<AskUser>`` block telling the agent when to reach
-for this tool.
+Controls (the card owns the keyboard — the composer is disabled while it's
+up, see ``KodaApp._lock_composer``):
+
+  ↑ / ↓      move the highlighted option
+  type       fill the free-text field
+  enter      send the typed text if there is any, else the highlighted option
+  backspace  edit the typed text
+  esc        cancel (returns "")
+
+The answer the agent receives is the verbatim typed text when the user
+typed something, otherwise the chosen option's text. Empty (Esc) means the
+user declined. ``KodaApp`` also routes keys here via ``try_key`` as a
+focus-race fallback (navigation/submit only — typing needs real focus).
 """
 
 from __future__ import annotations
 
-from typing import Callable, ClassVar
+from typing import Callable
 
-from textual.binding import Binding, BindingType
+from textual import events
 from textual.widgets import Static
+
+_PLACEHOLDER = "say something else…"
 
 
 def _clamp(text: str, max_chars: int) -> str:
@@ -27,34 +36,15 @@ def _clamp(text: str, max_chars: int) -> str:
 
 
 class AskUserPrompt(Static):
-    """Inline 'agent has a question for you' card.
+    """Inline 'agent has a question for you' card with a free-text reply.
 
-    Construct with the question text, an optional list of choices, and a
-    callback that fires with the user's answer (string). When options is
-    empty, the card surfaces a "press any key" prompt and dismisses on
-    Enter with a placeholder reply — free-text input lives in the chat
-    composer in v1, so the agent should phrase the question to allow a
-    composer-style follow-up if it really needs typed text.
+    Construct with the question, an optional list of choices, and a callback
+    that fires with the user's answer (string). The user can pick a preset
+    option (↑↓ + Enter) or type a custom reply in the "say something else"
+    field; a non-empty typed reply wins over the highlighted option.
     """
 
     can_focus = True
-
-    # ``priority=True`` is load-bearing: keeps keystrokes from leaking
-    # to the focused chat input. See ``PermissionPrompt`` for the same
-    # rationale.
-    BINDINGS: ClassVar[list[BindingType]] = [
-        Binding("up", "prev", "Up", show=False, priority=True),
-        Binding("k", "prev", "Up", show=False, priority=True),
-        Binding("down", "next", "Down", show=False, priority=True),
-        Binding("j", "next", "Down", show=False, priority=True),
-        Binding("enter", "confirm", "Confirm", show=False, priority=True),
-        Binding("escape", "cancel", "Cancel", show=False, priority=True),
-    ] + [
-        # 1-9 jump to that option directly (helpful when you have a
-        # handful of choices and want to skip the arrow dance).
-        Binding(str(i), f"pick_{i}", f"Pick {i}", show=False, priority=True)
-        for i in range(1, 10)
-    ]
 
     def __init__(
         self,
@@ -67,6 +57,7 @@ class AskUserPrompt(Static):
         self._options = list(options)
         self._on_answer: Callable[[str], None] | None = on_answer
         self._idx = 0
+        self._typed = ""  # free-text buffer for "say something else"
         self.add_class("ask-user-prompt")
 
     def on_mount(self) -> None:
@@ -76,63 +67,73 @@ class AskUserPrompt(Static):
         except Exception:
             pass
 
-    # ── Actions ──────────────────────────────────────────────────────
+    # ── Key handling ─────────────────────────────────────────────────
 
-    def action_prev(self) -> None:
-        if not self._options:
-            return
-        self._idx = (self._idx - 1) % len(self._options)
-        self._refresh_content()
+    def on_key(self, event: events.Key) -> None:
+        if self._handle(event.key, event.character):
+            event.stop()
+            event.prevent_default()
 
-    def action_next(self) -> None:
-        if not self._options:
-            return
-        self._idx = (self._idx + 1) % len(self._options)
-        self._refresh_content()
-
-    def action_confirm(self) -> None:
-        if self._options:
-            self._resolve(self._options[self._idx])
-        else:
-            # No options offered — return a sentinel so the agent knows
-            # the user acknowledged but didn't pick anything specific.
-            self._resolve("(acknowledged)")
-
-    def action_cancel(self) -> None:
-        # Esc returns empty string. The tool's caller (the agent) sees
-        # the empty answer and can decide whether to retry or proceed.
-        self._resolve("")
-
-    def try_key(self, key: str) -> bool:
-        """Run the action this key maps to; return True if handled. Used by
-        the app-level focus-independent fallback (see ``PermissionPrompt.try_key``)."""
-        nav = {"up": "prev", "k": "prev", "down": "next", "j": "next",
-               "enter": "confirm", "escape": "cancel"}
-        if key in nav:
-            getattr(self, f"action_{nav[key]}")()
+    def _handle(self, key: str, character: str | None) -> bool:
+        if key == "escape":
+            self._resolve("")
             return True
-        if len(key) == 1 and key in "123456789":
-            getattr(self, f"action_pick_{key}")()
+        if key == "enter":
+            self._submit()
+            return True
+        if key == "up":
+            self._move(-1)
+            return True
+        if key == "down":
+            self._move(1)
+            return True
+        if key == "backspace":
+            if self._typed:
+                self._typed = self._typed[:-1]
+                self._refresh_content()
+            return True
+        # Any single printable character fills the free-text field.
+        if character and len(character) == 1 and character.isprintable():
+            self._typed += character
+            self._refresh_content()
             return True
         return False
 
-    def __getattr__(self, name: str):
-        # Wires number-key actions to ``_resolve(self._options[n-1])``.
-        # Defined as ``__getattr__`` instead of nine separate methods so
-        # we don't pollute the class with boilerplate.
-        if name.startswith("action_pick_"):
-            try:
-                n = int(name[len("action_pick_") :])
-            except ValueError:
-                raise AttributeError(name)
+    def try_key(self, key: str) -> bool:
+        """Focus-race fallback used by ``KodaApp.on_key`` — navigation and
+        submit only. Free-text typing needs real focus (and the character),
+        which is handled in ``on_key``."""
+        if key == "up":
+            self._move(-1)
+            return True
+        if key == "down":
+            self._move(1)
+            return True
+        if key == "enter":
+            self._submit()
+            return True
+        if key == "escape":
+            self._resolve("")
+            return True
+        return False
 
-            def _pick() -> None:
-                if 1 <= n <= len(self._options):
-                    self._idx = n - 1
-                    self._resolve(self._options[n - 1])
+    # ── Actions ──────────────────────────────────────────────────────
 
-            return _pick
-        raise AttributeError(name)
+    def _move(self, delta: int) -> None:
+        if not self._options:
+            return
+        self._idx = (self._idx + delta) % len(self._options)
+        self._refresh_content()
+
+    def _submit(self) -> None:
+        """Enter: typed text wins; else the highlighted option; else ack."""
+        text = self._typed.strip()
+        if text:
+            self._resolve(text)
+        elif self._options:
+            self._resolve(self._options[self._idx])
+        else:
+            self._resolve("(acknowledged)")
 
     # ── Helpers ──────────────────────────────────────────────────────
 
@@ -144,34 +145,37 @@ class AskUserPrompt(Static):
         try:
             cb(answer)
         except Exception:
-            # Bridge handles its own future cancellation; we don't want
-            # a callback exception to leave the card half-resolved.
+            # Bridge handles its own future cancellation; don't let a
+            # callback exception leave the card half-resolved.
             pass
 
     def _refresh_content(self) -> None:
         # NB: see PermissionPrompt for why this isn't named ``_render``.
-        # Hex literal (#fb923c) is the KodaBanner orange — keeps the
-        # ``AGENT ASKS`` chip and the highlighted option visually
-        # anchored to the same brand color the left border uses, even
-        # after a ``/theme`` switch.
+        typing = bool(self._typed)
         question = _clamp(self._question.strip().replace("\n", " "), 200)
-        header = f"[reverse #fb923c] AGENT ASKS [/]  [b]{question}[/]"
-        lines: list[str] = [header, ""]
-        if self._options:
-            for i, opt in enumerate(self._options):
-                short = _clamp(opt, 100)
-                if i == self._idx:
-                    lines.append(f"  [b reverse #fb923c] ❯ {i + 1}. {short} [/]")
-                else:
-                    lines.append(f"    [dim]{i + 1}. {short}[/]")
-            lines.append("")
-            lines.append(
-                "  [dim]↑↓ / jk navigate · 1-9 jump · enter submit · esc cancel[/]"
-            )
+        lines: list[str] = [f"[reverse #fb923c] AGENT ASKS [/]  [b]{question}[/]", ""]
+
+        for i, opt in enumerate(self._options):
+            short = _clamp(opt, 100)
+            # When the user is typing, dim the options to signal the typed
+            # reply will win; otherwise highlight the selected option.
+            if not typing and i == self._idx:
+                lines.append(f"  [b reverse #fb923c] ❯ {i + 1}. {short} [/]")
+            else:
+                lines.append(f"    [dim]{i + 1}. {short}[/]")
+
+        # Free-text "say something else" row — always available.
+        if typing:
+            shown = _clamp(self._typed, 120)
+            lines.append(f"  [b reverse #fb923c] ✎ {shown}▌ [/]")
         else:
-            lines.append(
-                "  [dim]No options offered — press enter to acknowledge, esc to cancel[/]"
-            )
+            lines.append(f"    [dim]✎ {_PLACEHOLDER}[/]")
+
+        lines.append("")
+        if self._options:
+            lines.append("  [dim]↑↓ select · type to reply · enter send · esc cancel[/]")
+        else:
+            lines.append("  [dim]type to reply · enter send · esc cancel[/]")
         self.update("\n".join(lines))
 
 

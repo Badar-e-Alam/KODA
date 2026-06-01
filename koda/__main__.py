@@ -1,13 +1,18 @@
 """
-KODA entry point — agent-agnostic AI coding TUI.
+KODA entry point — agent-agnostic AI coding assistant.
 
-Usage:
+Usage — Interactive TUI (default)
     koda                                          # Default model from API keys
     koda --model anthropic:claude-sonnet-4-6      # Specify model
     koda --model openai:gpt-4o                    # OpenAI
     koda --model ollama:llama3.1                  # Local Ollama
-    koda --agent deep                             # Built-in deep agent (default)
+    koda --agent deep                             # Built-in deep agent
     koda --agent module.ClassName                 # Custom KodaAgent class
+
+Usage — One-shot mode (no TUI)
+    koda --prompt "Fix the pagination bug in pagination.py"
+    echo "Add a README" | koda --prompt
+    koda --no-tui --cwd /path/to/project
 """
 
 from __future__ import annotations
@@ -176,7 +181,33 @@ def main() -> None:
             "having to `cd` into it (e.g. `koda --cwd ~/work/meal-planning`)."
         ),
     )
+    parser.add_argument(
+        "--prompt", "-p",
+        default=None,
+        nargs="?",
+        const="__stdin__",
+        metavar="TEXT",
+        help=(
+            "One-shot mode: run a single prompt and stream text to stdout, "
+            "then exit. If no TEXT is given, reads the prompt from stdin. "
+            "Useful for evals, scripts, and piping."
+        ),
+    )
+    parser.add_argument(
+        "--no-tui",
+        action="store_true",
+        dest="no_tui",
+        help="Alias for --prompt (one-shot, non-interactive)",
+    )
     args = parser.parse_args()
+
+    # --no-tui is an alias for --prompt (backward compat with eval harness)
+    prompt = args.prompt
+    if args.no_tui and prompt is None:
+        prompt = "__stdin__"
+    elif args.no_tui and prompt is not None and prompt != "__stdin__":
+        # --prompt was already set, leave it alone
+        pass
 
     if args.cwd is not None:
         import os
@@ -185,58 +216,96 @@ def main() -> None:
         target = _Path(args.cwd).expanduser().resolve()
         if not target.is_dir():
             parser.error(f"--cwd: not a directory: {target}")
-        # chdir before adapters are built so every cwd-derived path
-        # (AGENTS.md, .koda/, /memories/, checkpoints.db) anchors here.
         os.chdir(target)
 
     _setup_logging()
 
-    # Warm provider model lists in the background so /model is instant.
-    # Kicked off before building the (potentially slow) first adapter,
-    # so by the time the user reaches the TUI the cache is usually ready.
-    try:
-        from koda.model_config import warm_cache_in_background
-
-        warm_cache_in_background()
-    except Exception:
-        pass  # non-fatal — /model will still work off fallback lists
-
-    # ``thread_id`` is intentionally left ``None`` here: ``KodaApp`` derives
-    # it from the freshly-created ``SessionTree.session_id`` so that the
-    # LangGraph checkpointer's thread matches the session shown in the
-    # sidebar. A random UUID at launch would create an orphan thread that
-    # the user could never resume.
-    thread_id = None
     model = args.model or _default_model()
-    # Build the factory eagerly (cheap — just resolves a callable) but defer
-    # the expensive ``factory(model, thread_id)`` call into a background
-    # thread on TUI mount, so the user sees the KODA banner within ~1 s even
-    # when langchain + langgraph imports take 3–4 s to warm up.
     factory = _build_adapter_factory(args.agent)
 
     import logging
-    logging.getLogger("koda").info("Starting KODA: agent=%s model=%s", args.agent, model)
+    logging.getLogger("koda").info(
+        "Starting KODA: agent=%s model=%s mode=%s",
+        args.agent, model, "oneshot" if prompt is not None else "interactive",
+    )
 
     import asyncio
-    # Wrap ``asyncio.run`` so Ctrl+C exits cleanly with status 130 (the
-    # conventional exit code for SIGINT) instead of dumping a multi-screen
-    # traceback. On Python 3.11+ ``asyncio.run`` installs its own SIGINT
-    # handler that races with Textual's Ctrl+C keybinding; when asyncio
-    # wins the race, the ``KeyboardInterrupt`` lands inside whatever
-    # Textual code path was running (typically a style-property getter
-    # mid-paint) and bubbles up unhandled. Catching here is the
-    # documented pattern for asyncio scripts. The shutdown side-effects
-    # (adapter aclose, on_unmount, atexit hooks) still run because the
-    # cancellation propagates through ``run_async()`` first.
     try:
-        asyncio.run(_run_app(
-            factory=factory,
-            model=model,
-            thread_id=thread_id,
-            auto_approve=args.auto_approve,
-        ))
+        if prompt is not None:
+            # One-shot mode: stream text to stdout, no TUI
+            asyncio.run(_run_oneshot(
+                factory=factory,
+                model=model,
+                prompt=prompt,
+                auto_approve=args.auto_approve,
+            ))
+        else:
+            asyncio.run(_run_app(
+                factory=factory,
+                model=model,
+                thread_id=None,
+                auto_approve=args.auto_approve,
+            ))
     except KeyboardInterrupt:
         sys.exit(130)
+
+
+async def _run_oneshot(*, factory, model: str, prompt: str, auto_approve: bool = False) -> None:
+    """Run one prompt, stream text to stdout, then exit.
+
+    Reads the prompt from stdin if ``--prompt`` was given without a value,
+    or from the first positional arg / ``sys.stdin`` when piped.
+    """
+    import time
+    from koda.agent_api import Done, TextDelta, ToolStart
+
+    # Resolve prompt text
+    if prompt == "__stdin__":
+        prompt_text = sys.stdin.read()
+    else:
+        prompt_text = prompt
+
+    # Build adapter (same path as the TUI)
+    adapter = factory(model=model, thread_id=f"oneshot-{os.getpid()}")
+
+    if auto_approve:
+        # Allow all gated tool calls so the agent can run unattended.
+        try:
+            from koda.tools import permissions as _perms  # type: ignore[attr-defined]
+            _perms.set_auto_approve(True)  # type: ignore[union-attr]
+        except Exception:
+            pass  # The module doesn't have this function — the eval runner
+            # will just wait on permission prompts until timeout. That's
+            # harmless but should be rare; the eval harness doesn't use this.
+
+    stream_start = time.monotonic()
+    event_count = 0
+    try:
+        async for event in adapter.stream(prompt_text, []):
+            event_count += 1
+            if isinstance(event, TextDelta):
+                print(event.content, end="", flush=True)
+            elif isinstance(event, ToolStart):
+                # One tool dot per call on stderr so users know what is happening
+                print(".", end="", file=sys.stderr, flush=True)
+            elif isinstance(event, Done) and event.usage:
+                # Print a compact footer on stderr so stdout stays clean
+                u = event.usage
+                used = []
+                if u.input_tokens:
+                    used.append(f"in={u.input_tokens}")
+                if u.output_tokens:
+                    used.append(f"out={u.output_tokens}")
+                print(
+                    f"\n[{event_count} events  {' '.join(used)}]",
+                    file=sys.stderr, flush=True,
+                )
+    finally:
+        # Clean up the aiosqlite checkpointer (non-daemon worker thread)
+        if hasattr(adapter, "aclose"):
+            await adapter.aclose()
+    elapsed = time.monotonic() - stream_start
+    print(f"\n[{elapsed:.1f}s] done", file=sys.stderr, flush=True)
 
 
 async def _run_app(*, factory, model: str, thread_id: str | None = None, auto_approve: bool = False) -> None:

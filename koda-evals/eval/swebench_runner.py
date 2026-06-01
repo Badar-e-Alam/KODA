@@ -214,27 +214,7 @@ def _grade(predictions_path: Path, instances: list[dict], run_id: str) -> dict:
     return {"graded": True, "report": None, "note": f"no {report_path}"}
 
 
-def _force_utf8_stdio() -> None:
-    """Make ``print`` on Windows tolerate the heavy box-drawing chars we
-    use as separators (``━━``, ``↳`` in tool previews, etc.).
-
-    Windows defaults stdout/stderr to cp1252, which can't encode those —
-    the runner used to crash on its very first ``print(f"━━ {iid} ━━")``
-    before infer_one even started. Reconfigure to utf-8 with
-    ``errors='replace'`` so a stray glyph never aborts a run.
-    """
-    for stream in (sys.stdout, sys.stderr):
-        reconf = getattr(stream, "reconfigure", None)
-        if reconf is None:
-            continue
-        try:
-            reconf(encoding="utf-8", errors="replace")
-        except Exception:
-            pass
-
-
 def main() -> None:
-    _force_utf8_stdio()
     parser = argparse.ArgumentParser()
     parser.add_argument("--split", choices=["dev", "full"], default="dev",
                         help="dev = swebench/dev_split.json (default); full = all SWE-bench Lite")
@@ -246,19 +226,9 @@ def main() -> None:
                         help="skip inference, grade an existing predictions.jsonl")
     parser.add_argument("--predictions", type=Path, default=Path("predictions.jsonl"))
     parser.add_argument("--report-json", type=Path, default=Path("swebench_results.json"))
-    parser.add_argument(
-        "--model",
-        help="Model spec like 'kimi:kimi-k2.6' or 'anthropic:claude-sonnet-4-6'. "
-             "Overrides $KODA_MODEL. Default: $KODA_MODEL or ollama:qwen2.5-coder:7b.",
-    )
     args = parser.parse_args()
 
     load_dotenv()
-    # CLI flag wins over env, env wins over the historical default. The flag
-    # is exported so eval.agent_adapter._run_via_import (which reads KODA_MODEL
-    # at adapter-construction time inside _collect) sees the same value.
-    if args.model:
-        os.environ["KODA_MODEL"] = args.model
     reporter = LangfuseReporter(run_name=args.run_name)
     model = os.getenv("KODA_MODEL", "ollama:qwen2.5-coder:7b")
     print(f"[koda] mode={os.getenv('EVAL_AGENT_MODE', 'import')}  model={model}")

@@ -82,9 +82,9 @@ def run_one(task_dir: Path, reporter: LangfuseReporter) -> dict:
                 **agent_out.metadata,
             },
         )
-        span.score("pass", 1.0 if passed else 0.0,
+        span.score(name="pass", value=1.0 if passed else 0.0,
                    comment=grader_out[-200:] if not passed else "")
-        span.score("agent_latency_s", round(agent_elapsed, 2))
+        span.score(name="agent_latency_s", value=round(agent_elapsed, 2))
 
     shutil.rmtree(workdir, ignore_errors=True)
 
@@ -105,11 +105,14 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--task", help="run a single task by name")
     parser.add_argument("--run-name", help="Langfuse run name (default: auto)")
+    parser.add_argument("--model", help="Model spec (overrides KODA_MODEL env var), e.g. ollama:gpt-oss:20b or openai:gpt-4o")
     parser.add_argument("--report-json", default="results.json")
     parser.add_argument("--report-md", default="results.md")
     args = parser.parse_args()
 
     load_dotenv()
+    if args.model:
+        os.environ["KODA_MODEL"] = args.model
     reporter = LangfuseReporter(run_name=args.run_name)
     if reporter.enabled:
         print(f"[langfuse] reporting to run: {reporter.run_name}")

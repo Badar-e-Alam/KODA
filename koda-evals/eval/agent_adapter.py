@@ -2,42 +2,43 @@
 
 What this does
 --------------
-Two ways to invoke your agent -- pick one via `EVAL_AGENT_MODE` env var:
+Two ways to invoke your agent — pick one via ``EVAL_AGENT_MODE`` env var:
 
-  - "import"     -> imports CodingAgentAdapter from koda.adapters.coding_agent
+  - "import"     → imports CodingAgentAdapter from koda.adapters.coding_agent
                    (faster, in-process, traces nest naturally inside Langfuse)
-  - "subprocess" -> runs the `koda` CLI as a subprocess (same way a user would)
+  - "subprocess" → runs the ``koda`` CLI as a subprocess (same way a user would)
 
 Default is "import". The runner sets up a Langfuse trace BEFORE calling
 run_agent(), so the agent's existing @observe-decorated traces will nest
 inside the eval trace automatically.
 
-What you need to verify in YOUR repo
-------------------------------------
-Search your code for these and tweak the lines marked `# CHECK:` below if
-they don't match:
+Integration notes
+-----------------
+The adapter calls ``CodingAgentAdapter(model=..., thread_id=session_id)``
+then ``agent.stream(prompt, [])`` in an asyncio event loop. On completion it
+calls ``await agent.aclose()`` to close the aiosqlite checkpointer (whose
+non-daemon worker thread would otherwise hang the process on exit).
 
-  1. CodingAgentAdapter constructor signature -> `CodingAgentAdapter(model="ollama:qwen2.5-coder:7b")`?
-  2. The method that runs one prompt  -> `.stream(message, history)` (async iterator of AgentEvent)?
-  3. Whether it accepts session_id    -> for grouping traces per eval run
+``thread_id`` is set to the eval ``session_id`` so LangGraph's checkpointer
+and Langfuse's ``langfuse_callbacks()`` group all events under one trace
+per task.
 
-If the import path is different, fix `_KODA_IMPORT_PATH` below.
+If the import path is different, fix ``_KODA_IMPORT_PATH`` /
+``_KODA_CLASS_NAME`` below.
 """
 from __future__ import annotations
 
+import asyncio
 import os
 import subprocess
-import sys
 import time
 import traceback
-from contextlib import redirect_stdout, redirect_stderr
 from dataclasses import asdict, dataclass, field
-from io import StringIO
 from pathlib import Path
 from typing import Any
 
 
-# CHECK: confirm this matches your repo
+# CHECK: confirm these match your repo
 _KODA_IMPORT_PATH = "koda.adapters.coding_agent"
 _KODA_CLASS_NAME = "CodingAgentAdapter"
 
@@ -54,98 +55,147 @@ class AgentResult:
         return asdict(self)
 
 
-# -----------------------------------------------------------------------
-# Mode A: import CodingAgentAdapter and call .stream() (preferred)
-# -----------------------------------------------------------------------
+# ─────────────────────────────────────────────────────────────────────────────
+# Mode A: import KodaAgent and call it directly (preferred)
+# ─────────────────────────────────────────────────────────────────────────────
 
 
 def _run_via_import(prompt: str, workdir: Path, *, session_id: str) -> AgentResult:
     start = time.perf_counter()
-    captured_stdout, captured_stderr = StringIO(), StringIO()
+    _EVAL_TIMEOUT_S = int(os.getenv("EVAL_AGENT_TIMEOUT", "600"))
 
     try:
-        import asyncio
+        # Import lazily so subprocess mode still works without the package installed.
         import importlib
 
         mod = importlib.import_module(_KODA_IMPORT_PATH)
         AgentCls = getattr(mod, _KODA_CLASS_NAME)
 
-        # CodingAgentAdapter(model=...) -- model spec routed via BaseAdapter
+        # CodingAgentAdapter(model, thread_id=None) — thread_id propagates
+        # to both the LangGraph checkpointer and Langfuse langfuse_callbacks(),
+        # grouping all LLM/tool events under one trace per task.
         model_spec = os.getenv("KODA_MODEL", "ollama:qwen2.5-coder:7b")
-        agent = AgentCls(model=model_spec)
+        agent = AgentCls(model=model_spec, thread_id=session_id)
 
-        # Skip AGENTS.md bootstrap inside eval workdirs -- eval repos are
-        # tiny and don't need a project context file. Saves tokens + time.
-        os.environ.setdefault("KODA_DISABLE_BOOTSTRAP", "1")
+        # Evals run headless — no TUI to answer permission prompts. Pre-allow
+        # every mutating tool so the agent can edit files / run commands without
+        # hanging on a HITL interrupt that nobody will resume.
+        try:
+            from koda.tools.permissions import MUTATING_TOOLS, allow_tool
+            for tool_name in MUTATING_TOOLS:
+                allow_tool(tool_name)
+        except Exception:
+            pass  # Not all KODA versions expose the same API — harmless to skip.
 
         # Run from inside the workdir so the agent's relative paths (read_file,
-        # grep, run_shell, etc.) resolve correctly.
+        # grep, etc.) resolve correctly.
         prev_cwd = os.getcwd()
         os.chdir(workdir)
         try:
-            with redirect_stdout(captured_stdout), redirect_stderr(captured_stderr):
+            # CodingAgentAdapter.stream() is async — it yields AgentEvent
+            # objects (TextDelta, ToolStart, ToolResult, Done, ...). We collect
+            # TextDelta content into stdout and capture usage from the Done event.
 
-                async def _collect() -> str:
-                    """Consume the async stream and return concatenated text.
+            async def _collect() -> tuple[str, Any | None]:
+                from koda.agent_api import (
+                    Done, PermissionRequest, TextDelta, ToolStart, ToolResult,
+                )
 
-                    KODA's AgentEvent is a Union of dataclasses defined in
-                    ``koda.agent_api``; the one we care about is
-                    ``TextDelta(content=str)`` — *not* ``.text``. The
-                    earlier ``hasattr(event, "text")`` check silently
-                    matched nothing, so ``result_text`` was always empty
-                    and logs misleadingly said "agent produced 0 stdout
-                    chars" even when the agent ran a full multi-step turn.
-                    SWE-bench grading reads ``git diff`` from the workdir,
-                    so the patch was still captured correctly — but the
-                    captured stdout is what tells you whether the agent
-                    actually said anything.
-                    """
-                    from koda.agent_api import TextDelta
-
-                    parts: list[str] = []
+                parts: list[str] = []
+                final_usage = None
+                n_events = 0
+                try:
                     async for event in agent.stream(prompt, []):
+                        n_events += 1
+                        if n_events % 10 == 0:
+                            print(f"    [adapter] {n_events} events received…", flush=True)
                         if isinstance(event, TextDelta):
                             parts.append(event.content)
-                    return "".join(parts)
+                        elif isinstance(event, PermissionRequest):
+                            # Evals run headless — no TUI to ask the user. Auto-
+                            # approve every gated tool so the agent can edit files
+                            # and run shell commands without hanging on an
+                            # interrupt that nobody will ever resume.
+                            decisions = [
+                                {"type": "approve"}
+                                for _ in event.items
+                            ]
+                            tool_names = ", ".join(it.tool_name for it in event.items)
+                            print(
+                                f"    [adapter] auto-approve {len(decisions)} tool(s): {tool_names}",
+                                flush=True,
+                            )
+                            agent.provide_decisions(decisions)
+                        elif isinstance(event, ToolStart):
+                            print(f"    [adapter] tool: {event.name}", flush=True)
+                        elif isinstance(event, Done) and event.usage:
+                            final_usage = event.usage
+                            print(f"    [adapter] done: tokens in={final_usage.input_tokens} out={final_usage.output_tokens}", flush=True)
+                finally:
+                    # Close the aiosqlite checkpointer to prevent the non-daemon
+                    # worker thread from hanging the process on exit.
+                    if hasattr(agent, "aclose"):
+                        await agent.aclose()
+                print(f"    [adapter] stream finished: {n_events} events, {len(parts)} text deltas", flush=True)
+                return "".join(parts), final_usage
 
-                result_text = asyncio.run(_collect())
+            result_text, usage = asyncio.run(
+                asyncio.wait_for(_collect(), timeout=_EVAL_TIMEOUT_S)
+            )
         finally:
             os.chdir(prev_cwd)
 
+        usage_info: dict[str, Any] = {}
+        if usage:
+            usage_info = {
+                "input_tokens": usage.input_tokens,
+                "output_tokens": usage.output_tokens,
+            }
+
         return AgentResult(
-            stdout=captured_stdout.getvalue() + result_text,
-            stderr=captured_stderr.getvalue(),
+            stdout=result_text,
             elapsed_s=time.perf_counter() - start,
-            metadata={"mode": "import", "model": model_spec, "session_id": session_id},
+            metadata={"mode": "import", "model": model_spec, "session_id": session_id, **usage_info},
         )
 
+    except asyncio.TimeoutError:
+        # Stream exceeded EVAL_AGENT_TIMEOUT (default 600s).
+        try:
+            if hasattr(agent, "aclose"):
+                asyncio.run(agent.aclose())
+        except Exception:
+            pass
+        return AgentResult(
+            elapsed_s=time.perf_counter() - start,
+            error=f"timeout after {_EVAL_TIMEOUT_S}s",
+            metadata={"mode": "import", "model": model_spec},
+        )
     except Exception as e:
         return AgentResult(
-            stdout=captured_stdout.getvalue(),
-            stderr=captured_stderr.getvalue() + "\n" + traceback.format_exc(),
+            stderr=traceback.format_exc(),
             elapsed_s=time.perf_counter() - start,
             error=f"{type(e).__name__}: {e}",
             metadata={"mode": "import"},
         )
 
 
-# -----------------------------------------------------------------------
+# ─────────────────────────────────────────────────────────────────────────────
 # Mode B: spawn the `koda` CLI binary as a subprocess
-# -----------------------------------------------------------------------
+# ─────────────────────────────────────────────────────────────────────────────
 
 
 def _run_via_subprocess(prompt: str, workdir: Path, *, session_id: str) -> AgentResult:
-    """Invoke the koda CLI. Customize EVAL_AGENT_CMD if your entry point differs.
+    """Invoke the koda CLI in one-shot mode.
 
-    Default assumes a one-shot mode where prompt comes via stdin and the agent
-    runs in --cwd. If your CLI takes the prompt as an arg or from a flag,
-    tweak EVAL_AGENT_CMD; {prompt} and {workdir} are substituted.
+    Default command uses ``--prompt`` which reads from stdin and exits when
+    the agent finishes — no TUI. Override with ``EVAL_AGENT_CMD`` env var;
+    ``{workdir}``, ``{model}``, and ``{prompt}`` are substituted.
     """
     cmd_template = os.getenv(
         "EVAL_AGENT_CMD",
-        # CHECK: confirm `koda` is on PATH and accepts these flags. Your doc
-        # mentions `--model openai:X / --model ollama:X` so this should work.
-        "koda --cwd {workdir} --model {model} --no-tui",
+        # --prompt enables one-shot (non-TUI) mode: read prompt from stdin,
+        # stream text to stdout, exit when done. See koda/__main__.py.
+        "koda --cwd {workdir} --model {model} --prompt",
     )
     model = os.getenv("KODA_MODEL", "ollama:qwen2.5-coder:7b")
     cmd = cmd_template.format(workdir=str(workdir), model=model, prompt="").split()
@@ -185,9 +235,9 @@ def _run_via_subprocess(prompt: str, workdir: Path, *, session_id: str) -> Agent
         )
 
 
-# -----------------------------------------------------------------------
+# ─────────────────────────────────────────────────────────────────────────────
 # Dispatcher
-# -----------------------------------------------------------------------
+# ─────────────────────────────────────────────────────────────────────────────
 
 
 def run_agent(prompt: str, workdir: Path, *, session_id: str = "") -> AgentResult:

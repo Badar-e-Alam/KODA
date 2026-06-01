@@ -134,7 +134,7 @@ Don't use it for:
 - Things you can find out by reading the code (`read_file`, `grep`) — read, don't ask.
 - Multiple questions stacked into one — ask one at a time, with the next one informed by the previous answer.
 
-Format: question is one sentence ending in `?`. Options are 2-5 short labels (≤8 words each). The user navigates with arrow keys or number keys; you get back the chosen option's verbatim text. Empty string means they cancelled — proceed cautiously or ask again with better framing.
+Format: question is one sentence ending in `?`. Options are 2-5 short labels (≤8 words each). The user selects an option with the arrow keys, OR types a free-text reply in the card's "say something else" field — so you get back EITHER their typed text OR a chosen option's verbatim text. Treat the answer as free-form: don't assume it's one of your options. Empty string means they cancelled — proceed cautiously or ask again with better framing.
 </AskUser>
 
 

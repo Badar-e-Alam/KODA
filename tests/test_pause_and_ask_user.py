@@ -115,14 +115,41 @@ async def test_ask_user_arrow_then_enter() -> None:
 
 
 @pytest.mark.asyncio
-async def test_ask_user_number_key_jumps() -> None:
-    """Pressing ``2`` on a 3-option prompt selects the second option directly."""
+async def test_ask_user_free_text_overrides_options() -> None:
+    """Typing a custom reply + Enter sends that text to the agent instead of
+    a preset option (the 'say something else' field)."""
     app = KodaApp(model="test:model")
     async with app.run_test() as pilot:
         answer, cleared = await _drive_ask(
-            app, pilot, "Pick one", ["Yes", "No", "Maybe"], keys=["2"]
+            app, pilot, "Pick one", ["Yes", "No", "Maybe"],
+            keys=["h", "e", "l", "l", "o", "enter"],
         )
-        assert answer == "No"
+        assert answer == "hello"
+        assert cleared
+
+
+@pytest.mark.asyncio
+async def test_ask_user_free_text_backspace_edits() -> None:
+    """Backspace edits the free-text buffer before sending."""
+    app = KodaApp(model="test:model")
+    async with app.run_test() as pilot:
+        answer, cleared = await _drive_ask(
+            app, pilot, "Pick one", ["Yes", "No"],
+            keys=["h", "i", "x", "backspace", "enter"],
+        )
+        assert answer == "hi"
+        assert cleared
+
+
+@pytest.mark.asyncio
+async def test_ask_user_empty_text_falls_back_to_option() -> None:
+    """With nothing typed, Enter still sends the highlighted option."""
+    app = KodaApp(model="test:model")
+    async with app.run_test() as pilot:
+        answer, cleared = await _drive_ask(
+            app, pilot, "Pick one", ["Yes", "No", "Maybe"], keys=["down", "enter"]
+        )
+        assert answer == "No"  # down once → option 2
         assert cleared
 
 

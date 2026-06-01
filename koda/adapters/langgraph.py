@@ -182,24 +182,27 @@ class LangGraphAdapter(BaseAdapter):
             if state is None or not getattr(state, "next", None):
                 return
 
-            hitl_requests = _collect_hitl_requests(state)
-            if not hitl_requests:
+            interrupts = _collect_hitl_interrupts(state)
+            if not interrupts:
                 # Paused, but not on a HITL approval request we understand.
                 # Returning avoids an infinite resume loop / hang.
                 _log.warning("graph paused with no HITL interrupt; ending turn")
                 return
 
-            # Split this batch of gated calls into auto-resolved decisions
-            # (mode / session-allow) and the ones that need the human.
-            decisions, human = _plan_decisions(hitl_requests)
+            # Plan decisions PER interrupt. Parallel subagents each pause on
+            # their own interrupt, so there can be several pending at once;
+            # we collect the items needing the user across all of them.
+            #   per_interrupt: [(interrupt_id, [decision|None per action])]
+            #   human:         [(interrupt_id, slot_index, PermissionItem)]
+            per_interrupt, human = _plan_decisions(interrupts)
 
             if human:
                 loop = asyncio.get_running_loop()
                 self._pending_decision_future = loop.create_future()
                 # Surface the human-needed items to the TUI via the typed
                 # stream (the permission extractor turns this marker into a
-                # PermissionRequest). Then await the user's answers.
-                yield {_PERM_KEY: [item for _, item in human]}
+                # PermissionRequest). Then await the user's answers, in order.
+                yield {_PERM_KEY: [item for _iid, _i, item in human]}
                 try:
                     answers = await self._pending_decision_future
                 finally:
@@ -209,15 +212,28 @@ class LangGraphAdapter(BaseAdapter):
                     self._pending_decision_future = None
                 if answers is None:  # cancelled / abandoned
                     return
-                for (idx, _item), answer in zip(human, answers):
-                    decisions[idx] = answer
+                slots_by_id = dict(per_interrupt)
+                for (iid, slot_idx, _item), answer in zip(human, answers):
+                    slots_by_id[iid][slot_idx] = answer
 
             # Every slot must be filled (one decision per gated tool call) or
             # the HITL middleware raises on the count mismatch.
-            if any(d is None for d in decisions):
+            if any(d is None for _iid, slots in per_interrupt for d in slots):
                 _log.error("incomplete permission decisions; ending turn")
                 return
-            graph_input = Command(resume={"decisions": decisions})
+
+            # Resume. A single pending interrupt takes LangGraph's simple
+            # ``resume=<value>`` form; multiple pending interrupts (parallel
+            # subagents) MUST be resumed with a map keyed by interrupt id —
+            # LangGraph raises "you must specify the interrupt id when
+            # resuming" otherwise.
+            if len(per_interrupt) == 1:
+                _iid, slots = per_interrupt[0]
+                graph_input = Command(resume={"decisions": slots})
+            else:
+                graph_input = Command(resume={
+                    iid: {"decisions": slots} for iid, slots in per_interrupt
+                })
 
     def provide_decisions(self, decisions: list[dict[str, Any]] | None) -> None:
         """Deliver the user's permission decisions back to a paused turn.
@@ -294,65 +310,71 @@ def _extract_tool_end(event: dict[str, Any]) -> Iterable[AgentEvent] | None:
 
 # ── Helpers ─────────────────────────────────────────────────────────
 
-def _collect_hitl_requests(state: Any) -> list[dict[str, Any]]:
-    """Pull human-in-the-loop interrupt payloads out of a paused graph state.
+def _collect_hitl_interrupts(state: Any) -> list[tuple[str, dict[str, Any]]]:
+    """``[(interrupt_id, HITLRequest)]`` for each pending HITL interrupt.
 
     ``HumanInTheLoopMiddleware`` interrupts with a ``HITLRequest`` dict —
     ``{"action_requests": [...], "review_configs": [...]}`` — stored on the
-    pending tasks. We only keep dicts that look like that, so an unrelated
-    ``interrupt()`` from a custom tool doesn't get mistaken for an approval
-    batch.
+    pending tasks. We keep only dicts that look like that (so an unrelated
+    ``interrupt()`` from a custom tool isn't mistaken for an approval batch),
+    **and** keep each interrupt's id: parallel subagents each pause on their
+    own interrupt, and LangGraph requires resuming by id when more than one
+    is pending.
     """
-    out: list[dict[str, Any]] = []
+    out: list[tuple[str, dict[str, Any]]] = []
     for task in getattr(state, "tasks", ()) or ():
         for it in getattr(task, "interrupts", ()) or ():
             val = getattr(it, "value", None)
-            if isinstance(val, dict) and "action_requests" in val:
-                out.append(val)
+            iid = getattr(it, "id", None)
+            if iid is not None and isinstance(val, dict) and "action_requests" in val:
+                out.append((iid, val))
     return out
 
 
 def _plan_decisions(
-    hitl_requests: list[dict[str, Any]],
-) -> tuple[list[dict[str, Any] | None], list[tuple[int, PermissionItem]]]:
-    """Split one batch of gated tool calls into auto-decisions + human-needed.
+    interrupts: list[tuple[str, dict[str, Any]]],
+) -> tuple[
+    list[tuple[str, list[dict[str, Any] | None]]],
+    list[tuple[str, int, PermissionItem]],
+]:
+    """Plan resume decisions across every pending interrupt.
 
-    Returns ``(decisions, human)`` where ``decisions`` is one slot per
-    ``action_request`` in order (``None`` for slots awaiting the user) and
-    ``human`` is ``[(index, PermissionItem)]`` for the slots that need a
-    prompt. deepagents batches a model step's gated calls into one request,
-    so we handle the first and log if there were more.
+    Returns ``(per_interrupt, human)`` where:
+      * ``per_interrupt`` is ``[(interrupt_id, slots)]`` and ``slots`` has one
+        entry per ``action_request`` (``None`` for slots awaiting the user),
+      * ``human`` is ``[(interrupt_id, slot_index, PermissionItem)]`` for the
+        slots whose policy verdict is ``"ask"``.
+
+    Auto-resolves approve/reject via ``koda.tools.permissions.decide`` (mode +
+    session-allow); only the ``"ask"`` slots are surfaced to the user.
     """
-    if len(hitl_requests) > 1:
-        _log.warning("multiple HITL requests in one pause; handling the first")
-    req = hitl_requests[0]
-    action_requests = list(req.get("action_requests") or [])
-    review_configs = list(req.get("review_configs") or [])
+    per_interrupt: list[tuple[str, list[dict[str, Any] | None]]] = []
+    human: list[tuple[str, int, PermissionItem]] = []
 
-    decisions: list[dict[str, Any] | None] = [None] * len(action_requests)
-    human: list[tuple[int, PermissionItem]] = []
-
-    for i, ar in enumerate(action_requests):
-        name = ar.get("name") or "tool"
-        args = ar.get("args") or {}
-        allowed: tuple[str, ...] = ("approve", "reject")
-        if i < len(review_configs):
-            allowed = tuple(review_configs[i].get("allowed_decisions") or allowed)
-        verdict = _perms.decide(name, args)
-        if verdict == "approve":
-            decisions[i] = {"type": "approve"}
-        elif verdict == "reject":
-            decisions[i] = {"type": "reject", "message": _perms.reject_message(name)}
-        else:  # "ask" — needs the human
-            human.append(
-                (i, PermissionItem(
+    for iid, hitl in interrupts:
+        action_requests = list(hitl.get("action_requests") or [])
+        review_configs = list(hitl.get("review_configs") or [])
+        slots: list[dict[str, Any] | None] = [None] * len(action_requests)
+        for i, ar in enumerate(action_requests):
+            name = ar.get("name") or "tool"
+            args = ar.get("args") or {}
+            allowed: tuple[str, ...] = ("approve", "reject")
+            if i < len(review_configs):
+                allowed = tuple(review_configs[i].get("allowed_decisions") or allowed)
+            verdict = _perms.decide(name, args)
+            if verdict == "approve":
+                slots[i] = {"type": "approve"}
+            elif verdict == "reject":
+                slots[i] = {"type": "reject", "message": _perms.reject_message(name)}
+            else:  # "ask" — needs the human
+                human.append((iid, i, PermissionItem(
                     tool_name=name,
                     args=args if isinstance(args, dict) else {"input": args},
                     allowed_decisions=allowed,
                     description=str(ar.get("description") or ""),
-                ))
-            )
-    return decisions, human
+                )))
+        per_interrupt.append((iid, slots))
+    return per_interrupt, human
 
 
 def _history_to_langchain(history: list[dict[str, Any]]) -> list[dict[str, Any]]:
