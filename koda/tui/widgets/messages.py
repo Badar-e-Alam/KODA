@@ -262,6 +262,20 @@ class ThinkingMessage(BaseMessage):
 
     _FRAMES = ("·   ", "··  ", "··· ", " ···", "  ··", "   ·")
 
+    # Sparkle "breathing" pulse: orange shades ramp dim → bright → dim so the
+    # icon dims and brightens in a loop. Paired with a filled/outline glyph
+    # twinkle (✦/✧) for a subtle sparkle. Indexed by ``self._frame``.
+    _SPARKLE = (
+        ("#7a3a10", "☆"),
+        ("#9a4a12", "★"),
+        ("#c2410c", "★"),
+        ("#fb923c", "★"),
+        ("#ffd0a3", "★"),
+        ("#fb923c", "★"),
+        ("#c2410c", "★"),
+        ("#9a4a12", "☆"),
+    )
+
     def __init__(
         self,
         label: str = "Thinking",
@@ -293,7 +307,8 @@ class ThinkingMessage(BaseMessage):
         mins = int(elapsed) // 60
         secs = int(elapsed) % 60
         ts = f"{mins}:{secs:02d}"
-        self.update(f"[dim italic]{self._label} {ts} {frame}[/]")
+        color, glyph = self._SPARKLE[(self._frame - 1) % len(self._SPARKLE)]
+        self.update(f"[{color}]{glyph}[/] [dim italic]{self._label} {ts} {frame}[/]")
 
 
 def _format_args(args: dict[str, Any]) -> str:

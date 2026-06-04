@@ -1,0 +1,13 @@
+The CLI tool `wc_lite.py` counts words in a file. Add a new flag `--lines`
+(short form: `-l`) that makes it print the line count instead of the word count.
+
+Usage examples after your change:
+  python wc_lite.py poem.txt          # prints word count (existing behavior)
+  python wc_lite.py --lines poem.txt  # prints line count
+  python wc_lite.py -l poem.txt       # prints line count
+
+Output format must remain:
+  word count of poem.txt: 42
+  line count of poem.txt: 7
+
+Existing tests must still pass. New tests for the --lines flag are in test_cli.py.

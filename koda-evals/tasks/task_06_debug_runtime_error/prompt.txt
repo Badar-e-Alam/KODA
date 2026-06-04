@@ -1,0 +1,9 @@
+Running `python main.py` crashes with a TypeError. Diagnose the cause and fix
+it. Do not just catch the exception — fix the underlying logic so the program
+runs to completion and produces the correct output.
+
+Expected output of `python main.py`:
+  Total revenue: $245.50
+  Top customer: Alice ($120.00)
+
+Existing tests in test_analytics.py must keep passing after your fix.

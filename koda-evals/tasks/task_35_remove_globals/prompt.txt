@@ -1,0 +1,3 @@
+The `logger.py` module uses a module-level global `LOG_LEVEL` that can't be configured per-instance. Refactor to a `Logger` class where each instance has its own `level`.
+
+All tests in `test_logger.py` must pass. Keep backward compatibility by providing module-level functions that use a default instance.

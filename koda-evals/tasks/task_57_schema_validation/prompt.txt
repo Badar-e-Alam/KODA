@@ -1,0 +1,8 @@
+The `process_order(raw)` function in `orders.py` assumes the input dict has the right shape. Add validation that checks:
+
+- `raw` is a dict
+- `items` is a list of dicts, each with `name` (str) and `qty` (int > 0)
+- `customer` is a dict with `name` (str)
+- Raise `ValueError` for any violation
+
+All tests in `test_orders.py` must pass.

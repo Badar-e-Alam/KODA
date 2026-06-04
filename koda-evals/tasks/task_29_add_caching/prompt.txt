@@ -1,0 +1,9 @@
+The `fetch_user(user_id)` function in `users_api.py` always calls the expensive `_slow_lookup`. Add an in-memory LRU cache so repeated lookups for the same `user_id` are instant.
+
+Requirements:
+- Cache up to 100 entries
+- Return cached results for repeated calls
+- Thread-safe (use `threading.Lock`)
+- The cache should be stored at module level
+
+All tests in `test_users_api.py` must pass.

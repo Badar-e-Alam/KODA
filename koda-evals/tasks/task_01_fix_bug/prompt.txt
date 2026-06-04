@@ -1,0 +1,5 @@
+The `paginate(items, page, page_size)` function in `pagination.py` has a bug.
+When users request page 2, they're getting items from page 1 mixed in.
+
+Find the bug and fix it. The existing tests in `test_pagination.py` should
+all pass after your fix.

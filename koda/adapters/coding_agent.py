@@ -27,6 +27,7 @@ import logging
 from typing import Any
 
 from coding_agent.agent import build_agent
+from coding_agent.compaction import CompactionResult, compact_thread
 from coding_agent.tracing import langfuse_callbacks
 
 from koda.adapters.langgraph import LangGraphAdapter
@@ -61,6 +62,22 @@ class CodingAgentAdapter(LangGraphAdapter):
                 return
             _log.debug("building coding_agent graph for model=%s", self._model)
             self._graph = await build_agent(model=self._model)
+
+    async def compact(self) -> CompactionResult:
+        """Summarize older turns for this thread (the ``/compact`` command).
+
+        Drives the summarization engine stashed on the graph at build time
+        (``coding_agent.agent.build_agent``). Builds the graph first if the
+        first turn hasn't run yet, so ``/compact`` works even on a freshly
+        resumed session. Uses the same ``thread_id`` the streaming path does so
+        the compaction lands on the active conversation.
+        """
+        await self._ensure_graph()
+        engine = getattr(self._graph, "_koda_compact_engine", None)
+        if engine is None:
+            raise RuntimeError("This agent build does not support compaction.")
+        config = {"configurable": {"thread_id": self._thread_id}}
+        return await compact_thread(self._graph, engine, config)
 
     def _extra_callbacks(self) -> list[Any]:
         """Attach Langfuse to every turn (no-op when LANGFUSE_PUBLIC_KEY unset).

@@ -1,0 +1,3 @@
+The `query.py` module builds SQL queries with string formatting, making it vulnerable to SQL injection.
+
+Rewrite `find_user(name)` to use parameterized queries. All tests in `test_query.py` must pass.

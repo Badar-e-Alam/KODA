@@ -36,6 +36,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 import threading
 from typing import Callable, Literal
 
@@ -108,11 +109,49 @@ _session_allow: set[str] = set()
 # tools wired into ``create_deep_agent(interrupt_on=…)`` (see
 # ``coding_agent/agent.py``); every other tool (ls, read_file, glob, grep,
 # web_search, git, …) is read-only and never interrupts.
-MUTATING_TOOLS: set[str] = {"write_file", "edit_file", "multi_edit", "execute"}
+MUTATING_TOOLS: set[str] = {"write_file", "edit_file", "multi_edit", "execute", "bash_background"}
 
 # Subset of MUTATING_TOOLS that count as "file edits" — these pass through
 # silently in EDITS mode.
 FILE_EDIT_TOOLS: set[str] = {"write_file", "edit_file", "multi_edit"}
+
+# ``execute`` commands that are dangerous enough to ALWAYS prompt, even when
+# the user has session-allowed ``execute`` or is in EDITS mode. This is the
+# defense-in-depth backstop for the class of bug where a single shell call
+# walks the entire disk or destroys files: an orphaned
+# ``glob('/**/.env', recursive=True)`` once pegged a CPU for 75 minutes. The
+# session-allow escape hatch is keyed by tool *name* only (args aren't part
+# of the key), so without this a single "always allow execute" would wave
+# such a command straight through. Patterns are deliberately broad — a false
+# "ask" costs one keypress; a false "approve" can cost the machine.
+_DANGEROUS_EXECUTE_PATTERNS: tuple[re.Pattern[str], ...] = (
+    # Filesystem-root- or home-rooted walks (find / grep -r / rg / ls -R).
+    re.compile(r"\b(find|grep|rg|ls|du|chmod|chown)\b[^\n|;&]*\s(/|~|\$HOME)(\s|$)"),
+    # Python recursive walks anchored at root/home: glob('/**…'), os.walk('/'),
+    # Path('/').rglob(…), pathlib rglob from root.
+    re.compile(r"""glob\(\s*['"](/|~|\$HOME|/\*\*)"""),
+    re.compile(r"""(os\.walk|rglob)\(\s*['"]?(/|~|os\.path\.expanduser)"""),
+    re.compile(r"recursive\s*=\s*True[^\n]*['\"]/\*\*"),
+    # Root-anchored shell globs: /**/…  or  /*  walks.
+    re.compile(r"(^|\s)/\*\*?/"),
+    # Destructive classics.
+    re.compile(r"\brm\b[^\n|;&]*\s-[a-zA-Z]*[rf][a-zA-Z]*\s+(/|~|\$HOME)(\s|$)"),
+    re.compile(r"\b(mkfs|dd)\b[^\n]*\bif=|\bof=/dev/"),
+    re.compile(r">\s*/dev/[sh]d[a-z]"),
+    re.compile(r":\(\)\s*\{\s*:\s*\|\s*:\s*&\s*\}"),  # fork bomb
+)
+
+
+def is_dangerous_execute(command: str) -> bool:
+    """True if a shell command matches a known catastrophic pattern.
+
+    Matching forces an ``"ask"`` verdict regardless of session-allow / mode
+    (except PLAN, which already rejects everything). See
+    ``_DANGEROUS_EXECUTE_PATTERNS`` for the rationale.
+    """
+    if not command:
+        return False
+    return any(p.search(command) for p in _DANGEROUS_EXECUTE_PATTERNS)
 
 # The exact mapping handed to deepagents' ``interrupt_on``. Keeping it here
 # keeps the gated-tool list and the policy in one place.
@@ -174,6 +213,7 @@ def decide(tool_name: str, args: dict | None = None) -> Verdict:
     auto-resolves approve/reject and only surfaces a prompt for ``"ask"``.
 
       * ``PLAN``  → ``"reject"`` for every mutating tool (advisory-only).
+      * dangerous ``execute`` → ``"ask"`` (overrides session-allow / EDITS).
       * ``EDITS`` → ``"approve"`` for file edits; ``execute`` falls through.
       * session-allowed tool → ``"approve"``.
       * otherwise → ``"ask"``.
@@ -188,6 +228,12 @@ def decide(tool_name: str, args: dict | None = None) -> Verdict:
     mode = _current_mode
     if mode is Mode.PLAN:
         return "reject"
+    # Catastrophic shell commands always surface a prompt — the session-allow
+    # escape hatch and EDITS auto-approve must not wave a disk-wide walk or an
+    # ``rm -rf /`` straight through. Checked before those two branches.
+    if tool_name in ("execute", "bash_background") and is_dangerous_execute((args or {}).get("command", "")):
+        _log.warning("dangerous %s forced to ask: %r", tool_name, (args or {}).get("command", "")[:120])
+        return "ask"
     if mode is Mode.EDITS and tool_name in FILE_EDIT_TOOLS:
         return "approve"
     if tool_name in _session_allow:

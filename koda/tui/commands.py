@@ -77,6 +77,29 @@ async def _theme(app: "KodaApp", args: str) -> bool:
     return True
 
 
+async def _compact(app: "KodaApp", _args: str) -> bool:
+    """Summarize older messages to free up the model's context window."""
+    adapter = app._adapter
+    compact = getattr(adapter, "compact", None)
+    if adapter is None or compact is None:
+        await app.mount_message(
+            AppMessage("Compaction isn't supported by the active agent.")
+        )
+        return True
+    await app.mount_message(AppMessage("Compacting conversation…"))
+    result = await compact()
+    if result.compacted:
+        await app.mount_message(
+            AppMessage(
+                f"✓ Compacted {result.summarized_messages} message(s) into a "
+                "summary; recent turns kept intact."
+            )
+        )
+    else:
+        await app.mount_message(AppMessage(result.reason))
+    return True
+
+
 async def _usage(app: "KodaApp", _args: str) -> bool:
     sb = app._status_bar
     if sb is None:
@@ -194,6 +217,7 @@ _HELP: dict[str, tuple[Handler, str]] = {
     "clear": (_clear, "start a new chat session"),
     "model": (_model, "[provider:model] — switch model or show current"),
     "tree": (_tree, "open the session tree"),
+    "compact": (_compact, "summarize older messages to free up context"),
     "copy": (_copy, "copy the last assistant response to clipboard"),
     "theme": (_theme, "[name] — switch color theme (or list)"),
     "usage": (_usage, "show cumulative token usage"),

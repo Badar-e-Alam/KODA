@@ -1,0 +1,3 @@
+The `serialize_config(config)` function in `config.py` uses `json.dumps()` but fails when the config contains `datetime` objects or `set` instances because they aren't JSON serializable.
+
+Fix it to handle both types: `datetime` → ISO format string, `set` → list. All tests in `test_config.py` must pass.

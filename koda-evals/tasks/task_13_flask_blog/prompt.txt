@@ -1,0 +1,10 @@
+Build a Flask service in `app.py` that implements the Posts API
+described in `spec.md`. The contract tests are already written in
+`test_app.py` — make them all pass with `pytest test_app.py -q`.
+
+The application must:
+  - Expose a Flask `app` instance at module scope so tests can `from app import app`.
+  - Use in-memory storage (a module-level dict is fine; no database).
+  - Allocate IDs monotonically (never reuse an ID even after delete).
+
+Read `spec.md` and `test_app.py` first, then write `app.py` from scratch.

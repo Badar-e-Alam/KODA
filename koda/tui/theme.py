@@ -33,11 +33,11 @@ class Palette:
 #   --accent #fb923c   --accent-2 #c2410c
 #   --ok #84a86b   --err #d97474
 DARK_KODA = Palette(
-    primary="#e8e6e1",   # --fg  (banner / headings)
+    primary="#ffffff",   # --fg  (banner / headings) — pure white text
     accent="#fb923c",    # --accent  (orange highlight)
-    assistant="#e8e6e1", # --fg
+    assistant="#ffffff", # --fg  — pure white assistant/body text
     user="#84a86b",      # --ok  (green border for user msg)
-    tool="#c2410c",      # --accent-2  (deeper orange for tool headers)
+    tool="#fb923c",      # --accent  (orange for tool headers)
     tool_ok="#84a86b",   # --ok
     tool_err="#d97474",  # --err
     error="#d97474",     # --err

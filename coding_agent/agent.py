@@ -19,6 +19,10 @@ from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
 from langgraph.graph.state import CompiledStateGraph
 
 from coding_agent.backend import build_backend
+from coding_agent.compaction import (
+    build_context_editing_middleware,
+    build_manual_compaction_engine,
+)
 from coding_agent.model import resolve_model
 from coding_agent.subagents import SUBAGENTS
 from coding_agent.system_prompt_v2 import SYSTEM_PROMPT_V2
@@ -134,10 +138,26 @@ async def build_agent(
     root = Path(cwd) if cwd else Path.cwd()
     backend = build_backend(root, timeout=timeout, inherit_env=inherit_env)
     checkpointer = _build_checkpointer(root)
+    resolved_model = resolve_model(model)
+
+    # Context management (see coding_agent/compaction.py):
+    #   • ContextEditingMiddleware — always-on, Claude-Code-style clearing of
+    #     stale tool *results* once the transcript crosses a token threshold.
+    #     Layered on top of the auto-summarization middleware deepagents wires
+    #     in by default.
+    #   • A standalone summarization engine drives the manual ``/compact``
+    #     command (see ``CodingAgentAdapter.compact``); it's stashed on the
+    #     graph below rather than added to the chain.
+    extra_middleware = []
+    context_editing = build_context_editing_middleware()
+    if context_editing is not None:
+        extra_middleware.append(context_editing)
 
     graph = create_deep_agent(
-        model=resolve_model(model),
+        model=resolved_model,
         backend=backend,
+        # Additional middleware layered on top of deepagents' defaults.
+        middleware=extra_middleware,
         # Extras layered on top of the deepagents defaults (`execute`,
         # `read_file`, `write_file`, `edit_file`, `ls`, `glob`, `grep`,
         # `write_todos`, `task`). See coding_agent/tools.py.
@@ -185,6 +205,11 @@ async def build_agent(
     # without an explicit ``await conn.close()`` it pins the process
     # open after Textual unmounts (terminal appears to hang).
     graph._koda_checkpointer_conn = checkpointer.conn  # type: ignore[attr-defined]
+    # Stash the summarization engine the ``/compact`` command drives on
+    # demand (see coding_agent/compaction.compact_thread).
+    graph._koda_compact_engine = build_manual_compaction_engine(  # type: ignore[attr-defined]
+        resolved_model, backend
+    )
     return graph
 
 

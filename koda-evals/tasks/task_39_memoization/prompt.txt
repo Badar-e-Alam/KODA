@@ -1,0 +1,3 @@
+The `fib(n)` function in `fib.py` recalculates the same values repeatedly. Add memoization so it runs in O(n) time instead of exponential.
+
+All tests in `test_fib.py` must pass, including a stress test for `fib(100)`.

@@ -1,0 +1,5 @@
+Implement the function `chunk(items, size)` in `chunks.py` according to the
+docstring. The file currently has only a stub that raises NotImplementedError.
+
+The tests in `test_chunks.py` describe the full expected behavior, including
+edge cases. Make all of them pass.

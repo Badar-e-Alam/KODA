@@ -1,79 +1,128 @@
-"""Pick a frozen dev-20 split from SWE-bench Lite.
+"""Generate ``swebench/dev_split.json`` — a frozen 20% sample of SWE-bench Lite.
 
-Run ONCE, commit the resulting dev_split.json, then never re-run except to
-expand the split. Re-running with the same seed is reproducible, but the
-point of "frozen" is that you stop iterating against the same 20 once they
-become the dev set.
+Strategy: stratified by repo with a fixed seed.
 
-    python -m swebench.pick_dev_split            # writes dev_split.json
-    python -m swebench.pick_dev_split --n 30     # bigger split
-    python -m swebench.pick_dev_split --seed 7   # different sample
+  - Load all 300 SWE-bench Lite instances from HuggingFace.
+  - Group by repo.
+  - From each repo, pick ``ceil(repo_count * fraction)`` instances
+    using ``random.Random(seed).sample(...)`` — every repo gets at
+    least one instance as long as it has any instances in Lite, so the
+    resulting dev split is representative across the dataset's
+    distribution rather than dominated by alphabetically-early repos.
 
-Stratifies across repos so you don't end up with all-django (which would
-let you overfit to one codebase's idioms).
+The output file pins ``instance_ids`` so re-running the picker (or a
+teammate running it on another machine) produces the same set as long
+as the dataset and ``--seed`` / ``--fraction`` are unchanged.
+
+Run once::
+
+    python -m swebench.pick_dev_split
+
+Override sampling::
+
+    python -m swebench.pick_dev_split --fraction 0.10 --seed 7
+
+Requires ``pip install datasets``.
 """
 from __future__ import annotations
 
 import argparse
 import json
+import math
 import random
+import sys
 from collections import defaultdict
 from pathlib import Path
 
-OUT = Path(__file__).resolve().parent / "dev_split.json"
+DATASET_NAME = "princeton-nlp/SWE-bench_Lite"
+DATASET_SPLIT = "test"
+OUT_PATH = Path(__file__).resolve().parent / "dev_split.json"
 
 
-def main() -> None:
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--n", type=int, default=20, help="split size (default 20)")
-    parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--split", default="test", help="HF split name (SWE-bench Lite uses 'test')")
-    parser.add_argument("--dataset", default="princeton-nlp/SWE-bench_Lite")
-    parser.add_argument("--out", type=Path, default=OUT)
-    args = parser.parse_args()
+def _load_dataset():
+    try:
+        from datasets import load_dataset
+    except ImportError:
+        sys.exit(
+            "`datasets` not installed. Run:\n\n"
+            "    pip install datasets\n\n"
+            "then re-run `python -m swebench.pick_dev_split`."
+        )
+    return load_dataset(DATASET_NAME, split=DATASET_SPLIT)
 
-    from datasets import load_dataset
 
-    ds = load_dataset(args.dataset, split=args.split)
+def pick(fraction: float, seed: int) -> dict:
+    ds = _load_dataset()
 
+    # Group instance_ids by repo
     by_repo: dict[str, list[str]] = defaultdict(list)
     for row in ds:
         by_repo[row["repo"]].append(row["instance_id"])
 
-    rng = random.Random(args.seed)
-    repos = sorted(by_repo)
-    for r in repos:
-        by_repo[r].sort()
-        rng.shuffle(by_repo[r])
+    rng = random.Random(seed)
+    selected: list[str] = []
+    per_repo: dict[str, int] = {}
 
-    picked: list[str] = []
-    cursors = {r: 0 for r in repos}
-    while len(picked) < args.n:
-        progressed = False
-        for r in repos:
-            if len(picked) >= args.n:
-                break
-            if cursors[r] < len(by_repo[r]):
-                picked.append(by_repo[r][cursors[r]])
-                cursors[r] += 1
-                progressed = True
-        if not progressed:
-            break
+    for repo, instance_ids in sorted(by_repo.items()):
+        # Sort within-repo first so the rng draws from a deterministic
+        # order regardless of HF dataset iteration order.
+        instance_ids = sorted(instance_ids)
+        n_pick = max(1, math.ceil(len(instance_ids) * fraction))
+        n_pick = min(n_pick, len(instance_ids))
+        picked = rng.sample(instance_ids, n_pick)
+        selected.extend(sorted(picked))
+        per_repo[repo] = n_pick
 
-    payload = {
-        "dataset": args.dataset,
-        "split": args.split,
-        "seed": args.seed,
-        "n": len(picked),
-        "instance_ids": sorted(picked),
+    selected.sort()
+
+    return {
+        "dataset": DATASET_NAME,
+        "split": DATASET_SPLIT,
+        "fraction": fraction,
+        "seed": seed,
+        "n_total_in_dataset": sum(len(v) for v in by_repo.values()),
+        "n_selected": len(selected),
+        "per_repo_counts": per_repo,
+        "instance_ids": selected,
     }
-    args.out.write_text(json.dumps(payload, indent=2) + "\n")
-    print(f"wrote {len(picked)} instances → {args.out}")
-    counts: dict[str, int] = defaultdict(int)
-    for iid in picked:
-        counts[iid.split("__", 1)[0]] += 1
-    for repo, c in sorted(counts.items()):
-        print(f"  {repo}: {c}")
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    parser.add_argument(
+        "--fraction",
+        type=float,
+        default=0.20,
+        help="Fraction of each repo's instances to pick (default: 0.20 = 20%%).",
+    )
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=42,
+        help="Random seed for reproducibility (default: 42).",
+    )
+    parser.add_argument(
+        "--out",
+        type=Path,
+        default=OUT_PATH,
+        help=f"Output JSON path (default: {OUT_PATH.name} next to this script).",
+    )
+    args = parser.parse_args()
+
+    if not 0.0 < args.fraction <= 1.0:
+        sys.exit(f"--fraction must be in (0, 1], got {args.fraction}")
+
+    out = pick(args.fraction, args.seed)
+    args.out.parent.mkdir(parents=True, exist_ok=True)
+    args.out.write_text(json.dumps(out, indent=2) + "\n")
+
+    print(
+        f"wrote {args.out}: {out['n_selected']}/{out['n_total_in_dataset']} "
+        f"instances across {len(out['per_repo_counts'])} repos "
+        f"(fraction={out['fraction']}, seed={out['seed']})"
+    )
+    for repo, n in sorted(out["per_repo_counts"].items()):
+        print(f"  {repo}: {n}")
 
 
 if __name__ == "__main__":

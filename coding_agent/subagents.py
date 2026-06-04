@@ -31,6 +31,7 @@ from coding_agent.tools import (
     run_tests,
     run_type_check,
     think,
+    visual_analyze,
     web_fetch,
     web_search,
 )
@@ -158,7 +159,7 @@ SUBAGENTS: list[SubAgent] = [
             "runs mutating shell. Use for >5 reads of orientation."
         ),
         "system_prompt": EXPLORE_PROMPT,
-        "tools": [think, git, git_diff, web_fetch, web_search],
+        "tools": [think, git, git_diff, visual_analyze, web_fetch, web_search],
     },
     {
         "name": "plan",
@@ -169,7 +170,7 @@ SUBAGENTS: list[SubAgent] = [
             "committing to an approach."
         ),
         "system_prompt": PLAN_PROMPT,
-        "tools": [ask_user, think, git, git_diff, web_fetch, web_search],
+        "tools": [visual_analyze, ask_user, think, git, git_diff, web_fetch, web_search],
     },
     {
         "name": "edit",
@@ -189,6 +190,7 @@ SUBAGENTS: list[SubAgent] = [
             run_type_check,
             run_lint,
             think,
+            visual_analyze,
         ],
     },
 ]

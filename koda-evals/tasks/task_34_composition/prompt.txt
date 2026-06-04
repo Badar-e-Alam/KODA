@@ -1,0 +1,3 @@
+The `PremiumCustomer` class in `customers.py` inherits from `Customer` but only uses it for the `discount` method. Refactor to use composition instead: `PremiumCustomer` should accept a `Customer` instance and delegate discount calculations to it.
+
+The public API must remain unchanged. All tests in `test_customers.py` must pass.

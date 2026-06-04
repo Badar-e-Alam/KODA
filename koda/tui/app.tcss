@@ -10,7 +10,7 @@
  * (user=green, tool=amber, error=red) are consistent in every palette.
  */
 $user: #84a86b;
-$tool: #c2410c;
+$tool: #fb923c;
 $tool-ok: #84a86b;
 $tool-err: #d97474;
 $muted: #8a8780;

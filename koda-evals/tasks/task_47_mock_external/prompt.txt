@@ -1,0 +1,3 @@
+The `weather.py` module calls an external API that is unavailable during tests. Modify the code to accept an optional `client` parameter for dependency injection, and write tests in `test_weather.py` that pass a mock client.
+
+All tests in `test_weather.py` must pass without network access.

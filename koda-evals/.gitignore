@@ -1,0 +1,8 @@
+.env
+*.pyc
+__pycache__/
+results.json
+results.md
+.pytest_cache/
+.coverage
+*.egg-info/

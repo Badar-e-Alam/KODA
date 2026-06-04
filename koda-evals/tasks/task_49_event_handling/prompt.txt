@@ -1,0 +1,3 @@
+The `form.js` module validates a form on submit but prevents the default action incorrectly, causing the form to submit even when invalid.
+
+Fix the event handling so the form only submits when validation passes. All tests in `form.test.mjs` must pass.

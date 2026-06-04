@@ -1,0 +1,13 @@
+An integration test in `tests/test_integration.py` is failing for the
+`SAVE10` promo flow:
+
+  AssertionError: expected total 36.00 (2 * 20.00 * 0.9), got <something else>
+
+The codebase is a small inventory backend (~30 files under
+`inventory_app/`). The bug is somewhere in the call chain that goes
+from `submit_order` through `compute_total` and `apply_discount` down to
+the discount repository. It is NOT in the test — do not modify the test
+file or any file under `tests/`.
+
+Find the root cause, fix it with the minimum-possible edit, and confirm
+both tests pass with `pytest tests/test_integration.py -q`.
