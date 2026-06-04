@@ -114,6 +114,17 @@ Inside the TUI:
 - Press `Ctrl+C` to interrupt a running turn
 - Type `/quit`, `/exit`, or press `Ctrl+D` to leave
 
+### The coding agent in action
+
+<p align="center">
+  <img src="assets/koda_coding_agent_demo.gif" alt="KODA running the built-in coding agent on deepseek-v4-pro — the agent plans with a live todo list, accept-edits mode applies file writes silently, and shell commands stop at the permission gate" width="900">
+</p>
+
+> `koda --agent coding_agent --model ollama:deepseek-v4-pro` — the agent plans with a
+> **live todo list** that checks off as it works, **accept-edits** mode applies file
+> writes silently, and shell commands still stop at the **permission gate**
+> (`y` once / `a` always / `n` deny).
+
 ## Bring your own agent
 
 KODA defines a tiny 3-method contract. Anything that satisfies it works:
