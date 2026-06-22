@@ -26,8 +26,12 @@ DEFAULT_MODEL = "anthropic:claude-sonnet-4-6"
 # Default Ollama model id for a bare `kimi:` / `ollama:` spec.
 KIMI_DEFAULT_MODEL = "kimi-k2.6"
 
-# Prefixes routed through the Ollama-family resolver below.
-_OLLAMA_PREFIXES = ("kimi:", "ollama:")
+# Provider names routed through the Ollama-family resolver below. Matched
+# both as a prefix (``ollama:glm-5.1``) and as a bare spec with no model id
+# (``ollama`` / ``kimi``) — a bare spec falls back to ``KIMI_DEFAULT_MODEL``
+# rather than being passed verbatim to ``init_chat_model``, which can't infer
+# a provider from ``"ollama"`` alone and raises ValueError at graph build.
+_OLLAMA_PROVIDERS = ("kimi", "ollama")
 
 
 def _resolve_ollama_endpoint() -> tuple[str, str | None]:
@@ -84,6 +88,7 @@ def resolve_model(model: str | None) -> str | BaseChatModel:
     specs stay as strings and `create_deep_agent` handles them.
     """
     spec = model or os.environ.get("KODA_DEFAULT_MODEL") or DEFAULT_MODEL
-    if any(spec.lower().startswith(p) for p in _OLLAMA_PREFIXES):
+    head = spec.split(":", 1)[0].strip().lower()
+    if head in _OLLAMA_PROVIDERS:
         return _build_ollama_model(spec)
     return spec
