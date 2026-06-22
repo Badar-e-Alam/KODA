@@ -12,7 +12,7 @@
 </div>
 
 <p align="center">
-  <img src="assets/koda_demo.gif" alt="KODA in action — a user prompt and the agent's streamed, markdown-rendered answer, with a live status bar showing model, tokens, and mode" width="820">
+  <img src="assets/koda_demo_hero.gif" alt="KODA in action — a user prompt and the agent's streamed, markdown-rendered answer, with a live status bar showing model, tokens, and mode" width="820">
 </p>
 
 <p align="center"><sub>The KODA TUI in a live session (<code>ollama:gpt-oss:20b</code>) — type a prompt, watch the answer stream in as markdown.</sub></p>
