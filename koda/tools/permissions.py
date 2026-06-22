@@ -102,6 +102,12 @@ _current_mode: Mode = Mode.DEFAULT
 # defeats the point of the "always" escape hatch.
 _session_allow: set[str] = set()
 
+# Blanket auto-approve for unattended runs (``koda --no-tui -y`` and the eval
+# harness). When set, ``decide`` approves every gated tool — including
+# ``execute`` and the dangerous-execute backstop — because there is no human
+# to answer a prompt. Off by default; only headless callers flip it on.
+_auto_approve: bool = False
+
 
 # ── Tool classification ────────────────────────────────────────────────
 
@@ -175,6 +181,24 @@ def set_mode(mode: Mode) -> None:
     _log.info("mode → %s", mode.value)
 
 
+def set_auto_approve(on: bool) -> None:
+    """Approve every gated tool for the rest of this session.
+
+    Used by unattended entry points — ``koda --no-tui --auto-approve`` and the
+    SWE-bench eval harness — where no human can answer a permission prompt.
+    Once on, ``decide`` short-circuits to ``"approve"`` for everything
+    (overriding PLAN reject and the dangerous-execute backstop), so only flip
+    it on when the working tree is disposable (a one-shot run or a throwaway
+    clone)."""
+    global _auto_approve
+    _auto_approve = on
+    _log.info("auto-approve → %s", on)
+
+
+def is_auto_approve() -> bool:
+    return _auto_approve
+
+
 def allow_tool(tool_name: str) -> None:
     """Add a tool to the session allow-list. Subsequent calls auto-approve."""
     _session_allow.add(tool_name)
@@ -188,7 +212,9 @@ def is_allowed(tool_name: str) -> bool:
 def clear_session_allow() -> None:
     """Reset the session allow-list. Called on /clear so a new chat starts
     from a clean permission slate."""
+    global _auto_approve
     _session_allow.clear()
+    _auto_approve = False
 
 
 def reject_message(tool_name: str) -> str:
@@ -223,6 +249,11 @@ def decide(tool_name: str, args: dict | None = None) -> Verdict:
     wedge on an unexpected interrupt.
     """
     if tool_name not in MUTATING_TOOLS:
+        return "approve"
+
+    # Unattended runs approve everything — checked before PLAN and the
+    # dangerous-execute backstop, since neither has a human to fall back on.
+    if _auto_approve:
         return "approve"
 
     mode = _current_mode
