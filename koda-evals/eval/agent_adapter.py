@@ -59,6 +59,45 @@ class AgentResult:
 # -----------------------------------------------------------------------
 
 
+def _enable_yolo_permissions() -> str:
+    """Auto-approve every gated tool so the agent never blocks on a prompt.
+
+    KODA's permission gate (``koda.tools.permissions``) returns ``"ask"`` for
+    mutating tools (``edit_file``, ``execute``, …) unless the user is driving
+    the TUI. In a headless eval there is no human to answer, so the graph
+    emits a ``PermissionRequest`` and blocks until ``EVAL_AGENT_TIMEOUT`` —
+    every instance then dies with an empty patch. SWE-bench runs in disposable
+    tempdir clones, so blanket-approval (true "YOLO") is both safe and the
+    documented intent. We force ``decide`` to always approve, which also
+    covers the dangerous-execute backstop (repo-rooted ``grep -r`` etc. that
+    SWE-bench agents legitimately run).
+
+    Returns a short status string for logging. Best-effort: if the internal
+    API ever moves, we log and let the run proceed rather than abort.
+    """
+    try:
+        from koda.tools import permissions as _perms
+
+        _perms.set_auto_approve(True)
+        return "auto-approve on"
+    except AttributeError:
+        # Older KODA without set_auto_approve — fall back to the previous
+        # belt-and-braces monkeypatch so the eval still runs against it.
+        try:
+            from koda.tools import permissions as _perms
+            from koda.tui.modes import Mode
+
+            _perms.set_mode(Mode.EDITS)
+            for tool in _perms.MUTATING_TOOLS:
+                _perms.allow_tool(tool)
+            _perms.decide = lambda tool_name, args=None: "approve"  # type: ignore[assignment]
+            return "yolo fallback: decide→approve"
+        except Exception as e:  # pragma: no cover - defensive
+            return f"yolo setup failed ({type(e).__name__}: {e})"
+    except Exception as e:  # pragma: no cover - defensive
+        return f"yolo setup failed ({type(e).__name__}: {e})"
+
+
 def _run_via_import(prompt: str, workdir: Path, *, session_id: str) -> AgentResult:
     start = time.perf_counter()
     captured_stdout, captured_stderr = StringIO(), StringIO()
@@ -69,6 +108,9 @@ def _run_via_import(prompt: str, workdir: Path, *, session_id: str) -> AgentResu
 
         mod = importlib.import_module(_KODA_IMPORT_PATH)
         AgentCls = getattr(mod, _KODA_CLASS_NAME)
+
+        yolo_status = _enable_yolo_permissions()
+        print(f"    [adapter] permissions: {yolo_status}", flush=True)
 
         # CodingAgentAdapter(model=...) -- model spec routed via BaseAdapter
         model_spec = os.getenv("KODA_MODEL", "ollama:qwen2.5-coder:7b")
@@ -100,15 +142,32 @@ def _run_via_import(prompt: str, workdir: Path, *, session_id: str) -> AgentResu
                     captured stdout is what tells you whether the agent
                     actually said anything.
                     """
-                    from koda.agent_api import TextDelta
+                    from koda.agent_api import TextDelta, ToolResult
 
                     parts: list[str] = []
+                    n_events = 0
                     async for event in agent.stream(prompt, []):
+                        n_events += 1
+                        if n_events % 20 == 0:
+                            print(f"    [adapter] {n_events} events received…", flush=True)
                         if isinstance(event, TextDelta):
                             parts.append(event.content)
+                        # BaseAdapter.stream swallows build/runtime exceptions and
+                        # emits them as a synthetic error ToolResult, then ends the
+                        # stream cleanly. Without this, a failed run (e.g. an
+                        # unroutable model spec) reads as "empty patch, no error".
+                        elif isinstance(event, ToolResult) and getattr(
+                            event, "tool_id", None
+                        ) == "adapter_error":
+                            raise RuntimeError(getattr(event, "output", "adapter error"))
+                    print(f"    [adapter] stream finished: {n_events} events, "
+                          f"{len(parts)} text deltas", flush=True)
                     return "".join(parts)
 
-                result_text = asyncio.run(_collect())
+                timeout_s = int(os.getenv("EVAL_AGENT_TIMEOUT", "900"))
+                result_text = asyncio.run(
+                    asyncio.wait_for(_collect(), timeout=timeout_s)
+                )
         finally:
             os.chdir(prev_cwd)
 

@@ -37,10 +37,12 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -66,10 +68,20 @@ class Prediction:
     session_id: str
 
 
+def _hf_token() -> str | None:
+    """HuggingFace token read from the env (populated from .env by
+    :func:`_load_env`). Accepts the ``HUGGING_FACE_HUB_TOKEN`` alias that some
+    tooling uses. Returns ``None`` when unset/blank so anonymous (rate-limited)
+    access still works."""
+    tok = os.getenv("HF_TOKEN") or os.getenv("HUGGING_FACE_HUB_TOKEN")
+    tok = (tok or "").strip()
+    return tok or None
+
+
 def _load_instances(args: argparse.Namespace) -> list[dict]:
     from datasets import load_dataset
 
-    ds = load_dataset(DATASET_NAME, split=DATASET_SPLIT)
+    ds = load_dataset(DATASET_NAME, split=DATASET_SPLIT, token=_hf_token())
 
     if args.instance:
         rows = [r for r in ds if r["instance_id"] == args.instance]
@@ -80,12 +92,13 @@ def _load_instances(args: argparse.Namespace) -> list[dict]:
     if args.split == "full":
         return list(ds)
 
-    if not DEV_SPLIT_PATH.exists():
+    split_path = args.split_file or DEV_SPLIT_PATH
+    if not split_path.exists():
         sys.exit(
-            f"{DEV_SPLIT_PATH} not found. Run `python -m swebench.pick_dev_split` "
-            "once to generate the frozen dev-20 split."
+            f"{split_path} not found. Run `python -m swebench.pick_dev_split` "
+            "once to generate it."
         )
-    wanted = set(json.loads(DEV_SPLIT_PATH.read_text())["instance_ids"])
+    wanted = set(json.loads(split_path.read_text())["instance_ids"])
     rows = [r for r in ds if r["instance_id"] in wanted]
     missing = wanted - {r["instance_id"] for r in rows}
     if missing:
@@ -184,34 +197,138 @@ def _grade(predictions_path: Path, instances: list[dict], run_id: str) -> dict:
 
     instance_ids = [r["instance_id"] for r in instances]
     print(f"\n[swebench] grading {len(instance_ids)} instance(s) via Docker harness…")
+    # swebench ≥3 added required positional args (namespace, rewrite_reports,
+    # modal). namespace=None forces *local* image builds — required on arm64
+    # (Apple Silicon), where the published x86 `swebench/*` images don't run.
+    # Override via SWEBENCH_NAMESPACE=swebench on x86 hosts to pull prebuilt
+    # images instead. Passed as kwargs so the call survives further reordering.
+    eval_kwargs = dict(
+        dataset_name=DATASET_NAME,
+        split=DATASET_SPLIT,
+        instance_ids=instance_ids,
+        predictions_path=str(predictions_path),
+        max_workers=int(os.getenv("SWEBENCH_MAX_WORKERS", "4")),
+        force_rebuild=False,
+        cache_level="env",
+        clean=False,
+        open_file_limit=4096,
+        run_id=run_id,
+        timeout=int(os.getenv("SWEBENCH_TIMEOUT", "1800")),
+        namespace=os.getenv("SWEBENCH_NAMESPACE") or None,
+        rewrite_reports=False,
+        modal=False,
+    )
     try:
-        run_eval(
-            dataset_name=DATASET_NAME,
-            split=DATASET_SPLIT,
-            instance_ids=instance_ids,
-            predictions_path=str(predictions_path),
-            max_workers=int(os.getenv("SWEBENCH_MAX_WORKERS", "4")),
-            force_rebuild=False,
-            cache_level="env",
-            clean=False,
-            open_file_limit=4096,
-            run_id=run_id,
-            timeout=int(os.getenv("SWEBENCH_TIMEOUT", "1800")),
-        )
+        run_eval(**eval_kwargs)
     except TypeError:
-        # Older swebench versions have a slightly different signature.
-        run_eval(
-            dataset_name=DATASET_NAME,
-            split=DATASET_SPLIT,
-            instance_ids=instance_ids,
-            predictions_path=str(predictions_path),
-            run_id=run_id,
-        )
+        # Older swebench versions lack the newer args — retry with the subset
+        # they accept, dropping any kwargs their signature doesn't declare.
+        import inspect
+        accepted = set(inspect.signature(run_eval).parameters)
+        run_eval(**{k: v for k, v in eval_kwargs.items() if k in accepted})
 
-    report_path = Path(f"{run_id}.{predictions_path.stem}.json")
-    if report_path.exists():
-        return {"graded": True, "report": json.loads(report_path.read_text())}
-    return {"graded": True, "report": None, "note": f"no {report_path}"}
+    # SWE-bench writes reports with varying name patterns depending on version.
+    # Try the most common ones in order.
+    candidate_paths = [
+        Path(f"{_model_slug(model)}.{run_id}.json"),
+        Path(f"{run_id}.{predictions_path.stem}.json"),
+    ]
+    for report_path in candidate_paths:
+        if report_path.exists():
+            return {"graded": True, "report": json.loads(report_path.read_text())}
+    return {"graded": True, "report": None, "note": f"no {candidate_paths[0]} or {candidate_paths[1]}"}
+
+
+def _resolve_fraction_split(fraction: float, seed: int) -> Path:
+    """Map ``--fraction 0.10`` to ``swebench/dev10_split.json``, generating it
+    via :mod:`swebench.pick_dev_split` (stratified by repo, seeded) when it
+    doesn't exist yet. Existing files are reused so repeat runs stay
+    comparable."""
+    if not 0.0 < fraction <= 1.0:
+        sys.exit(f"--fraction must be in (0, 1], got {fraction}")
+    pct = f"{fraction * 100:g}".replace(".", "p")  # 0.10→10, 0.05→5, 0.125→12p5
+    suffix = f"-seed{seed}" if seed != 42 else ""
+    path = ROOT / "swebench" / f"dev{pct}{suffix}_split.json"
+    if path.exists():
+        print(f"[swebench] reusing split {path.name}")
+        return path
+    from swebench.pick_dev_split import pick
+    out = pick(fraction, seed)
+    path.write_text(json.dumps(out, indent=2) + "\n")
+    print(f"[swebench] generated {path.name}: {out['n_selected']} instances "
+          f"(fraction={fraction}, seed={seed})")
+    return path
+
+
+def _model_slug(model: str) -> str:
+    """Filesystem/Langfuse-safe slug for a model spec like ``kimi:kimi-k2.6``."""
+    return re.sub(r"[^A-Za-z0-9._-]+", "-", model).strip("-")
+
+
+def _with_slug(path: Path, slug: str) -> Path:
+    """predictions.jsonl + kimi-k2.6 → predictions.kimi-k2.6.jsonl"""
+    return path.with_name(f"{path.stem}.{slug}{path.suffix}")
+
+
+def _relay_output(slug: str, proc: subprocess.Popen) -> None:
+    for line in proc.stdout:  # type: ignore[union-attr]
+        print(f"[{slug}] {line}", end="", flush=True)
+
+
+def _run_multi(args: argparse.Namespace, models: list[str]) -> None:
+    """Fan out one child runner per model, in parallel.
+
+    Per-model subprocesses are mandatory, not a convenience: the import-mode
+    adapter ``os.chdir``s into each instance's workdir and model selection
+    rides on the process-global ``KODA_MODEL`` env var, so two models in one
+    process would trample each other. Each child gets its own predictions /
+    report / Langfuse run name so nothing collides on disk either.
+    """
+    base_run = args.run_name or f"multi-{time.strftime('%Y%m%d-%H%M%S')}"
+    procs: list[tuple[str, subprocess.Popen]] = []
+    threads: list[threading.Thread] = []
+
+    for model in models:
+        slug = _model_slug(model)
+        cmd = [
+            sys.executable, "-u", "-m", "eval.swebench_runner",
+            "--model", model,
+            "--predictions", str(_with_slug(args.predictions, slug)),
+            "--report-json", str(_with_slug(args.report_json, slug)),
+            "--run-name", f"{base_run}-{slug}",
+        ]
+        if args.instance:
+            cmd += ["--instance", args.instance]
+        else:
+            cmd += ["--split", args.split]
+            if args.split_file:
+                cmd += ["--split-file", str(args.split_file)]
+        if args.no_grade:
+            cmd.append("--no-grade")
+        if args.grade_only:
+            cmd.append("--grade-only")
+        if args.timeout is not None:
+            cmd += ["--timeout", str(args.timeout)]
+
+        proc = subprocess.Popen(
+            cmd, cwd=str(ROOT), stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT, text=True,
+            encoding="utf-8", errors="replace",
+        )
+        t = threading.Thread(target=_relay_output, args=(slug, proc), daemon=True)
+        t.start()
+        procs.append((slug, proc))
+        threads.append(t)
+        print(f"[multi] launched {model} (pid {proc.pid}) → "
+              f"{_with_slug(args.predictions, slug)}")
+
+    codes = {slug: proc.wait() for slug, proc in procs}
+    for t in threads:
+        t.join(timeout=5)
+    print("\n[multi] all runs finished:")
+    for slug, code in codes.items():
+        print(f"  {slug}: exit {code}")
+    sys.exit(max(codes.values()) if codes else 0)
 
 
 def _force_utf8_stdio() -> None:
@@ -238,6 +355,16 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--split", choices=["dev", "full"], default="dev",
                         help="dev = swebench/dev_split.json (default); full = all SWE-bench Lite")
+    parser.add_argument("--split-file", type=Path,
+                        help="path to an alternate split JSON (e.g. swebench/dev10_split.json); "
+                             "implies --split dev semantics")
+    parser.add_argument("--fraction", type=float,
+                        help="stratified sample fraction of SWE-bench Lite (e.g. 0.10 = ~30 "
+                             "instances). Generates swebench/dev<pct>_split.json on first use "
+                             "and reuses it afterwards. Overrides --split/--split-file.")
+    parser.add_argument("--seed", type=int, default=42,
+                        help="seed for --fraction sampling (default: 42 — keep it for "
+                             "comparable runs)")
     parser.add_argument("--instance", help="run a single instance_id and ignore --split")
     parser.add_argument("--run-name", help="Langfuse run name (default: auto)")
     parser.add_argument("--no-grade", action="store_true",
@@ -251,9 +378,50 @@ def main() -> None:
         help="Model spec like 'kimi:kimi-k2.6' or 'anthropic:claude-sonnet-4-6'. "
              "Overrides $KODA_MODEL. Default: $KODA_MODEL or ollama:qwen2.5-coder:7b.",
     )
+    parser.add_argument(
+        "--models",
+        help="Comma-separated model specs — run 1, 2, 3 or more, e.g. "
+             "'kimi:kimi-k2.6' (single) or 'kimi:kimi-k2.6,ollama:minimax-m3' "
+             "(two). Each model runs as its own parallel subprocess with "
+             "per-model predictions/report files. Mutually exclusive with --model.",
+    )
+    parser.add_argument(
+        "--timeout", type=int,
+        help="Per-instance agent timeout in seconds (the threshold an instance "
+             "is given before it's abandoned with an empty patch). Overrides "
+             "$EVAL_AGENT_TIMEOUT. Default: 600.",
+    )
     args = parser.parse_args()
 
-    load_dotenv()
+    # Load koda-evals/.env explicitly so the keys (HF_TOKEN, Ollama, Langfuse)
+    # are found no matter which directory the runner is launched from — not
+    # just when CWD happens to be koda-evals.
+    load_dotenv(ROOT / ".env")
+
+    # Normalise the HuggingFace token across the two names tooling looks for,
+    # so `datasets`/`huggingface_hub` pick it up (silences the "unauthenticated
+    # requests to the HF Hub" warning and dodges anonymous rate limits). Child
+    # subprocesses (--models) inherit it via the environment.
+    if _hf_token():
+        os.environ["HF_TOKEN"] = _hf_token()
+        os.environ["HUGGING_FACE_HUB_TOKEN"] = _hf_token()
+
+    # CLI threshold wins over .env; export so child subprocesses (--models) and
+    # the in-process adapter (reads $EVAL_AGENT_TIMEOUT) both see it.
+    if args.timeout is not None:
+        os.environ["EVAL_AGENT_TIMEOUT"] = str(args.timeout)
+
+    if args.fraction is not None:
+        args.split_file = _resolve_fraction_split(args.fraction, args.seed)
+
+    if args.models:
+        if args.model:
+            sys.exit("use either --model or --models, not both")
+        models = [m.strip() for m in args.models.split(",") if m.strip()]
+        if not models:
+            sys.exit("--models given but no model specs parsed")
+        _run_multi(args, models)
+        return  # _run_multi sys.exits; belt and braces
     # CLI flag wins over env, env wins over the historical default. The flag
     # is exported so eval.agent_adapter._run_via_import (which reads KODA_MODEL
     # at adapter-construction time inside _collect) sees the same value.
@@ -266,8 +434,13 @@ def main() -> None:
         print(f"[langfuse] run: {reporter.run_name}")
 
     instances = _load_instances(args)
-    print(f"[swebench] {len(instances)} instance(s) selected from "
-          f"{'dev-20' if args.split == 'dev' and not args.instance else args.split}")
+    if args.instance:
+        split_label = "single"
+    elif args.split_file:
+        split_label = args.split_file.name
+    else:
+        split_label = "dev-20" if args.split == "dev" else args.split
+    print(f"[swebench] {len(instances)} instance(s) selected from {split_label}")
 
     if not args.grade_only:
         preds = [infer_one(r, reporter, model) for r in instances]

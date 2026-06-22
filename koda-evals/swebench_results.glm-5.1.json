@@ -1,0 +1,12 @@
+{
+  "run_name": "local-b11d9b9d",
+  "model": "ollama:glm-5.1",
+  "split": "dev",
+  "n_instances": 22,
+  "predictions_path": "predictions.glm-5.1.jsonl",
+  "grading": {
+    "graded": true,
+    "report": null,
+    "note": "no local-b11d9b9d.predictions.glm-5.1.json"
+  }
+}
