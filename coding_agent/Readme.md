@@ -19,11 +19,11 @@ Coding agent built on deepagent SDK. **Working.**
 
 - [x] Agent integrated, tools added
 - [x] Loop (the agent is missing an outer control loop
-- [ ] Proactive action for the prompt
-- [ ] Human-in-the-loop
-- [ ] Plan mode
-- [ ] Edit mode
-- [ ] Auto-fly mode (accept all changes)
+- [x] Proactive action for the prompt
+- [x] Human-in-the-loop
+- [x] Plan mode
+- [x] Edit mode
+- [x] Auto-fly mode (accept all changes)
 - [ ] Code execution Docker environment
 - [ ] Mature the compaction
 - [ ] Mature the subagent

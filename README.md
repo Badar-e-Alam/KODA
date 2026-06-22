@@ -12,8 +12,10 @@
 </div>
 
 <p align="center">
-  <img src="assets/koda_demo.gif" alt="KODA in action — banner, user prompt, streamed web_search + read_webpage tool calls, agent answer, live status bar" width="900">
+  <img src="assets/koda_demo.gif" alt="KODA in action — a user prompt and the agent's streamed, markdown-rendered answer, with a live status bar showing model, tokens, and mode" width="820">
 </p>
+
+<p align="center"><sub>The KODA TUI in a live session (<code>ollama:gpt-oss:20b</code>) — type a prompt, watch the answer stream in as markdown.</sub></p>
 
 ---
 
@@ -30,6 +32,7 @@ implements a 3-method protocol.
 
 - [Why KODA](#why-koda)
 - [Features](#features)
+- [Built-in agents](#built-in-agents)
 - [Install](#install)
 - [Quick start](#quick-start)
 - [Bring your own agent](#bring-your-own-agent)
@@ -67,7 +70,7 @@ else is pluggable.
 |------|--------------|
 | **TUI** | Textual-based terminal UI with slash-command menu, `@`-file autocomplete, thinking indicator, live tool-call rendering, and a resizable session sidebar |
 | **Sessions** | JSONL session tree with **in-place branching** (`/tree`), sidebar for switch/delete/restore, auto-generated markdown transcripts |
-| **Agents** | Built-in `deep` backend (deepagents + LangGraph) — or plug in your own with `--agent mypkg.build` |
+| **Agents** | Two built-in agents — the **[KODA Coding Agent](coding_agent/)** (default) and a lightweight **deep** loop — or plug in your own with `--agent mypkg.build` |
 | **Models** | Anthropic · OpenAI · Google · Ollama · LM Studio · any OpenAI-compatible endpoint. Model discovery cached (24h TTL) for instant `/model` switching |
 | **Tools** | Jailed filesystem (`read_file`, `write_file`, `edit_file`, `ls`, `glob`, `grep`) + shell + Jina-backed web search/read (SSRF-hardened) |
 | **Skills** | Drop a `SKILL.md` in `agent_workspace/skills/<name>/` — the agent auto-discovers and uses it |
@@ -75,6 +78,45 @@ else is pluggable.
 | **Shell escape** | `!command` runs a shell command directly, bypassing the agent |
 | **Extensible** | `KodaAgent` Protocol is ~30 lines. Reference adapters for LangGraph, raw Anthropic SDK, and HTTP/SSE are shipped in `examples/` |
 | **Cross-platform** | Tested on Linux, macOS, Windows (CI matrix: Python 3.11 / 3.12 / 3.13) |
+
+## Built-in agents
+
+KODA is the front-end — the agent behind it is pluggable. Two agents ship in
+the box, and anything implementing the [3-method protocol](#bring-your-own-agent)
+drops in with one flag.
+
+<table>
+<tr>
+<td width="50%" valign="top">
+
+### 🛠️ KODA Coding Agent · `default`
+
+Long-horizon coding — multi-file refactors, end-to-end features, and debugging
+that spans a codebase. Plan / accept-edits modes, subagents, context
+compaction, and a permission gate on every shell command.
+
+**[→ Open the KODA Coding Agent](coding_agent/)**
+
+</td>
+<td width="50%" valign="top">
+
+### 💬 deep · `--agent deep`
+
+A lightweight deepagents + LangGraph chat-and-tools loop. A clean starting
+point for your own agent, or quick Q&A with the filesystem + web tools.
+
+**[→ Bring your own agent](#bring-your-own-agent)**
+
+</td>
+</tr>
+</table>
+
+<p align="center">
+  <a href="coding_agent/">
+    <img src="assets/koda_coding_agent_demo.gif" alt="The KODA Coding Agent running in the TUI on deepseek-v4-pro — live todo-list planning, accept-edits mode applying file writes silently, and the shell permission gate" width="820">
+  </a>
+</p>
+<p align="center"><sub><b><a href="coding_agent/">▶ The KODA Coding Agent in action</a></b> — click to open <code>coding_agent/</code></sub></p>
 
 ## Install
 
@@ -114,16 +156,8 @@ Inside the TUI:
 - Press `Ctrl+C` to interrupt a running turn
 - Type `/quit`, `/exit`, or press `Ctrl+D` to leave
 
-### The coding agent in action
-
-<p align="center">
-  <img src="assets/koda_coding_agent_demo.gif" alt="KODA running the built-in coding agent on deepseek-v4-pro — the agent plans with a live todo list, accept-edits mode applies file writes silently, and shell commands stop at the permission gate" width="900">
-</p>
-
-> `koda --agent coding_agent --model ollama:deepseek-v4-pro` — the agent plans with a
-> **live todo list** that checks off as it works, **accept-edits** mode applies file
-> writes silently, and shell commands still stop at the **permission gate**
-> (`y` once / `a` always / `n` deny).
+> Want the flagship coding agent? It's the default — see
+> [**Built-in agents**](#built-in-agents) and [`coding_agent/`](coding_agent/).
 
 ## Bring your own agent
 
@@ -198,12 +232,17 @@ koda/
   agent_api.py             KodaAgent Protocol + AgentEvent union
   tui/app.py               Main Textual application
   tui/stream.py            Event-stream rendering
+  adapters/coding_agent.py Wires the default KODA Coding Agent into the TUI
   adapters/deep.py         Built-in deepagents/LangGraph factory
   adapters/langgraph.py    LangGraph graph → KodaAgent wrapper
   adapters/anthropic.py    Reference raw-SDK adapter
   session.py               JSONL session tree with branching
   tools/fs.py              Jailed filesystem + shell tools
   tools/web.py             Jina-backed search/read (SSRF-guarded)
+coding_agent/              Default agent — long-horizon coding (see its README)
+  agent.py                 deepagents/LangGraph factory + checkpointer
+  tools.py                 Extra @tool registry (todo, subagents, …)
+  ARCHITECTURE.md          Design walkthrough of the agent package
 examples/
   deepagents_backend.py    Minimal BYOA example
   fastapi_agent.py         HTTP/SSE service example
