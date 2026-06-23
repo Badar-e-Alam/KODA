@@ -115,16 +115,27 @@ def probe_provider(provider: str, timeout: float = 1.5) -> tuple[bool, str | Non
     candidates: list[tuple[str, dict[str, str]]] = []
 
     if provider == "ollama":
-        host = os.environ.get("OLLAMA_HOST") or os.environ.get("OLLAMA_BASE_URL")
-        if host:
-            base = host if host.startswith("http") else f"http://{host}"
-            candidates.append((f"{base.rstrip('/')}/api/tags", {}))
-        candidates.append((default_url, {}))
+        # When an API key is configured, probe Ollama Cloud directly and
+        # skip the local daemon entirely. Localhost is only probed when the
+        # user explicitly points to it via OLLAMA_HOST / OLLAMA_BASE_URL.
         if key := os.environ.get("OLLAMA_API_KEY"):
+            cloud_host = os.environ.get("OLLAMA_CLOUD_HOST", "https://ollama.com")
             candidates.append((
-                "https://ollama.com/api/tags",
+                f"{cloud_host.rstrip('/')}/v1/models",
                 {"Authorization": f"Bearer {key}"},
             ))
+        else:
+            host = os.environ.get("OLLAMA_HOST") or os.environ.get("OLLAMA_BASE_URL")
+            if host:
+                base = host if host.startswith("http") else f"http://{host}"
+                candidates.append((f"{base.rstrip('/')}/api/tags", {}))
+            else:
+                # No API key and no explicit host — don't fall back to
+                # localhost. Report that Ollama is not configured.
+                return False, (
+                    "Ollama is not configured. Set OLLAMA_API_KEY for Ollama "
+                    "Cloud, or set OLLAMA_HOST / OLLAMA_BASE_URL for a custom endpoint."
+                )
     else:
         candidates.append((default_url, {}))
 
