@@ -122,6 +122,20 @@ point for your own agent, or quick Q&A with the filesystem + web tools.
 
 **Requirements:** Python **3.11+**
 
+### One-liner (recommended)
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/Badar-e-Alam/KODA/main/install.sh | sh
+```
+
+The installer clones KODA into `~/.koda`, builds an isolated venv, installs the
+`koda` command on your PATH, and prompts for your **Ollama API key** (`OLLAMA_API_KEY`).
+It auto-detects a local Ollama daemon at `localhost:11434` (no key needed) and
+falls back to [Ollama Cloud](https://ollama.com) when a key is present. Works on
+macOS and Linux; on Windows use WSL or Git Bash.
+
+### Manual
+
 ```bash
 # Clone and install in editable mode with your preferred provider(s)
 git clone https://github.com/Badar-e-Alam/KODA.git
