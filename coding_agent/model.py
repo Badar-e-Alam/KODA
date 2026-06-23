@@ -44,7 +44,7 @@ def _resolve_ollama_endpoint() -> tuple[str, str | None]:
       2. `OLLAMA_HOST` — coerced to a URL (adds `http://` if missing).
       3. `OLLAMA_API_KEY` set with no host → Ollama Cloud at
          `https://ollama.com/v1` (OpenAI-shaped).
-      4. Otherwise → local Ollama daemon at `http://localhost:11434`.
+      4. Otherwise → raises ``ValueError`` (local Ollama daemon is not used).
     """
     api_key = os.environ.get("OLLAMA_API_KEY")
     explicit = os.environ.get("OLLAMA_BASE_URL")
@@ -57,7 +57,10 @@ def _resolve_ollama_endpoint() -> tuple[str, str | None]:
         return host, api_key
     if api_key:
         return "https://ollama.com/v1", api_key
-    return "http://localhost:11434", None
+    raise ValueError(
+        "Ollama is not configured. Set OLLAMA_API_KEY for Ollama Cloud, "
+        "or set OLLAMA_HOST / OLLAMA_BASE_URL for a custom endpoint."
+    )
 
 
 def _build_ollama_model(spec: str) -> BaseChatModel:
