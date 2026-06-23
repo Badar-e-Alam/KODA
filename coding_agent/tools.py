@@ -226,7 +226,7 @@ def _resolve_ollama_host() -> str:
     2. ``OLLAMA_HOST`` — explicit host (protocol-prefixed if bare).
     3. ``OLLAMA_API_KEY`` present — Ollama Cloud via ``OLLAMA_CLOUD_HOST``
        (defaults to ``https://api.ollama.com`` if not set).
-    4. Default — local Ollama at ``http://localhost:11434``.
+    4. Otherwise raises ``RuntimeError`` (local Ollama daemon is not used).
 
     Reuses the same resolution logic as ``coding_agent.model`` so the
     tool and the agent talk to the same endpoint.
@@ -244,7 +244,10 @@ def _resolve_ollama_host() -> str:
         if not cloud_host.startswith(("http://", "https://")):
             cloud_host = f"https://{cloud_host}"
         return cloud_host.rstrip("/")
-    return "http://localhost:11434"
+    raise RuntimeError(
+        "Ollama is not configured. Set OLLAMA_API_KEY for Ollama Cloud, "
+        "or set OLLAMA_HOST / OLLAMA_BASE_URL for a custom endpoint."
+    )
 
 
 @tool
@@ -262,13 +265,13 @@ def visual_analyze(
     model: str | None = None,
     max_tokens: int = 4096,
 ) -> str:
-    """Analyze an image using a vision model via Ollama or Ollama Cloud.
+    """Analyze an image using a vision model via Ollama Cloud or a custom endpoint.
 
     Sends an image file to a multimodal model and returns the model's
     analysis.  When ``OLLAMA_API_KEY`` is set the tool connects to
     **Ollama Cloud** (``https://api.ollama.com``) and defaults to
-    ``gemma4:31b``; otherwise it falls back to a local Ollama instance
-    with the ``gemma3:4b`` default.
+    ``gemma4:31b``.  For a custom Ollama endpoint, set ``OLLAMA_HOST`` or
+    ``OLLAMA_BASE_URL`` and pass the model tag explicitly.
 
     Useful for understanding screenshots, UI mockups, diagrams, charts,
     or any visual content the agent cannot read as text.
@@ -284,8 +287,8 @@ def visual_analyze(
             - ``"Extract all text visible in this image"`` for OCR-like tasks
             Default is a general description prompt.
         model: Ollama model tag to use.  Defaults to ``gemma4:31b`` when
-            using Ollama Cloud (``OLLAMA_API_KEY`` set), or ``gemma3:4b``
-            when using local Ollama.  Override to use a different variant.
+            using Ollama Cloud (``OLLAMA_API_KEY`` set).  Required when
+            using a custom Ollama endpoint.
         max_tokens: Maximum response tokens. Default 4096.
 
     Returns:
@@ -314,10 +317,18 @@ def visual_analyze(
     if len(raw) < 16:
         return "[error] file is too small to be a valid image"
 
-    # Determine endpoint and default model..
+    # Determine endpoint and default model.
     host = _resolve_ollama_host()
     is_cloud = host.startswith("https://api.ollama.com")
-    resolved_model = model or ("gemma4:31b" if is_cloud else "gemma3:4b")
+    if is_cloud:
+        resolved_model = model or "gemma4:31b"
+    else:
+        if not model:
+            return (
+                "[error] no model specified for custom Ollama endpoint; "
+                "pass `model` explicitly."
+            )
+        resolved_model = model
 
     # For cloud, images must be base64-encoded (server can't read local files).
     # For local Ollama, pass the file path directly.
