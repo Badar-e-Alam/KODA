@@ -64,7 +64,7 @@ def _default_model() -> str:
         # Cloud-only fallback. ``gpt-oss:20b`` is small + fast + present
         # in the Ollama Cloud catalog. Override with KODA_DEFAULT_MODEL
         # or ``--model`` for anything bigger.
-        return "ollama:gpt-oss:20b"
+        return "ollama:kimi-k2.7-code"
     return "anthropic:claude-sonnet-4-6"
 
 
