@@ -71,6 +71,12 @@ class ProviderSpec:
     cloud_needs_key: bool = True
     """If ``True`` the cloud fallback is skipped when *auth_env* is unset."""
 
+    cloud_endpoint: str | None = None
+    """Endpoint path for the cloud fallback.  Defaults to *endpoint* if unset."""
+
+    cloud_parse: Callable[[dict[str, Any]], list[str]] | None = None
+    """Parser for the cloud fallback response.  Defaults to *parse* if unset."""
+
 
 # ── Response parsers (reusable across many providers) ─────────────────
 
@@ -114,12 +120,14 @@ PROVIDERS: dict[str, ProviderSpec] = {
         parse=_parse_ollama,
         fallback=(
             "codellama", "deepseek-coder-v2", "gemma2",
-            "llama3.1", "llama3.2", "mistral", "phi3", "qwen2.5-coder",
+            "kimi-k2.6", "llama3.1", "llama3.2", "mistral", "phi3", "qwen2.5-coder",
         ),
         needs_key=False,
         cloud_url="https://ollama.com",
         cloud_env_urls=("OLLAMA_CLOUD_HOST",),
         cloud_needs_key=True,
+        cloud_endpoint="/v1/models",
+        cloud_parse=_parse_openai_compat,
     ),
     "lmstudio": ProviderSpec(
         name="lmstudio",
@@ -204,7 +212,11 @@ def _read_cache(provider: str, ttl: int) -> list[str] | None:
     try:
         data = json.loads(_cache_path(provider).read_text(encoding="utf-8"))
         if time.time() - data.get("ts", 0) < ttl:
-            return data["models"]
+            models = data["models"]
+            # An empty list cached by a broken discovery run is useless;
+            # treat it as a miss so we re-fetch.
+            if models:
+                return models
     except (FileNotFoundError, json.JSONDecodeError, KeyError, OSError):
         pass
     return None
@@ -233,7 +245,11 @@ def _resolve_cloud_url(spec: ProviderSpec) -> str | None:
 
 
 def _try_fetch(spec: ProviderSpec, url: str) -> list[str] | None:
-    """Hit a specific URL. Returns None on failure."""
+    """Hit a specific URL. Returns None on failure or empty result.
+
+    An empty list (e.g. local Ollama daemon with no models pulled) is
+    treated as a miss so the cloud fallback can be tried.
+    """
     headers: dict[str, str] = {"Accept": "application/json"}
     if spec.auth_env:
         key = os.environ.get(spec.auth_env)
@@ -243,7 +259,10 @@ def _try_fetch(spec: ProviderSpec, url: str) -> list[str] | None:
         req = Request(url, headers=headers, method="GET")
         with urlopen(req, timeout=3) as resp:  # noqa: S310
             data = json.loads(resp.read())
-        return spec.parse(data)
+        parsed = spec.parse(data)
+        if not parsed:
+            return None
+        return parsed
     except (URLError, OSError, json.JSONDecodeError, ValueError) as exc:
         _log.debug("%s fetch failed (%s): %s", spec.name, url, exc)
         return None
@@ -252,25 +271,36 @@ def _try_fetch(spec: ProviderSpec, url: str) -> list[str] | None:
 def _fetch(spec: ProviderSpec) -> list[str] | None:
     """Try primary, then cloud fallback (if configured). Returns None on all failures."""
     have_key = bool(spec.auth_env and os.environ.get(spec.auth_env))
+    cloud_url: str | None = None
+
+    # Cloud first when credentials are present so users with OLLAMA_API_KEY
+    # (or another provider's cloud key) don't pay a timeout waiting for a
+    # local daemon they aren't running.
+    cloud_base = _resolve_cloud_url(spec)
+    if cloud_base is not None and (not spec.cloud_needs_key or have_key):
+        cloud_endpoint = spec.cloud_endpoint or spec.endpoint
+        cloud_url = f"{cloud_base}{cloud_endpoint}"
+        _log.debug("%s trying cloud endpoint: %s", spec.name, cloud_url)
+        if spec.cloud_parse:
+            from dataclasses import replace
+
+            cloud_spec = replace(spec, endpoint=cloud_endpoint, parse=spec.cloud_parse)
+            live = _try_fetch(cloud_spec, cloud_url)
+        else:
+            live = _try_fetch(spec, cloud_url)
+        if live is not None:
+            return live
 
     # Primary: skip only if the provider strictly needs a key we don't have
     primary_url = f"{_resolve_url(spec)}{spec.endpoint}"
+    if cloud_url == primary_url:
+        return None
     if not (spec.needs_key and spec.auth_env and not have_key):
         live = _try_fetch(spec, primary_url)
         if live is not None:
             return live
 
-    # Cloud fallback
-    cloud_base = _resolve_cloud_url(spec)
-    if cloud_base is None:
-        return None
-    cloud_url = f"{cloud_base}{spec.endpoint}"
-    if cloud_url == primary_url:
-        return None
-    if spec.cloud_needs_key and not have_key:
-        return None
-    _log.debug("%s trying cloud fallback: %s", spec.name, cloud_url)
-    return _try_fetch(spec, cloud_url)
+    return None
 
 
 def get_models(provider: str) -> list[str]:
