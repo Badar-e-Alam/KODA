@@ -233,6 +233,7 @@ Prove the change works with evidence. Never skip.
 
 Steps:
 1. Write a focused verification — a small pytest function, a script, a runnable example — that exercises the change. Place it in a clearly-named file (`_verify_<feature>.py`, `verify_<bug>.sh`, etc.) so it's obviously scratch.
+   **Keep it tight:** cover the actual changed behavior with one or two case-based tests (the bug case and the happy-path case). Avoid exhaustive mock matrices or testing unrelated modules.
 2. Run it via `execute` (e.g. `execute("pytest _verify_feature.py -v")`, `execute("python _verify_script.py")`).
 
 If it **PASSES**:
