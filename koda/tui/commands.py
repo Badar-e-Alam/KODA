@@ -78,7 +78,16 @@ async def _theme(app: "KodaApp", args: str) -> bool:
 
 
 async def _compact(app: "KodaApp", _args: str) -> bool:
-    """Summarize older messages to free up the model's context window."""
+    """Summarize older messages to free up the model's context window.
+
+    Shows an animated indeterminate progress bar in the message stream
+    while the summary model runs, so the user sees the compaction is
+    actually in progress (it can take several seconds for a long thread).
+    The bar is removed the moment ``compact()`` returns — success or
+    failure — and the textual result message replaces it.
+    """
+    from textual.widgets import LoadingIndicator
+
     adapter = app._adapter
     compact = getattr(adapter, "compact", None)
     if adapter is None or compact is None:
@@ -86,8 +95,31 @@ async def _compact(app: "KodaApp", _args: str) -> bool:
             AppMessage("Compaction isn't supported by the active agent.")
         )
         return True
-    await app.mount_message(AppMessage("Compacting conversation…"))
-    result = await compact()
+
+    # Indeterminate animated bar — compaction is a single LLM call with
+    # no progress callbacks, so a real percentage bar isn't possible.
+    container = app._messages_container
+    spinner = LoadingIndicator(id="compact-progress")
+    label = AppMessage("Compacting conversation…")
+    await app.mount_message(label)
+    if container is not None:
+        await container.mount(spinner)
+        container.scroll_end(animate=False)
+    try:
+        result = await compact()
+    finally:
+        # Always remove the bar + label, even on failure, so the UI never
+        # leaves a dangling spinner after an error.
+        if container is not None:
+            try:
+                await spinner.remove()
+            except Exception:
+                pass
+        try:
+            await label.remove()
+        except Exception:
+            pass
+
     if result.compacted:
         await app.mount_message(
             AppMessage(
