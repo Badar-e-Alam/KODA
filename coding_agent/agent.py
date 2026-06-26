@@ -26,6 +26,7 @@ from coding_agent.compaction import (
 from coding_agent.model import resolve_model
 from coding_agent.subagents import SUBAGENTS
 from coding_agent.system_prompt_v2 import SYSTEM_PROMPT_V2
+from coding_agent.mcp import load_mcp_tools
 from coding_agent.tools import EXTRA_TOOLS
 from coding_agent.tracing import langfuse_callbacks
 
@@ -153,6 +154,14 @@ async def build_agent(
     if context_editing is not None:
         extra_middleware.append(context_editing)
 
+    # MCP tools — loaded from .mcp.json (Context7 for up-to-date library
+    # docs, etc.) via langchain-mcp-adapters. Non-fatal: returns [] when
+    # MCP is unconfigured or langchain-mcp-adapters isn't installed, so the
+    # agent always starts with at least its built-in tools. See
+    # coding_agent/mcp.py.
+    mcp_tools = await load_mcp_tools(root)
+    all_tools = list(EXTRA_TOOLS) + mcp_tools
+
     graph = create_deep_agent(
         model=resolved_model,
         backend=backend,
@@ -160,8 +169,9 @@ async def build_agent(
         middleware=extra_middleware,
         # Extras layered on top of the deepagents defaults (`execute`,
         # `read_file`, `write_file`, `edit_file`, `ls`, `glob`, `grep`,
-        # `write_todos`, `task`). See coding_agent/tools.py.
-        tools=EXTRA_TOOLS,
+        # `write_todos`, `task`) plus any MCP tools loaded above.
+        # See coding_agent/tools.py and coding_agent/mcp.py.
+        tools=all_tools,
         # Skill files live under the FilesystemBackend mounted at /skills/
         # inside the composite backend (see coding_agent/backend.py).
         skills=["/skills/"],

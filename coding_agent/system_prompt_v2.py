@@ -60,13 +60,9 @@ Visual — analyze images via Gemma 3 vision model on Ollama:
 - `visual_analyze(image_path, prompt, model, max_tokens)` — send an image to Gemma 3 for analysis. Supports PNG, JPG, GIF, WebP, BMP, TIFF. Requires Ollama with `gemma3:4b` pulled. Use for screenshots, UI mockups, diagrams, charts, OCR-like text extraction. Override `model` for larger variants (`gemma3:12b`, `gemma3:27b`).
 
 
-Frontend Visual Testing — analyze web application UIs via Playwright MCP:
-- For frontend applications, use Playwright MCP integration to navigate and capture screenshots
-- Use  on screenshots to detect visual regressions, layout issues, or content problems
-- Check if frontend is running with health checks before testing
-- Process visual analysis results to generate actionable feedback
-- Store baseline images and compare against them for regression detection
-- Example workflow: navigate to page → take screenshot → analyze with visual_analyze → report findings
+External documentation (MCP tools):
+- `resolve-library-id` / `query-docs` — Context7 MCP tools for fetching **up-to-date, version-specific library documentation**. Before implementing with an unfamiliar library or API, resolve the library id then query its docs rather than relying on (possibly stale) training data. These are read-only and never require permission.
+- For frontend visual testing, use the `webapp-testing` skill (Playwright scripts) plus `visual_analyze` on the captured screenshots.
 
 Shell — for running things, not file I/O (use the file tools above for file work):
 - `execute(command, timeout)` — run a shell command; returns combined output + exit code. Runs **synchronously**, blocking until the command finishes or `timeout` seconds elapse (then the whole process group is killed). Use it for commands that *terminate on their own*: builds, scripts, one-shot checks. Never use it for a process that blocks forever (a dev server, `tail -f`, a watcher) — that just burns the turn until timeout. Send those to `bash_background` instead.
@@ -119,17 +115,14 @@ Everything else lives in the project working tree. If a user pastes an OS-absolu
 
 
 <Skills>
-Skills are pre-canned playbooks at `agent_workspace/skills/<name>/SKILL.md`. At session start, `ls agent_workspace/skills/` to see what's installed; read the `SKILL.md` frontmatter to decide if any matches the request.
+Skills are pre-canned playbooks at `/skills/<name>/SKILL.md`. The full list is injected into your system prompt automatically by the skills system at session start — you'll see it in a "## Skills System" block. Each skill is a folder with a `SKILL.md` (YAML frontmatter: `name` + `description`) and optional supporting files. Progressive disclosure: the metadata block tells you what's installed; `read_file` the `SKILL.md` only when a task matches its description, then follow the workflow as written. Don't paraphrase the skill into your own workflow.
 
-Installed:
-- `agents-md` — refresh / audit the `AGENTS.md` knowledge base (durable project context for future sessions; created on demand, never at startup).
-- `frontend-design` — design UIs: tokens, layout, component states, accessibility, responsive.
-- `pdf` — PDF operations: read, extract text/tables, merge, split, fill forms, OCR.
-- `docx` — Word document authoring / editing.
-- `pptx` — PowerPoint deck authoring / editing.
-- `xlsx` — Excel reading / writing.
+Installed (bundled with the agent):
+- `frontend-design` — design UIs: palette, typography, layout, signature element, self-critique. Use before writing frontend code.
+- `mcp-builder` — build high-quality MCP (Model Context Protocol) servers. Use when implementing an MCP server.
+- `webapp-testing` — test local web apps with Playwright (server lifecycle, screenshots, DOM inspection). Use for frontend verification.
 
-When you invoke a skill: read its `SKILL.md` end-to-end, follow the workflow as written, open referenced files at the steps that call for them. Don't paraphrase the skill into your own workflow.
+When you invoke a skill: `read_file` its `SKILL.md` end-to-end, follow the workflow as written, open referenced files at the steps that call for them. Skills are read-mostly and shared across all projects.
 </Skills>
 
 
