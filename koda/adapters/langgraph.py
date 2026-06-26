@@ -73,6 +73,7 @@ class LangGraphAdapter(BaseAdapter):
         self._extractors = (
             _extract_permission,
             _extract_chat_stream,
+            _extract_chat_model_end,
             _extract_tool_start,
             _extract_tool_end,
         )
@@ -286,6 +287,40 @@ def _extract_chat_stream(event: dict[str, Any]) -> Iterable[AgentEvent] | None:
     if chunk is None:
         return None
     return _chat_chunk_events(chunk)
+
+
+def _extract_chat_model_end(event: dict[str, Any]) -> Iterable[AgentEvent] | None:
+    """Capture token usage from the final ``AIMessage``.
+
+    Many local / OpenAI-compatible providers (Ollama, vLLM, LM Studio, …)
+    do **not** populate ``usage_metadata`` on streaming ``AIMessageChunk``s
+    — the field only lands on the complete ``AIMessage`` delivered by the
+    ``on_chat_model_end`` event. Without this extractor the status bar's
+    token counters stay at zero for every non-Anthropic backend, even
+    though the provider reports usage perfectly well.
+
+    For backends that also emit usage on stream chunks (Anthropic), this is
+    a harmless no-op: ``merge_usage`` uses max-ish (non-zero-overrides)
+    semantics, so re-reporting the same cumulative totals just re-sets them
+    to the same value — no double counting.
+    """
+    if event.get("event") != "on_chat_model_end":
+        return None
+    output = (event.get("data") or {}).get("output")
+    if output is None:
+        return None
+    meta = getattr(output, "usage_metadata", None)
+    if not meta:
+        return None
+    details_in = meta.get("input_token_details") or {}
+    return (
+        Usage(
+            input_tokens=meta.get("input_tokens", 0) or 0,
+            output_tokens=meta.get("output_tokens", 0) or 0,
+            cache_read_tokens=details_in.get("cache_read", 0) or 0,
+            cache_write_tokens=details_in.get("cache_creation", 0) or 0,
+        ),
+    )
 
 
 def _extract_tool_start(event: dict[str, Any]) -> Iterable[AgentEvent] | None:
