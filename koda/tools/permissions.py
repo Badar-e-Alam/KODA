@@ -18,9 +18,11 @@ Behaviour depends on the current :class:`~koda.tui.modes.Mode`:
 
   * ``PLAN``    — every mutating tool is auto-rejected (advisory-only;
                   the user reviews the plan and presses Shift+A to apply).
-  * ``EDITS``   — file writes/edits auto-approve; ``execute`` still asks.
+  * ``EDITS``   — file writes/edits auto-approve; shell calls auto-approve
+                  too, *except* ``rm`` (file removal), which still asks.
   * ``DEFAULT`` — every mutating tool asks on first use, unless the user
-                  has already "always allowed" it for this session.
+                  has already "always allowed" it for this session (an
+                  explicit "always" overrides the EDITS ``rm`` guard).
 
 The decision is consumed by ``koda.adapters.langgraph.LangGraphAdapter``,
 which turns ``"ask"`` results into a prompt and the user's answer into a
@@ -159,6 +161,30 @@ def is_dangerous_execute(command: str) -> bool:
         return False
     return any(p.search(command) for p in _DANGEROUS_EXECUTE_PATTERNS)
 
+
+# ``rm`` (file removal) is the one shell verb that ACCEPT-EDITS mode still
+# refuses to auto-approve. Removing a file is easy to trigger by accident,
+# hard to undo, and unlike a build/edit can't be recovered from version
+# control if it was never tracked. The pattern matches ``rm`` as a *command*
+# word (optionally prefixed by sudo / nohup / exec / xargs or chained after
+# ``;``/``&&``/``|``), so ``grep rm …`` or ``ls rm`` don't trip it.
+_RM_CMD_PATTERN = re.compile(
+    r"(?:^|[|;&]+\s*|\b(?:sudo|nohup|exec|xargs)\s+)rm\b"
+)
+
+
+def _is_rm_command(command: str) -> bool:
+    """True if ``command`` removes files via ``rm`` (ACCEPT-EDITS guard).
+
+    Deliberately narrow to the ``rm`` verb so ordinary shell calls
+    (``ls``, ``git status``, ``pytest``, ``npm run build`` …) auto-approve
+    in ACCEPT-EDITS mode; only ``rm`` still surfaces a prompt there.
+    """
+    if not command:
+        return False
+    return bool(_RM_CMD_PATTERN.search(command))
+
+
 # The exact mapping handed to deepagents' ``interrupt_on``. Keeping it here
 # keeps the gated-tool list and the policy in one place.
 INTERRUPT_ON: dict[str, dict] = {
@@ -240,8 +266,10 @@ def decide(tool_name: str, args: dict | None = None) -> Verdict:
 
       * ``PLAN``  → ``"reject"`` for every mutating tool (advisory-only).
       * dangerous ``execute`` → ``"ask"`` (overrides session-allow / EDITS).
-      * ``EDITS`` → ``"approve"`` for file edits; ``execute`` falls through.
-      * session-allowed tool → ``"approve"``.
+      * session-allowed tool → ``"approve"`` (honoured before EDITS, so an
+        explicit "always" wins over the EDITS ``rm`` guard).
+      * ``EDITS`` → ``"approve"`` for file edits *and* shell calls, except
+        shell calls that remove files (``rm``) → ``"ask"``.
       * otherwise → ``"ask"``.
 
     A non-mutating tool should never reach here (it isn't in
@@ -265,10 +293,26 @@ def decide(tool_name: str, args: dict | None = None) -> Verdict:
     if tool_name in ("execute", "bash_background") and is_dangerous_execute((args or {}).get("command", "")):
         _log.warning("dangerous %s forced to ask: %r", tool_name, (args or {}).get("command", "")[:120])
         return "ask"
-    if mode is Mode.EDITS and tool_name in FILE_EDIT_TOOLS:
-        return "approve"
+    # An explicit "always allow" from the user wins over mode-specific rules —
+    # once the user has accepted a tool for the session, honour it everywhere
+    # (including ACCEPT-EDITS, so the ``rm`` guard below doesn't re-prompt on
+    # a tool the user already opted into for the rest of the session).
     if tool_name in _session_allow:
         return "approve"
+    if mode is Mode.EDITS:
+        # File writes/edits auto-approve silently.
+        if tool_name in FILE_EDIT_TOOLS:
+            return "approve"
+        # Shell calls auto-approve too — *except* file removal (``rm``). A stray
+        # ``rm`` is the one destructive shell verb that still asks, because it
+        # is easy to trigger by accident and hard to undo. ``rm`` flagged by
+        # ``is_dangerous_execute`` above is already handled; this catches the
+        # ordinary ``rm somefile`` case.
+        if tool_name in ("execute", "bash_background"):
+            if _is_rm_command((args or {}).get("command", "")):
+                return "ask"
+            return "approve"
+        # Any other mutating tool in EDITS (future-proofing) falls through to ask.
     return "ask"
 
 

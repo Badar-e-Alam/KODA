@@ -54,12 +54,33 @@ def test_decide_plan_rejects_all_mutators():
     assert perms.decide("execute", {}) == "reject"
 
 
-def test_decide_edits_approves_file_edits_but_asks_execute():
+def test_decide_edits_approves_file_edits_and_shell_except_rm():
     perms.set_mode(Mode.EDITS)
     assert perms.decide("write_file", {}) == "approve"
     assert perms.decide("edit_file", {}) == "approve"
     assert perms.decide("multi_edit", {}) == "approve"
-    assert perms.decide("execute", {}) == "ask"  # shell still prompts in EDITS
+    # Shell calls auto-approve in ACCEPT-EDITS now (build, ls, pytest …) …
+    assert perms.decide("execute", {"command": "ls -la"}) == "approve"
+    assert perms.decide("execute", {"command": "npm run build"}) == "approve"
+    assert perms.decide("execute", {"command": "pytest tests/"}) == "approve"
+    # … except file removal (``rm``), which still surfaces a prompt.
+    assert perms.decide("execute", {"command": "rm foo.txt"}) == "ask"
+    assert perms.decide("execute", {"command": "rm -rf build/"}) == "ask"
+    assert perms.decide("execute", {"command": "echo ok && rm temp"}) == "ask"
+    # ``rm`` as an argument (not the verb) does not trip the guard.
+    assert perms.decide("execute", {"command": "grep rm README.md"}) == "approve"
+    # Catastrophic ``rm -rf /`` is still caught by the dangerous backstop.
+    assert perms.decide("execute", {"command": "rm -rf /"}) == "ask"
+
+
+def test_decide_session_allow_overrides_edits_rm_guard():
+    # An explicit "always allow" is honoured before the EDITS branch, so the
+    # user opting into "always" for a tool isn't re-prompted by the rm guard.
+    perms.set_mode(Mode.EDITS)
+    perms.allow_tool("execute")
+    assert perms.decide("execute", {"command": "rm foo.txt"}) == "approve"
+    # … but it never overrides the dangerous-execute backstop.
+    assert perms.decide("execute", {"command": "rm -rf /"}) == "ask"
 
 
 def test_decide_session_allow_approves():
