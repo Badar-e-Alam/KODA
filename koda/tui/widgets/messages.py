@@ -20,6 +20,7 @@ import re
 import time
 from typing import Any
 
+import textual.events
 from textual.widgets import Static
 
 
@@ -52,13 +53,75 @@ def _sanitize_tool_output(text: str) -> str:
     return clean
 
 
+
+# URL pattern for linkifying — matches http(s)/ftp URLs. Trailing punctuation
+# (.,);]) is excluded so it doesn't end up inside the hyperlink. The negative
+# lookbehind avoids double-wrapping a URL already inside a markup tag.
+_URL_RE = re.compile(r'''(?<!\])((?:https?|ftp)://[^\s<>'"\[\]]+?)([.,);\]]?(?:\s|$))''')
+
+
+def _linkify(text: str) -> str:
+    """Wrap bare URLs in Textual ``[link=url]url[/]`` markup.
+
+    Modern terminals (iTerm2, Kitty, GNOME Terminal, Windows Terminal,
+    WezTerm) render Rich's ``link`` style as an OSC 8 hyperlink that the
+    terminal makes natively clickable — no app-side click handler needed.
+    On terminals without OSC 8 support the URL still renders as plain
+    text (and double-click-copy still works).
+
+    Existing Textual markup tags (``[b]``, ``[dim]``, ...) are preserved;
+    only bare URL substrings are wrapped.
+    """
+    if not text or "://" not in text:
+        return text
+
+    def _replace(m: re.Match) -> str:
+        url = m.group(1)
+        tail = m.group(2) or ""
+        return f"[link={url}]{url}[/]{tail}"
+
+    return _URL_RE.sub(_replace, text)
+
+
 class BaseMessage(Static):
-    """Common base — individual subclasses tweak CSS classes."""
+    """Common base — individual subclasses tweak CSS classes.
+
+    Double-click any message to copy its full text to the OS clipboard
+    (pyperclip, falling back to Textual OSC 52). A brief toast confirms.
+    """
+
+    async def on_click(self, event: textual.events.Click) -> None:
+        """Double-click → copy this message's text to the clipboard.
+
+        ``event.chain`` is Textual's click counter (1 = single, 2 = double).
+        We only act on double-click so single clicks (focus/scroll) don't
+        accidentally clobber the clipboard.
+        """
+        if event.chain < 2:
+            return
+        text = getattr(self, "_content", None)
+        if not text:
+            try:
+                text = str(self.render())
+            except Exception:
+                return
+        try:
+            import pyperclip
+            pyperclip.copy(text)
+        except Exception:
+            try:
+                self.app.copy_to_clipboard(text)
+            except Exception:
+                return
+        try:
+            self.app.notify(f"Copied {len(text)} chars", timeout=2)
+        except Exception:
+            pass
 
 
 class UserMessage(BaseMessage):
     def __init__(self, content: str, **kwargs: Any) -> None:
-        super().__init__(content, **kwargs)
+        super().__init__(_linkify(content), **kwargs)
         self._content = content
 
 
@@ -112,7 +175,7 @@ class AssistantMessage(BaseMessage):
                 pass
             self._flush_timer = None
         try:
-            self.update(text)
+            self.update(_linkify(text))
         except Exception:
             pass
 
@@ -120,7 +183,7 @@ class AssistantMessage(BaseMessage):
         """Paint the accumulated content. Called by the one-shot timer."""
         self._flush_timer = None
         try:
-            self.update(self._content)
+            self.update(_linkify(self._content))
         except Exception:
             pass
 
