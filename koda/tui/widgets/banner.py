@@ -28,6 +28,7 @@ _TIPS = [
     "Use ! prefix for shell commands (e.g. !ls)",
     "Use Ctrl+B to toggle the session sidebar",
     "Use Ctrl+Y to copy the last assistant response",
+    "Select & copy text and click links like a normal terminal — Ctrl+O for mouse/scroll mode",
     "Use Ctrl+L to start a new chat",
     "Use /help to list all slash commands",
 ]
