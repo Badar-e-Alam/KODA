@@ -57,6 +57,56 @@ without asking first.
 """
 
 
+def _wants_ollama_cloud(name: str) -> bool:
+    """Decide whether an ``ollama`` model should be routed to Ollama Cloud.
+
+    Routing is **opt-in only** so a global ``OLLAMA_API_KEY`` never silently
+    hijacks a user's local ``ollama serve`` (which would 404 on the cloud
+    catalog and bill cloud usage). Two explicit signals enable it:
+
+    1. A cloud-tagged model name — Ollama Cloud models carry a ``:cloud`` or
+       ``-cloud`` suffix (e.g. ``gpt-oss:120b-cloud``, ``glm-4.6:cloud``).
+    2. ``OLLAMA_USE_CLOUD`` set truthy — forces *every* ``ollama:`` model to
+       cloud (for users with no local daemon at all).
+
+    Anything else stays on the local daemon path.
+    """
+    if name.endswith(("-cloud", ":cloud")):
+        return True
+    flag = os.environ.get("OLLAMA_USE_CLOUD", "").strip().lower()
+    return flag in ("1", "true", "yes", "on")
+
+
+def _build_chat_model(model: str):
+    """Build the LangChain chat model for ``provider:name``.
+
+    Special-cases **Ollama Cloud**: ``init_chat_model("ollama:…")`` builds a
+    ``ChatOllama`` that always talks to ``http://localhost:11434`` with no
+    auth header. A cloud-only user therefore gets ``ConnectError`` on every
+    turn — and because the request never reaches a provider, no
+    ``usage_metadata`` is ever emitted, so the status bar's token counters
+    stay at ``0``. When cloud routing is explicitly requested (see
+    ``_wants_ollama_cloud``) and a key is present, point ``ChatOllama`` at
+    Ollama Cloud and forward the bearer token. This is what makes both the
+    response *and* the token usage work for cloud ``ollama:`` models.
+
+    Every other provider falls through to plain ``init_chat_model``.
+    """
+    provider, _, name = model.partition(":")
+    if provider == "ollama" and name and _wants_ollama_cloud(name):
+        api_key = os.environ.get("OLLAMA_API_KEY")
+        if api_key:
+            from langchain_ollama import ChatOllama
+
+            cloud_host = os.environ.get("OLLAMA_CLOUD_HOST", "https://ollama.com")
+            return ChatOllama(
+                model=name,
+                base_url=cloud_host.rstrip("/"),
+                client_kwargs={"headers": {"Authorization": f"Bearer {api_key}"}},
+            )
+    return init_chat_model(model)
+
+
 def _build_system_prompt(workspace: Path) -> str:
     now = datetime.now()
     utc = datetime.now(timezone.utc)
@@ -91,7 +141,7 @@ def build_deep_graph(
     ))
     set_workspace_root(ws)
 
-    chat_model = init_chat_model(model)
+    chat_model = _build_chat_model(model)
     return create_react_agent(
         model=chat_model,
         tools=[*FS_TOOLS, web_search, read_webpage],

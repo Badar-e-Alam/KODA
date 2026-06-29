@@ -23,7 +23,6 @@ from textual.binding import Binding, BindingType
 from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.events import Key, Resize
 
-from koda import __version__
 from koda.agent_api import KodaAgent
 from koda.conversation_log import ConversationLog
 from koda.model_config import (
@@ -39,7 +38,7 @@ from koda.tools import permissions as _perms
 from koda.tui.commands import dispatch as dispatch_command
 from koda.tui.modes import Mode, next_mode, style_for
 from koda.tui.stream import run_turn
-from koda.tui.theme import DEFAULT_THEME, THEMES, get as get_theme, to_textual_theme
+from koda.tui.theme import DEFAULT_THEME, THEMES, to_textual_theme
 from koda.tui.widgets import (
     AppMessage,
     AskUserPrompt,
@@ -65,6 +64,19 @@ def _default_adapter_factory(model: str, thread_id: str) -> KodaAgent:
     from koda.adapters.deep import create_deep_adapter
 
     return create_deep_adapter(model=model, thread_id=thread_id)
+
+
+def _resolve_mouse_default(mouse: bool | None) -> bool:
+    """Initial mouse mode: ``True`` = Textual captures the mouse (scroll/click),
+    ``False`` = released for native terminal selection/copy/link-clicks.
+
+    Explicit constructor/CLI value wins; otherwise ``KODA_MOUSE`` env (``1``/
+    ``true``/``on`` → captured). Default is **released** so KODA behaves like a
+    normal terminal out of the box.
+    """
+    if mouse is not None:
+        return mouse
+    return os.environ.get("KODA_MOUSE", "").strip().lower() in ("1", "true", "yes", "on")
 
 
 # File paths that count as agent memory — editing one triggers the
@@ -115,6 +127,10 @@ class KodaApp(App):
         Binding("ctrl+y", "yank_last", "Copy last response", show=False),
         Binding("ctrl+b", "toggle_sidebar", "Toggle sidebar", show=False),
         Binding("ctrl+l", "clear_session", "New chat", show=False),
+        # Drop Textual's mouse capture so the terminal's own click-drag text
+        # selection works again (Textual 1.x has no built-in selection). Toggle
+        # back to restore scroll/click. See action_toggle_mouse_capture.
+        Binding("ctrl+o", "toggle_mouse_capture", "Select text", show=False),
         # Esc interrupts a running turn (Claude-Code-style stop). The
         # PermissionPrompt's ``escape→deny`` binding is ``priority=True``
         # so when a prompt is up it consumes Esc first; same for the
@@ -136,6 +152,7 @@ class KodaApp(App):
         auto_approve: bool = False,
         thread_id: str | None = None,
         adapter_factory: Any | None = None,
+        mouse: bool | None = None,
     ) -> None:
         super().__init__()
         self._adapter: KodaAgent | None = adapter
@@ -170,6 +187,12 @@ class KodaApp(App):
         self._banner: KodaBanner | None = None
         self._sidebar_host = None
         self._popup: SuggestionPopup | None = None
+        # Mouse mode. KODA defaults to *native terminal* behaviour — the mouse
+        # is released so click-drag text selection, copy, and clicking OSC-8
+        # URLs all work exactly like a normal terminal. Textual's own mouse
+        # (scroll wheel, click-to-focus) is opt-in via Ctrl+O or KODA_MOUSE=1.
+        # ``True`` here means "Textual captures the mouse"; applied in on_mount.
+        self._mouse_captured: bool = _resolve_mouse_default(mouse)
         # Most recent inline todo block; the stream pump updates it in place
         # while it's still the last message, else starts a fresh one.
         self._active_todo_widget: Any | None = None
@@ -279,7 +302,14 @@ class KodaApp(App):
         # interactive immediately. Heavy imports (langgraph, langchain,
         # deepagents) and graph compilation can take 5–8 s on a cold start.
         if self._adapter is None and self._adapter_factory is not None:
-            asyncio.create_task(self._bootstrap_adapter())
+            from koda.tui.onboarding import needs_onboarding
+
+            if needs_onboarding():
+                # No credentials anywhere → walk the user through setup first,
+                # then bootstrap against whatever they configure.
+                self.run_onboarding(initial=True)
+            else:
+                asyncio.create_task(self._bootstrap_adapter())
 
         # The default ``coding_agent`` graph gates tools via LangGraph's
         # human-in-the-loop interrupt, surfaced as a ``PermissionRequest``
@@ -298,6 +328,10 @@ class KodaApp(App):
         _ask_user.set_hook(self._ask_user_from_tool_thread)
         # Reflect the current mode in the UI now that everything is mounted.
         self._apply_agent_mode(self._agent_mode)
+
+        # Release the mouse by default so selection/copy/link-clicks behave
+        # like a normal terminal (Textual otherwise captures the mouse).
+        self._apply_initial_mouse_mode()
 
     async def _bootstrap_adapter(self) -> None:
         """Build the initial adapter without blocking the UI thread."""
@@ -326,6 +360,51 @@ class KodaApp(App):
         await self._warm_graph()
         self._refresh_capability_badges()
         await self.mount_message(AppMessage(f"Agent ready ({self._model})"))
+
+    @work(exclusive=True)
+    async def run_onboarding(self, *, initial: bool = False) -> None:
+        """Show the setup modal, apply the result, then (re)build the adapter.
+
+        ``initial=True`` is the first-run path from ``on_mount`` (no adapter
+        yet) — on completion (or skip) we bootstrap so the app is usable.
+        Invoked again via ``/setup`` it just switches to the chosen model.
+        Runs in a worker because ``push_screen_wait`` requires one.
+        """
+        from koda.tui.onboarding import OnboardingResult, OnboardingScreen
+
+        result: OnboardingResult | None = await self.push_screen_wait(OnboardingScreen())
+
+        if result is not None:
+            # Apply to the live process so discovery/probes see the new keys…
+            for key, value in result.env.items():
+                if value:
+                    os.environ[key] = value
+                else:
+                    os.environ.pop(key, None)
+            # …and persist so the next launch doesn't ask again.
+            try:
+                from koda.env_file import update_env_file
+
+                path = update_env_file({k: v for k, v in result.env.items() if v})
+                await self.mount_message(AppMessage(f"Saved settings to {path}"))
+            except Exception as e:
+                _log.warning("Failed to persist .env: %s", e)
+
+        if initial:
+            # First run: set the model (if chosen) and bootstrap regardless of
+            # whether the user saved or skipped, so the UI becomes usable.
+            if result is not None:
+                self._model = result.model
+                parsed = ModelSpec.try_parse(self._model)
+                if self._status_bar is not None:
+                    if parsed:
+                        self._status_bar.set_model(parsed.provider, parsed.model)
+                    else:
+                        self._status_bar.set_model("", self._model)
+            await self._bootstrap_adapter()
+        elif result is not None:
+            # Runtime /setup: hot-swap to the newly configured model.
+            await self.switch_model(result.model)
 
     async def _rebuild_adapter_for_thread(self, *, resume: bool) -> None:
         """Rebuild the adapter against ``self._koda_thread_id``.
@@ -1424,24 +1503,12 @@ class KodaApp(App):
             self._turn_task.cancel()
 
     async def action_copy_or_interrupt(self) -> None:
-        """Ctrl+C:
-          1. If the user has a mouse selection, copy it to the OS clipboard.
-             (Never interrupts in this case — selection copy must be safe.)
-          2. Otherwise, if a turn is running, interrupt it.
-          3. Otherwise, exit the app.
-        """
-        selected = self._current_selection_text()
-        if selected:
-            self._copy_to_os_clipboard(selected)
-            try:
-                self.screen.clear_selection()
-            except Exception:
-                pass
-            await self.mount_message(
-                AppMessage(f"Copied {len(selected)} char{'s' if len(selected) != 1 else ''}")
-            )
-            return
+        """Ctrl+C: interrupt a running turn, otherwise exit the app.
 
+        Text copy is handled natively by the terminal (KODA releases the
+        mouse by default — see ``_apply_initial_mouse_mode``), so there's no
+        in-app selection to copy here.
+        """
         if self._turn_task and not self._turn_task.done():
             # Immediate visual feedback — the cancel signal propagates
             # asynchronously and on slow streams the actual stop can be
@@ -1457,33 +1524,48 @@ class KodaApp(App):
         await self._shutdown_adapter()
         self.exit()
 
-    def _current_selection_text(self) -> str:
-        """Return the currently mouse-selected text across the screen, or ''."""
-        screen = getattr(self, "screen", None)
-        if screen is None:
-            return ""
-        try:
-            text = screen.get_selected_text()
-        except Exception:
-            return ""
-        return text or ""
+    def _set_mouse_capture(self, capture: bool) -> bool:
+        """Apply mouse capture to the driver. Returns True on success.
 
-    def _copy_to_os_clipboard(self, text: str) -> None:
-        """Copy to the system clipboard.
-
-        Tries pyperclip first (works in most local terminals), then falls
-        back to Textual's OSC52 path (works over SSH into supported
-        terminals).
+        ``capture=False`` releases the mouse so the terminal handles native
+        click-drag selection, copy, and OSC-8 link clicks; ``True`` restores
+        Textual's scroll-wheel / click handling. The driver keeps mouse
+        *capability* on (we never pass ``mouse=False`` to the run loop), so
+        this can flip freely at runtime — unlike the driver's own guard.
         """
+        driver = getattr(self, "_driver", None)
+        enable = getattr(driver, "_enable_mouse_support", None)
+        disable = getattr(driver, "_disable_mouse_support", None)
+        if driver is None or enable is None or disable is None:
+            return False
         try:
-            import pyperclip
-
-            pyperclip.copy(text)
-            return
+            (enable if capture else disable)()
         except Exception:
-            pass
+            _log.debug("mouse capture toggle failed", exc_info=True)
+            return False
+        self._mouse_captured = capture
+        return True
+
+    def _apply_initial_mouse_mode(self) -> None:
+        """Honour the startup mouse default (native unless KODA_MOUSE=1)."""
+        if not self._mouse_captured:
+            self._set_mouse_capture(False)
+
+    async def action_toggle_mouse_capture(self) -> None:
+        """Ctrl+O: toggle between native-terminal and Textual mouse modes.
+
+        Native mode (default) lets you select & copy text and click links like
+        any terminal. Mouse mode gives Textual the scroll wheel, click-to-focus,
+        and double-click-to-copy a whole message.
+        """
+        if not self._set_mouse_capture(not self._mouse_captured):
+            return
+        if self._mouse_captured:
+            msg = "🖱  Mouse mode — scroll & click active. Ctrl+O for native select/copy."
+        else:
+            msg = "📋 Native mode — drag to select & copy, click links. Ctrl+O for mouse/scroll."
         try:
-            self.copy_to_clipboard(text)
+            await self.mount_message(AppMessage(msg))
         except Exception:
             pass
 

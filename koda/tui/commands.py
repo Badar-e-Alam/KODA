@@ -57,6 +57,11 @@ async def _tree(app: "KodaApp", _args: str) -> bool:
     return True
 
 
+async def _setup(app: "KodaApp", _args: str) -> bool:
+    app.run_onboarding(initial=False)
+    return True
+
+
 async def _copy(app: "KodaApp", _args: str) -> bool:
     await app.action_yank_last()
     return True
@@ -248,6 +253,7 @@ async def _tools(app: "KodaApp", _args: str) -> bool:
 _HELP: dict[str, tuple[Handler, str]] = {
     "clear": (_clear, "start a new chat session"),
     "model": (_model, "[provider:model] — switch model or show current"),
+    "setup": (_setup, "add/change API keys and pick a client (Ollama local vs cloud)"),
     "tree": (_tree, "open the session tree"),
     "compact": (_compact, "summarize older messages to free up context"),
     "copy": (_copy, "copy the last assistant response to clipboard"),

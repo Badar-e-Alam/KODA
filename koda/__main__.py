@@ -199,6 +199,17 @@ def main() -> None:
         dest="no_tui",
         help="Alias for --prompt (one-shot, non-interactive)",
     )
+    parser.add_argument(
+        "--mouse",
+        dest="mouse",
+        default=None,
+        action=argparse.BooleanOptionalAction,
+        help=(
+            "Capture the mouse for in-app scroll/click (--mouse) or release it "
+            "for native terminal select/copy and link-clicks (--no-mouse, the "
+            "default). Toggle at runtime with Ctrl+O. Env: KODA_MOUSE=1."
+        ),
+    )
     args = parser.parse_args()
 
     # --no-tui is an alias for --prompt (backward compat with eval harness)
@@ -245,6 +256,7 @@ def main() -> None:
                 model=model,
                 thread_id=None,
                 auto_approve=args.auto_approve,
+                mouse=args.mouse,
             ))
     except KeyboardInterrupt:
         sys.exit(130)
@@ -308,7 +320,14 @@ async def _run_oneshot(*, factory, model: str, prompt: str, auto_approve: bool =
     print(f"\n[{elapsed:.1f}s] done", file=sys.stderr, flush=True)
 
 
-async def _run_app(*, factory, model: str, thread_id: str | None = None, auto_approve: bool = False) -> None:
+async def _run_app(
+    *,
+    factory,
+    model: str,
+    thread_id: str | None = None,
+    auto_approve: bool = False,
+    mouse: bool | None = None,
+) -> None:
     from koda.tui.app import KodaApp
 
     app = KodaApp(
@@ -317,6 +336,7 @@ async def _run_app(*, factory, model: str, thread_id: str | None = None, auto_ap
         model=model,
         thread_id=thread_id,
         auto_approve=auto_approve,
+        mouse=mouse,
     )
     await app.run_async()
 
