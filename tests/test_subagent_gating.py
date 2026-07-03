@@ -20,7 +20,7 @@ import pytest
 from koda.adapters.langgraph import LangGraphAdapter
 from koda.agent_api import PermissionRequest
 from koda.tools import permissions as perms
-from koda.tui.modes import Mode
+from koda.modes import Mode
 
 
 def _scripted(responses):

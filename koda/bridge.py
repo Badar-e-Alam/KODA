@@ -75,7 +75,7 @@ from koda.agent_api import (
 from koda import session_store
 from koda.subagent_tasks import BackgroundTaskRegistry
 from koda.tools import permissions as _perms
-from koda.tui.modes import Mode
+from koda.modes import Mode
 
 _log = logging.getLogger("koda.bridge")
 

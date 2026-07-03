@@ -85,7 +85,7 @@ def _enable_yolo_permissions() -> str:
         # belt-and-braces monkeypatch so the eval still runs against it.
         try:
             from koda.tools import permissions as _perms
-            from koda.tui.modes import Mode
+            from koda.modes import Mode
 
             _perms.set_mode(Mode.EDITS)
             for tool in _perms.MUTATING_TOOLS:

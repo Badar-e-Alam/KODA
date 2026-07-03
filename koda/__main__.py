@@ -1,7 +1,7 @@
 """
 KODA entry point — agent-agnostic AI coding assistant.
 
-Usage — Interactive TUI (default)
+Usage — Interactive UI (default, inline Ink REPL; needs Node >=18)
     koda                                          # Default model from API keys
     koda --model anthropic:claude-sonnet-4-6      # Specify model
     koda --model openai:gpt-4o                    # OpenAI
@@ -9,7 +9,7 @@ Usage — Interactive TUI (default)
     koda --agent deep                             # Built-in deep agent
     koda --agent module.ClassName                 # Custom KodaAgent class
 
-Usage — One-shot mode (no TUI)
+Usage — One-shot mode (no UI, no Node)
     koda --prompt "Fix the pagination bug in pagination.py"
     echo "Add a README" | koda --prompt
     koda --no-tui --cwd /path/to/project
@@ -199,27 +199,6 @@ def main() -> None:
         dest="no_tui",
         help="Alias for --prompt (one-shot, non-interactive)",
     )
-    parser.add_argument(
-        "--mouse",
-        dest="mouse",
-        default=None,
-        action=argparse.BooleanOptionalAction,
-        help=(
-            "Capture the mouse for in-app scroll/click (--mouse) or release it "
-            "for native terminal select/copy and link-clicks (--no-mouse, the "
-            "default). Toggle at runtime with Ctrl+O. Env: KODA_MOUSE=1."
-        ),
-    )
-    parser.add_argument(
-        "--ui",
-        default=os.environ.get("KODA_UI", "ink"),
-        choices=("ink", "textual"),
-        help=(
-            "Frontend: 'ink' (default — inline REPL in your terminal's normal "
-            "scrollback: native select/copy, clickable links, one scrollbar) or "
-            "'textual' (legacy full-screen TUI). Env: KODA_UI."
-        ),
-    )
     args = parser.parse_args()
 
     # --no-tui is an alias for --prompt (backward compat with eval harness)
@@ -238,21 +217,26 @@ def main() -> None:
             parser.error(f"--cwd: not a directory: {target}")
         os.chdir(target)
 
-    # The inline (Ink) UI is a separate Node process that drives koda.bridge.
-    # It manages its own agent subprocess, so hand off before we build one here.
-    # (One-shot --prompt mode always uses the in-process path below.) If the
-    # Node side isn't available, fall back to the classic Textual TUI so plain
-    # `koda` always starts something.
-    if args.ui == "ink" and prompt is None:
+    # Interactive KODA is the inline (Ink) UI: a separate Node process that
+    # drives koda.bridge and manages its own agent subprocess. It's the only
+    # interactive frontend — if Node/Ink isn't available, _run_ink prints why
+    # and we exit rather than falling back. (One-shot --prompt mode is fully
+    # in-process and needs no Node.)
+    if prompt is None:
         _run_ink(
             model=args.model,
             agent=args.agent,
             cwd=args.cwd,
             auto_approve=args.auto_approve,
         )
-        # _run_ink execs node and never returns on success; reaching here
-        # means the inline UI is unavailable — its reason was printed.
-        print("Falling back to the classic TUI (--ui textual).", file=sys.stderr)
+        # _run_ink execs node and never returns on success; reaching here means
+        # the inline UI is unavailable — its reason was already printed.
+        print(
+            "\nInteractive KODA needs the inline (Ink) UI. Fix the issue above, "
+            "or use one-shot mode: koda --prompt \"…\"",
+            file=sys.stderr,
+        )
+        sys.exit(1)
 
     _setup_logging()
 
@@ -261,28 +245,18 @@ def main() -> None:
 
     import logging
     logging.getLogger("koda").info(
-        "Starting KODA: agent=%s model=%s mode=%s",
-        args.agent, model, "oneshot" if prompt is not None else "interactive",
+        "Starting KODA (one-shot): agent=%s model=%s", args.agent, model,
     )
 
     import asyncio
     try:
-        if prompt is not None:
-            # One-shot mode: stream text to stdout, no TUI
-            asyncio.run(_run_oneshot(
-                factory=factory,
-                model=model,
-                prompt=prompt,
-                auto_approve=args.auto_approve,
-            ))
-        else:
-            asyncio.run(_run_app(
-                factory=factory,
-                model=model,
-                thread_id=None,
-                auto_approve=args.auto_approve,
-                mouse=args.mouse,
-            ))
+        # One-shot mode: stream text to stdout, no interactive UI.
+        asyncio.run(_run_oneshot(
+            factory=factory,
+            model=model,
+            prompt=prompt,
+            auto_approve=args.auto_approve,
+        ))
     except KeyboardInterrupt:
         sys.exit(130)
 
@@ -358,8 +332,8 @@ def _run_ink(
     as its agent backend. ``KODA_PYTHON`` is pinned to the current interpreter
     so the bridge runs in the same venv where ``koda`` is installed.
 
-    Returns (instead of exiting) when the inline UI can't start — the caller
-    falls back to the Textual TUI so ``koda`` always launches something.
+    Returns (instead of exiting) when the inline UI can't start — after printing
+    the reason — so the caller can report it and exit non-zero.
     """
     import shutil
 
@@ -395,27 +369,6 @@ def _run_ink(
 
     env = dict(os.environ, KODA_PYTHON=sys.executable)
     os.execvpe(node, argv, env)
-
-
-async def _run_app(
-    *,
-    factory,
-    model: str,
-    thread_id: str | None = None,
-    auto_approve: bool = False,
-    mouse: bool | None = None,
-) -> None:
-    from koda.tui.app import KodaApp
-
-    app = KodaApp(
-        adapter=None,  # built lazily in KodaApp.on_mount
-        adapter_factory=factory,
-        model=model,
-        thread_id=thread_id,
-        auto_approve=auto_approve,
-        mouse=mouse,
-    )
-    await app.run_async()
 
 
 if __name__ == "__main__":

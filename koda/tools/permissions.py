@@ -14,7 +14,7 @@ per gated tool call, whether to:
   * ``"reject"``  — refuse it (auto, no prompt), or
   * ``"ask"``     — surface a prompt and wait for the user.
 
-Behaviour depends on the current :class:`~koda.tui.modes.Mode`:
+Behaviour depends on the current :class:`~koda.modes.Mode`:
 
   * ``PLAN``    — every mutating tool is auto-rejected (advisory-only;
                   the user reviews the plan and presses Shift+A to apply).
@@ -42,7 +42,7 @@ import re
 import threading
 from typing import Callable, Literal
 
-from koda.tui.modes import Mode
+from koda.modes import Mode
 
 _log = logging.getLogger("koda.permissions")
 
