@@ -210,6 +210,16 @@ def main() -> None:
             "default). Toggle at runtime with Ctrl+O. Env: KODA_MOUSE=1."
         ),
     )
+    parser.add_argument(
+        "--ui",
+        default=os.environ.get("KODA_UI", "ink"),
+        choices=("ink", "textual"),
+        help=(
+            "Frontend: 'ink' (default — inline REPL in your terminal's normal "
+            "scrollback: native select/copy, clickable links, one scrollbar) or "
+            "'textual' (legacy full-screen TUI). Env: KODA_UI."
+        ),
+    )
     args = parser.parse_args()
 
     # --no-tui is an alias for --prompt (backward compat with eval harness)
@@ -221,13 +231,28 @@ def main() -> None:
         pass
 
     if args.cwd is not None:
-        import os
         from pathlib import Path as _Path
 
         target = _Path(args.cwd).expanduser().resolve()
         if not target.is_dir():
             parser.error(f"--cwd: not a directory: {target}")
         os.chdir(target)
+
+    # The inline (Ink) UI is a separate Node process that drives koda.bridge.
+    # It manages its own agent subprocess, so hand off before we build one here.
+    # (One-shot --prompt mode always uses the in-process path below.) If the
+    # Node side isn't available, fall back to the classic Textual TUI so plain
+    # `koda` always starts something.
+    if args.ui == "ink" and prompt is None:
+        _run_ink(
+            model=args.model,
+            agent=args.agent,
+            cwd=args.cwd,
+            auto_approve=args.auto_approve,
+        )
+        # _run_ink execs node and never returns on success; reaching here
+        # means the inline UI is unavailable — its reason was printed.
+        print("Falling back to the classic TUI (--ui textual).", file=sys.stderr)
 
     _setup_logging()
 
@@ -318,6 +343,58 @@ async def _run_oneshot(*, factory, model: str, prompt: str, auto_approve: bool =
             await adapter.aclose()
     elapsed = time.monotonic() - stream_start
     print(f"\n[{elapsed:.1f}s] done", file=sys.stderr, flush=True)
+
+
+def _run_ink(
+    *,
+    model: str | None,
+    agent: str,
+    cwd: str | None,
+    auto_approve: bool = False,
+) -> None:
+    """Launch the TypeScript + Ink inline UI (the default frontend).
+
+    Replaces this process with the Node launcher, which spawns ``koda.bridge``
+    as its agent backend. ``KODA_PYTHON`` is pinned to the current interpreter
+    so the bridge runs in the same venv where ``koda`` is installed.
+
+    Returns (instead of exiting) when the inline UI can't start — the caller
+    falls back to the Textual TUI so ``koda`` always launches something.
+    """
+    import shutil
+
+    repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    ink_dir = os.path.join(repo_root, "koda-ink")
+    launcher = os.path.join(ink_dir, "bin", "koda-ink.mjs")
+    node = shutil.which("node")
+
+    if node is None:
+        print(
+            "The inline UI needs Node.js (>=18). Install Node, then run:\n"
+            "  cd koda-ink && npm install",
+            file=sys.stderr,
+        )
+        return
+    if not os.path.exists(launcher):
+        print(f"koda-ink launcher not found at {launcher}", file=sys.stderr)
+        return
+    if not os.path.isdir(os.path.join(ink_dir, "node_modules")):
+        print(
+            "koda-ink dependencies aren't installed. Run:\n"
+            "  cd koda-ink && npm install",
+            file=sys.stderr,
+        )
+        return
+
+    argv = [node, launcher, "--agent", agent]
+    if model:
+        argv += ["--model", model]
+    argv += ["--cwd", cwd or os.getcwd()]
+    if auto_approve:
+        argv.append("--auto-approve")
+
+    env = dict(os.environ, KODA_PYTHON=sys.executable)
+    os.execvpe(node, argv, env)
 
 
 async def _run_app(

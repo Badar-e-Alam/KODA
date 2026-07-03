@@ -1,0 +1,27 @@
+{
+  "name": "koda-ink",
+  "version": "0.1.0",
+  "description": "KODA — inline terminal UI (TypeScript + Ink) for the KODA coding agent",
+  "type": "module",
+  "bin": {
+    "koda-ink": "./bin/koda-ink.mjs"
+  },
+  "scripts": {
+    "start": "tsx src/cli.tsx",
+    "dev": "tsx src/cli.tsx",
+    "typecheck": "tsc --noEmit"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "ink": "^5.0.1",
+    "react": "^18.3.1"
+  },
+  "devDependencies": {
+    "@types/node": "^22.5.0",
+    "@types/react": "^18.3.3",
+    "tsx": "^4.19.0",
+    "typescript": "^5.5.4"
+  }
+}
