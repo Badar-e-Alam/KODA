@@ -53,8 +53,12 @@ export function bannerString(info: BannerInfo): string {
   const meta = [
     `${muted}model  ${reset}${accent}${info.model}${reset}`,
     `${muted}cwd    ${reset}${home}`,
-    `${muted}mode   ${reset}${info.mode.toUpperCase()}`,
   ];
+  // Only surface the mode when it's not the plain default — the DEFAULT line is
+  // noise; accept-edits / plan modes are worth calling out.
+  if (info.mode && info.mode.toLowerCase() !== "default") {
+    meta.push(`${muted}mode   ${reset}${info.mode.toUpperCase()}`);
+  }
 
   const tip = TIPS[Math.floor(Math.random() * TIPS.length)];
   const lines: string[] = [""];
