@@ -823,6 +823,17 @@ class Bridge:
             )
             return
 
+        # koda -c / --continue: resolve the sentinel to the most recent
+        # resumable session for this project (list_sessions is newest-first and
+        # skips empty husks; exclude the just-created session).
+        if session_id in ("__latest__", "latest"):
+            infos = await asyncio.to_thread(session_store.list_sessions)
+            infos = [s for s in infos if s.id != self._session.session_id]
+            if not infos:
+                emit({"type": "info", "message": "No previous session to continue — starting fresh."})
+                return
+            session_id = infos[0].id
+
         path = session_store.find_session(session_id)
         if path is None:
             emit({"type": "error", "message": f"no session matching: {session_id}"})

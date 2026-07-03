@@ -8,6 +8,8 @@ Usage — Interactive UI (default, inline Ink REPL; needs Node >=18)
     koda --model ollama:llama3.1                  # Local Ollama
     koda --agent deep                             # Built-in deep agent
     koda --agent module.ClassName                 # Custom KodaAgent class
+    koda -r / --resume                            # Pick a past session at launch
+    koda -c / --continue                          # Resume the most recent session
 
 Usage — One-shot mode (no UI, no Node)
     koda --prompt "Fix the pagination bug in pagination.py"
@@ -172,6 +174,17 @@ def main() -> None:
         help="Auto-approve all tool calls",
     )
     parser.add_argument(
+        "--resume", "-r",
+        action="store_true",
+        help="Interactive: pick a past session to resume at launch (like `claude -r`).",
+    )
+    parser.add_argument(
+        "--continue", "-c",
+        dest="cont",
+        action="store_true",
+        help="Interactive: resume the most recent session automatically (like `claude -c`).",
+    )
+    parser.add_argument(
         "--cwd", "-C",
         default=None,
         metavar="PATH",
@@ -228,6 +241,8 @@ def main() -> None:
             agent=args.agent,
             cwd=args.cwd,
             auto_approve=args.auto_approve,
+            resume=args.resume,
+            cont=args.cont,
         )
         # _run_ink execs node and never returns on success; reaching here means
         # the inline UI is unavailable — its reason was already printed.
@@ -325,6 +340,8 @@ def _run_ink(
     agent: str,
     cwd: str | None,
     auto_approve: bool = False,
+    resume: bool = False,
+    cont: bool = False,
 ) -> None:
     """Launch the TypeScript + Ink inline UI (the default frontend).
 
@@ -366,6 +383,11 @@ def _run_ink(
     argv += ["--cwd", cwd or os.getcwd()]
     if auto_approve:
         argv.append("--auto-approve")
+    # --continue wins over --resume if both are passed (auto-continue is stronger).
+    if cont:
+        argv.append("--continue")
+    elif resume:
+        argv.append("--resume")
 
     env = dict(os.environ, KODA_PYTHON=sys.executable)
     os.execvpe(node, argv, env)

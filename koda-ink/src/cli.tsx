@@ -11,6 +11,9 @@ interface Args {
   agent: string;
   cwd?: string;
   autoApprove?: boolean;
+  // Resume a past session at launch: "pick" opens the session picker,
+  // "latest" continues the most recent session automatically.
+  resume?: "pick" | "latest";
 }
 
 function parseArgs(argv: string[]): Args {
@@ -21,13 +24,17 @@ function parseArgs(argv: string[]): Args {
     else if ((a === "--agent" || a === "-a") && argv[i + 1]) args.agent = argv[++i];
     else if ((a === "--cwd" || a === "-C") && argv[i + 1]) args.cwd = argv[++i];
     else if (a === "--auto-approve" || a === "-y") args.autoApprove = true;
+    else if (a === "--resume" || a === "-r") args.resume = "pick";
+    else if (a === "--continue" || a === "-c") args.resume = "latest";
     else if (a === "--help" || a === "-h") {
       process.stdout.write(
         "koda-ink — inline terminal UI for KODA\n\n" +
           "  --model, -m        provider:model (e.g. anthropic:claude-sonnet-4-6)\n" +
           "  --agent, -a        agent backend (default: coding_agent)\n" +
           "  --cwd,   -C        project directory to operate on\n" +
-          "  --auto-approve, -y approve all gated tool calls without prompting\n",
+          "  --auto-approve, -y approve all gated tool calls without prompting\n" +
+          "  --resume, -r       pick a past session to resume at launch\n" +
+          "  --continue, -c     resume the most recent session automatically\n",
       );
       process.exit(0);
     }
@@ -83,6 +90,7 @@ function main() {
         autoApprove: args.autoApprove,
       }}
       initialModel={args.model ?? "…"}
+      startupResume={args.resume}
     />,
     { exitOnCtrlC: false },
   );

@@ -69,9 +69,11 @@ function copyToClipboard(text: string, done: (ok: boolean, detail?: string) => v
 export interface AppProps {
   bridgeOptions: BridgeOptions;
   initialModel: string;
+  // Launch-time resume (koda -r / -c): open the picker or continue the latest.
+  startupResume?: "pick" | "latest";
 }
 
-export function App({ bridgeOptions, initialModel }: AppProps) {
+export function App({ bridgeOptions, initialModel, startupResume }: AppProps) {
   const { exit } = useApp();
   const [tstate, dispatch] = useReducer(transcriptReducer, { committed: [], live: [] } as TState);
   const stateRef = useRef(tstate);
@@ -108,6 +110,7 @@ export function App({ bridgeOptions, initialModel }: AppProps) {
   const modelRef = useRef(model);
   modelRef.current = model;
   const bridgeRef = useRef<Bridge | null>(null);
+  const didResume = useRef(false);
 
   function commit(item: Item) {
     dispatch({ type: "commit", item });
@@ -132,6 +135,17 @@ export function App({ bridgeOptions, initialModel }: AppProps) {
           setMode((ev.mode as Mode) ?? "default");
           setTools(ev.tools);
           toolsRef.current = ev.tools;
+          // koda -r / -c: once the backend is ready, either open the session
+          // picker (pick) or continue the most recent session (latest). Guarded
+          // so a reconnect's second "ready" doesn't re-trigger it.
+          if (startupResume && !didResume.current) {
+            didResume.current = true;
+            bridge.send(
+              startupResume === "latest"
+                ? { type: "resume", session_id: "__latest__" }
+                : { type: "resume" },
+            );
+          }
           break;
         case "text_delta":
           dispatch({ type: "text_delta", content: ev.content });
