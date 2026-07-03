@@ -22,6 +22,55 @@ function detectMode(value: string): "chat" | "shell" | "command" {
   return "chat";
 }
 
+// The input box grows one row per line up to MAX_INPUT_ROWS, then holds that
+// height and scrolls to keep the cursor visible — so a big paste expands a bit
+// and then becomes scrollable instead of shoving the whole transcript up.
+const MAX_INPUT_ROWS = 8;
+
+// Wrap `value` into fixed-width visual rows and locate the cursor within them.
+// We wrap manually (rather than letting Ink reflow) so the rendered height is
+// deterministic and we can window/scroll it. Cursor is an index in [0, len].
+export function layout(
+  value: string,
+  cursor: number,
+  width: number,
+): { rows: string[]; cursorRow: number; cursorCol: number } {
+  const w = Math.max(1, width);
+  const rows: string[] = [];
+  let cursorRow = 0;
+  let cursorCol = 0;
+  let found = false;
+  const lines = value.split("\n");
+  let abs = 0; // absolute index into `value` at the start of the current line
+  for (const line of lines) {
+    const nChunks = Math.max(1, Math.ceil(line.length / w));
+    for (let ci = 0; ci < nChunks; ci++) {
+      const start = ci * w;
+      const text = line.slice(start, start + w);
+      const rowIndex = rows.length;
+      rows.push(text);
+      const rowStart = abs + start;
+      const rowEnd = rowStart + text.length; // exclusive of any trailing '\n'
+      if (!found && cursor >= rowStart && cursor <= rowEnd) {
+        // At a mid-line wrap boundary the cursor belongs to the NEXT row's col 0.
+        if (cursor === rowEnd && ci < nChunks - 1) {
+          // defer to the next chunk
+        } else {
+          cursorRow = rowIndex;
+          cursorCol = cursor - rowStart;
+          found = true;
+        }
+      }
+    }
+    abs += line.length + 1; // +1 for the '\n' that split() removed
+  }
+  if (!found) {
+    cursorRow = Math.max(0, rows.length - 1);
+    cursorCol = rows[cursorRow]?.length ?? 0;
+  }
+  return { rows, cursorRow, cursorCol };
+}
+
 export function Input({ active, palette, mode, streaming, onSubmit, onInterrupt, onCycleMode, onExit }: Props) {
   const [value, setValue] = useState("");
   const [cursor, setCursor] = useState(0);
@@ -237,31 +286,83 @@ export function Input({ active, palette, mode, streaming, onSubmit, onInterrupt,
   const inputMode = detectMode(value);
   const symbol = inputMode === "shell" ? "!" : inputMode === "command" ? "/" : "›";
   const symbolColor = inputMode === "shell" ? palette.toolErr : inputMode === "command" ? palette.accent : ms.color;
-
-  const before = value.slice(0, cursor);
-  const at = value.slice(cursor, cursor + 1) || " ";
-  const after = value.slice(cursor + 1);
   const empty = value.length === 0;
+
+  // Wrap the value to the available width (minus the 2-col prompt gutter), then
+  // window it to MAX_INPUT_ROWS keeping the cursor row visible.
+  const cols = process.stdout.columns || 80;
+  const wrapWidth = Math.max(20, cols - 4);
+  const { rows, cursorRow, cursorCol } = layout(value, cursor, wrapWidth);
+  const total = rows.length;
+  const maxStart = Math.max(0, total - MAX_INPUT_ROWS);
+  let startRow = Math.min(cursorRow, maxStart);
+  if (cursorRow >= startRow + MAX_INPUT_ROWS) startRow = cursorRow - MAX_INPUT_ROWS + 1;
+  startRow = Math.max(0, Math.min(startRow, maxStart));
+  const visibleCount = Math.min(MAX_INPUT_ROWS, total);
+  const visible = rows.slice(startRow, startRow + visibleCount);
+  const hiddenAbove = startRow;
+  const hiddenBelow = total - (startRow + visibleCount);
+  const borderColor = active ? symbolColor : palette.muted;
 
   return (
     <Box flexDirection="column">
       {popupVisible && comp ? (
         <Completion title={comp.title} suggestions={comp.suggestions} index={idx} palette={palette} />
       ) : null}
-      <Box>
-        <Text color={symbolColor} bold>
-          {symbol}{" "}
-        </Text>
+      {/* Top + bottom rules bracket the input so the typing area is always
+          visible; the box grows with content up to MAX_INPUT_ROWS, then scrolls. */}
+      <Box
+        flexDirection="column"
+        width="100%"
+        borderStyle="round"
+        borderColor={borderColor}
+        borderTop
+        borderBottom
+        borderLeft={false}
+        borderRight={false}
+        paddingX={1}
+      >
         {empty && !streaming ? (
-          <Text color={palette.muted}>Ask KODA anything…  (/ commands · @ files · ! shell)</Text>
+          <Box>
+            <Text color={symbolColor} bold>
+              {symbol}{" "}
+            </Text>
+            <Text color={palette.muted}>Ask KODA anything…  (/ commands · @ files · ! shell)</Text>
+          </Box>
         ) : (
-          <Text color={palette.assistant}>
-            {before}
-            <Text inverse>{at}</Text>
-            {after}
-          </Text>
+          visible.map((rowText, i) => {
+            const absRow = startRow + i;
+            const first = absRow === 0;
+            const onCursorRow = active && absRow === cursorRow;
+            const b = rowText.slice(0, cursorCol);
+            const atCh = rowText.slice(cursorCol, cursorCol + 1) || " ";
+            const af = rowText.slice(cursorCol + 1);
+            return (
+              <Box key={i}>
+                <Text color={first ? symbolColor : palette.muted} bold={first}>
+                  {first ? `${symbol} ` : "  "}
+                </Text>
+                {onCursorRow ? (
+                  <Text color={palette.assistant}>
+                    {b}
+                    <Text inverse>{atCh}</Text>
+                    {af}
+                  </Text>
+                ) : (
+                  <Text color={palette.assistant}>{rowText || " "}</Text>
+                )}
+              </Box>
+            );
+          })
         )}
       </Box>
+      {total > MAX_INPUT_ROWS ? (
+        <Text color={palette.muted}>
+          {`  ${total} lines · line ${cursorRow + 1}`}
+          {hiddenAbove > 0 ? `  ↑${hiddenAbove}` : ""}
+          {hiddenBelow > 0 ? `  ↓${hiddenBelow}` : ""}
+        </Text>
+      ) : null}
     </Box>
   );
 }
