@@ -68,6 +68,38 @@ info "upgrading pip + installing koda[$EXTRAS]"
 python -m pip install --upgrade pip >/dev/null
 pip install -e "$CLONE_DIR[$EXTRAS]"
 
+# ── inline (Ink) UI — Node deps ────────────────────────────────────────
+# Interactive `koda` is the inline Ink UI, which runs on Node (>=18). We do
+# NOT install Node for you — if it's missing we say so and continue, since
+# one-shot mode (`koda --prompt …`) still works without it. Set SKIP_INK=1
+# to skip the npm step entirely.
+INK_DIR="$CLONE_DIR/koda-ink"
+SKIP_INK="${SKIP_INK:-0}"
+if [ "$SKIP_INK" = 1 ]; then
+    warn "SKIP_INK=1 — skipping the inline UI (Node) setup"
+elif [ ! -d "$INK_DIR" ]; then
+    warn "koda-ink/ not found in the clone — skipping inline UI setup"
+else
+    node_ok=0
+    if command -v node >/dev/null 2>&1; then
+        nver=$(node -p 'process.versions.node.split(".")[0]' 2>/dev/null || echo 0)
+        [ "${nver:-0}" -ge 18 ] 2>/dev/null && node_ok=1
+    fi
+    if [ "$node_ok" = 1 ] && command -v npm >/dev/null 2>&1; then
+        info "installing inline UI deps (npm install in koda-ink)"
+        ( cd "$INK_DIR" && npm install --no-audit --no-fund ) \
+            && ok "inline UI ready ($(node --version))" \
+            || warn "npm install failed — fix it, then: cd $INK_DIR && npm install"
+    else
+        warn "Node.js >=18 not found — the interactive UI needs it."
+        printf '  Install Node (any of):\n'
+        printf '    • https://nodejs.org/en/download  (official installer)\n'
+        printf '    • nvm: https://github.com/nvm-sh/nvm  then: nvm install --lts\n'
+        printf '  Then finish with:  cd %s && npm install\n' "$INK_DIR"
+        printf '  (Meanwhile, one-shot mode works now:  koda --prompt "…")\n'
+    fi
+fi
+
 # ── put `koda` on PATH ─────────────────────────────────────────────────
 BIN_DIR="$HOME/.local/bin"
 mkdir -p "$BIN_DIR"
