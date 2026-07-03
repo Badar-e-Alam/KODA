@@ -60,7 +60,7 @@ export function bannerString(info: BannerInfo): string {
   const lines: string[] = [""];
   ART.forEach((row, i) => {
     const right = meta[i - 1] ?? (i === 0 ? `${primary}KODA · AI coding agent  v${info.version}${reset}` : "");
-    lines.push(`${primary}${row}${reset}${right ? "     " + right : ""}`);
+    lines.push(`${accent}${row}${reset}${right ? "     " + right : ""}`);
   });
   lines.push("");
   lines.push(`  ${muted}Your AI teammate, right in the terminal.${reset}`);
