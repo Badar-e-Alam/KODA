@@ -162,11 +162,6 @@ async def _quit(app: "KodaApp", _args: str) -> bool:
     return True
 
 
-async def _reload_memory(app: "KodaApp", _args: str) -> bool:
-    await app.reload_memory()
-    return True
-
-
 async def _set_mode(app: "KodaApp", mode_name: str) -> bool:
     """Slash-command path to switch agent mode without Shift+Tab cycling."""
     from koda.tui.modes import Mode, style_for
@@ -261,7 +256,6 @@ _HELP: dict[str, tuple[Handler, str]] = {
     "usage": (_usage, "show cumulative token usage"),
     "agents": (_agents, "describe the active agent (backend, capabilities, tool count)"),
     "tools": (_tools, "list the active agent's tools"),
-    "reload-memory": (_reload_memory, "re-read AGENTS.md (mid-session)"),
     "plan": (_plan, "switch agent to plan mode (advisory, no writes/shell)"),
     "edits": (_edits, "switch agent to accept-edits (file writes silent; shell asks)"),
     "default": (_default_mode, "switch agent back to default mode"),

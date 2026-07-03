@@ -12,7 +12,7 @@ defers graph construction to the first ``_native_stream`` call, which
 runs inside the TUI's event loop. ``describe()`` (sync) reports an
 empty tool list pre-build and a populated one after the first turn —
 the status-bar badges refresh on the next describe trigger
-(``/model`` swap or ``/reload-memory``).
+(``/model`` swap).
 
 Usage::
 

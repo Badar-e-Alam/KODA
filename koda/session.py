@@ -67,12 +67,14 @@ class SessionTree:
     is preserved in a single file.
     """
 
-    def __init__(self, path: Path | None = None) -> None:
+    def __init__(self, path: Path | None = None, session_id: str | None = None) -> None:
         self._entries: dict[str, SessionEntry] = {}
         self._children: dict[str | None, list[str]] = {}
         self._leaf_id: str | None = None
         self._path = path
-        self._session_id = uuid.uuid4().hex[:12]
+        # Caller-supplied id lets the filename and session_id match
+        # (Claude-Code-style ~/.koda/projects/<slug>/<session-id>.jsonl).
+        self._session_id = session_id or uuid.uuid4().hex[:12]
 
         if path and path.exists():
             self._load()

@@ -80,8 +80,7 @@ def _resolve_mouse_default(mouse: bool | None) -> bool:
 
 
 # File paths that count as agent memory — editing one triggers the
-# "Memory updated" notice so the user knows to /reload-memory for the
-# change to take effect this session.
+# "Memory updated" notice so the user knows it takes effect next session.
 _MEMORY_FILES = {"/AGENTS.md", "AGENTS.md"}
 
 
@@ -169,7 +168,7 @@ class KodaApp(App):
         # keep their wiring across /model switches.
         self._adapter_factory = adapter_factory
 
-        self._koda_session = SessionTree(path=self._new_session_path())
+        self._koda_session = self._new_session()
         self._conv_log = self._new_conversation_log()
         # Bind the LangGraph thread_id to the KODA session_id (1:1) by
         # default so the checkpointer's per-thread state lines up with what
@@ -224,15 +223,17 @@ class KodaApp(App):
 
     @staticmethod
     def _sessions_dir() -> Path:
-        cwd_slug = os.getcwd().replace("\\", "--").replace("/", "--").strip("-")
-        d = Path.home() / ".koda" / "sessions" / cwd_slug
-        d.mkdir(parents=True, exist_ok=True)
-        return d
+        # Claude-Code-style store (~/.koda/projects/<slug>/), shared with the
+        # inline UI so both frontends see the same session history.
+        from koda import session_store
 
-    @classmethod
-    def _new_session_path(cls) -> Path:
-        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-        return cls._sessions_dir() / f"{ts}.jsonl"
+        return session_store.projects_dir()
+
+    @staticmethod
+    def _new_session():
+        from koda import session_store
+
+        return session_store.new_session()
 
     def _new_conversation_log(self) -> ConversationLog:
         project_root = Path(__file__).resolve().parent.parent.parent
@@ -953,7 +954,7 @@ class KodaApp(App):
             self._conv_log.tool_call(widget._tool_name, widget._args)
             if _is_memory_file_edit(widget):
                 notice = AppMessage(
-                    "Memory updated — active next session (or /reload-memory)."
+                    "Memory updated — active next session."
                 )
         elif isinstance(widget, AssistantMessage):
             self._last_assistant_widget = widget
@@ -1200,34 +1201,6 @@ class KodaApp(App):
         self._refresh_capability_badges()
         await self.mount_message(AppMessage(f"Switched to {display}"))
 
-    async def reload_memory(self) -> None:
-        """Rebuild the current adapter so ``AGENTS.md`` is re-read.
-
-        Matches Claude Code's ``/clear``-to-apply pattern but scoped: only
-        the adapter is rebuilt, the conversation UI is preserved. Heavy
-        graph compilation runs in a worker thread.
-        """
-        factory = self._adapter_factory or _default_adapter_factory
-        await self.mount_message(AppMessage("Reloading memory…"))
-        try:
-            new_adapter = await asyncio.to_thread(
-                factory, self._model, self._koda_thread_id
-            )
-        except Exception as e:
-            _log.exception("Memory reload failed")
-            await self.mount_message(ErrorMessage(f"Failed to reload memory: {e}"))
-            return
-        # Same reasoning as switch_model: the checkpoint holds the
-        # transcript, so don't let the new adapter re-seed from history.
-        mark = getattr(new_adapter, "mark_seeded", None)
-        if callable(mark):
-            mark()
-        await self._shutdown_adapter()
-        self._adapter = new_adapter
-        await self._warm_graph()
-        self._refresh_capability_badges()
-        await self.mount_message(AppMessage("Memory reloaded"))
-
     # ── Actions ──────────────────────────────────────────────────────
 
     async def action_clear_session(self) -> None:
@@ -1236,7 +1209,7 @@ class KodaApp(App):
         for child in list(self._messages_container.children):
             await child.remove()
         self._history.clear()
-        self._koda_session = SessionTree(path=self._new_session_path())
+        self._koda_session = self._new_session()
         self._conv_log = self._new_conversation_log()
         # Fresh session → fresh LangGraph thread → empty checkpoint. Rebuild
         # the adapter so its checkpointer is bound to the new thread_id
