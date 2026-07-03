@@ -205,6 +205,65 @@ def expand_at_files(text: str) -> str:
     return text + "".join(blocks)
 
 
+# ── skills authoring (/skill command) ───────────────────────────────────
+# Skills are read by deepagents' SkillsMiddleware (wired via skills=["/skills/"]
+# in coding_agent/agent.py). The /skill command lets the CONFIGURED model author
+# a spec-compliant SKILL.md and saves it into coding_agent/skills/<name>/, which
+# the middleware then surfaces to the agent (progressive disclosure).
+
+SKILL_AUTHOR_PROMPT = """You are authoring an Agent Skill file (SKILL.md) that follows Anthropic's Agent Skills specification.
+
+Write ONLY the complete SKILL.md content — no preamble, no explanation, and no surrounding code fences.
+
+It MUST begin with YAML frontmatter delimited by --- lines:
+---
+name: <lowercase-hyphenated identifier, 1-64 chars, only a-z 0-9 and single hyphens>
+description: <one or two sentences saying WHAT the skill does AND WHEN to use it; include trigger keywords>
+---
+
+Then a markdown body with these sections:
+# <Skill Title>
+## When to Use   — bullet list of situations that should trigger this skill
+## Instructions  — a concrete, numbered, step-by-step workflow the agent should follow
+## Notes         — optional pitfalls, tips, or a short example
+
+Make it specific and actionable — this is instructions for an AI coding agent, not marketing copy.
+
+The skill to author:
+{brief}
+"""
+
+
+def _slug(s: str) -> str:
+    """Normalize an arbitrary string into a spec-valid skill name."""
+    s = re.sub(r"[^a-z0-9]+", "-", s.strip().lower())
+    s = re.sub(r"-{2,}", "-", s).strip("-")
+    return s[:64]
+
+
+def _clean_skill_md(text: str) -> str:
+    """Strip a wrapping code fence the model may have added; ensure trailing NL."""
+    t = text.strip()
+    m = re.match(r"^```[a-zA-Z]*\s*\n(.*)\n```$", t, re.DOTALL)
+    if m:
+        t = m.group(1).strip()
+    return t + "\n"
+
+
+def _skill_frontmatter(content: str) -> dict[str, Any]:
+    """Parse the YAML frontmatter mapping from SKILL.md content (or {})."""
+    m = re.match(r"^---\s*\n(.*?)\n---", content, re.DOTALL)
+    if not m:
+        return {}
+    try:
+        import yaml
+
+        data = yaml.safe_load(m.group(1))
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
 # ── the bridge ──────────────────────────────────────────────────────────
 
 
@@ -553,11 +612,98 @@ class Bridge:
                     await self._compact()
                 elif ctype == "describe":
                     self._emit_ready()
+                elif ctype == "skill":
+                    await self._skill(cmd)
                 else:
                     emit({"type": "error", "message": f"unknown command: {ctype}"})
             except Exception as e:  # never let one command kill the worker
                 _log.exception("command %s failed", ctype)
                 emit({"type": "error", "message": f"{type(e).__name__}: {e}"})
+
+    # ── skills (/skill command) ──────────────────────────────────────
+
+    def _skills_dir(self) -> Path:
+        from coding_agent.backend import SKILLS_DIR
+
+        return SKILLS_DIR
+
+    def _list_skills(self) -> list[tuple[str, str]]:
+        """(name, description) for every skill on disk, sorted by name."""
+        out: list[tuple[str, str]] = []
+        for md in sorted(self._skills_dir().glob("*/SKILL.md")):
+            fm = _skill_frontmatter(md.read_text(encoding="utf-8")) if md.exists() else {}
+            out.append((str(fm.get("name") or md.parent.name), str(fm.get("description") or "")))
+        return out
+
+    def _author_skill(self, brief: str) -> str:
+        """One-shot call to the CONFIGURED model to write a SKILL.md."""
+        from koda.summarizer import create_chat_model
+
+        llm = create_chat_model(self._model)
+        resp = llm.invoke(SKILL_AUTHOR_PROMPT.format(brief=brief))
+        text = getattr(resp, "content", resp)
+        if isinstance(text, list):  # some providers return content blocks
+            text = "".join(p.get("text", "") if isinstance(p, dict) else str(p) for p in text)
+        return _clean_skill_md(str(text))
+
+    async def _skill(self, cmd: dict[str, Any]) -> None:
+        """List skills, or author a new one with the settled LLM and save it."""
+        action = cmd.get("action")
+        if action == "list":
+            skills = await asyncio.to_thread(self._list_skills)
+            if not skills:
+                emit({"type": "info", "message": "No skills yet. Create one with:  /skill new <name>: <what it does>"})
+                return
+            body = "\n".join(f"  • {n} — {d[:90]}" for n, d in skills)
+            emit({"type": "info", "message": f"Skills ({len(skills)}) in coding_agent/skills/:\n{body}"})
+            return
+
+        if action != "create":
+            emit({"type": "error", "message": f"unknown skill action: {action}"})
+            return
+
+        brief = str(cmd.get("brief") or "").strip()
+        if not brief:
+            emit({"type": "error", "message": "Usage:  /skill new <name>: <what the skill should do>"})
+            return
+
+        emit({"type": "info", "message": f"Authoring skill with {self._model}…"})
+        try:
+            content = await asyncio.to_thread(self._author_skill, brief)
+        except Exception as e:
+            emit({"type": "error", "message": f"skill authoring failed: {type(e).__name__}: {e}"})
+            return
+
+        fm = _skill_frontmatter(content)
+        name = _slug(str(fm.get("name") or brief.split(":", 1)[0]))
+        if not name:
+            emit({"type": "error", "message": "could not determine a valid skill name — try naming it explicitly."})
+            return
+        # Keep the frontmatter name in sync with the directory (the spec requires
+        # they match, and the model may have slugged it differently).
+        if str(fm.get("name") or "") != name:
+            content = re.sub(r"(?m)^name:.*$", f"name: {name}", content, count=1)
+
+        dest = self._skills_dir() / name
+        if (dest / "SKILL.md").exists():
+            emit({"type": "error", "message": f"skill '{name}' already exists — pick another name or delete it first."})
+            return
+        try:
+            dest.mkdir(parents=True, exist_ok=True)
+            (dest / "SKILL.md").write_text(content, encoding="utf-8")
+        except Exception as e:
+            emit({"type": "error", "message": f"could not write skill: {e}"})
+            return
+        emit(
+            {
+                "type": "info",
+                "message": (
+                    f"✓ Created skill '{name}' → coding_agent/skills/{name}/SKILL.md\n"
+                    f"  It loads into the skills list on your next session (/clear or restart); "
+                    f"the agent can read it now via that path."
+                ),
+            }
+        )
 
     # ── a single user turn ───────────────────────────────────────────
 

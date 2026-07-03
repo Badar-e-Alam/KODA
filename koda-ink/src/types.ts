@@ -101,6 +101,7 @@ export type BridgeCommand =
   | { type: "ask_answer"; value: string }
   | { type: "tree"; node?: string }
   | { type: "resume"; session_id?: string }
+  | { type: "skill"; action: "list" | "create"; brief?: string }
   | { type: "quit" };
 
 // ── Transcript items (what the UI renders) ──────────────────────────────

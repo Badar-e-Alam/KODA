@@ -369,6 +369,7 @@ export function App({ bridgeOptions, initialModel, startupResume }: AppProps) {
           "  /dashboard      full-screen subagent manager",
           "  /tree [id]      show the session tree · jump to a node to branch",
           "  /resume [id]    pick a past session and continue it",
+          "  /skill [new …]  list skills, or author one with the current model",
           "  /setup          configure API keys (see message)",
           "  /help /quit /exit",
           "",
@@ -445,6 +446,15 @@ export function App({ bridgeOptions, initialModel, startupResume }: AppProps) {
         // resume it directly (appends to the same session file).
         bridge?.send({ type: "resume", session_id: args || undefined });
         break;
+      case "skill":
+      case "skills": {
+        // No arg → list skills. `/skill new <name>: <what>` (or just
+        // `/skill <brief>`) → author one with the configured model & save it.
+        const brief = args.replace(/^new\s+/i, "").trim();
+        if (!brief) bridge?.send({ type: "skill", action: "list" });
+        else bridge?.send({ type: "skill", action: "create", brief });
+        break;
+      }
       case "tasks": {
         const all = Object.values(tasks);
         if (all.length === 0) {

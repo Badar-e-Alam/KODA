@@ -27,6 +27,7 @@ export const COMMANDS: Array<[string, string]> = [
   ["setup", "add/change API keys and pick a client"],
   ["tree", "[id] — show the session tree, or jump to a node to branch"],
   ["resume", "[id] — pick a past session and continue it"],
+  ["skill", "[new <name>: <what>] — list skills, or author one with the model"],
   ["compact", "summarize older messages to free up context"],
   ["copy", "copy the last assistant response"],
   ["theme", "[name] — switch color theme (or list)"],
