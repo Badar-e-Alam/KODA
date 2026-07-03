@@ -35,10 +35,14 @@ export interface TaskSummary {
   elapsed: number;
   error: string;
   awaiting_permission: boolean;
+  input_tokens?: number;
+  output_tokens?: number;
   /** Peek inside the agent: its most recent tool calls (up to 10). */
   recent_tools?: string[];
   /** Tail of the agent's output so far (up to 400 chars). */
   preview?: string;
+  /** Chronological log of what the agent did — one line per tool call. */
+  activity?: string[];
 }
 
 // Bridge → client events.

@@ -49,6 +49,14 @@ function clock(sec: number): string {
   return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, "0")}`;
 }
 
+// Compact token count: 0, 940, 12.3k, 128k.
+function fmtTok(n: number): string {
+  if (!n) return "0";
+  if (n < 1000) return String(n);
+  const k = n / 1000;
+  return (k >= 10 ? Math.round(k) : k.toFixed(1)) + "k";
+}
+
 // Small labelled key-hint chip, e.g. "← open". Keeps the footer legend visually
 // consistent between the list and detail views.
 function Hint({ k, label, palette }: { k: string; label: string; palette: Palette }) {
@@ -60,6 +68,135 @@ function Hint({ k, label, palette }: { k: string; label: string; palette: Palett
   );
 }
 
+// One subagent, fully expanded. Stable, non-streaming status (state · what it's
+// doing as text · tools/tokens/seconds) above a scrollable activity log — the
+// record of everything the agent has done — with the result shown only once it
+// has finished (never streamed live).
+export function TaskDetail({
+  task: t,
+  idx,
+  count,
+  palette,
+  rows,
+  logScroll,
+}: {
+  task: TaskSummary;
+  idx: number;
+  count: number;
+  palette: Palette;
+  rows: number;
+  logScroll: number;
+}) {
+  const col = STATE_COLOR[t.state](palette);
+  const running = isActive(t.state);
+  const activity = t.activity ?? [];
+
+  // Result (only shown once finished) gets a few lines; the rest of the
+  // vertical space is the scrollable activity log, anchored to the tail.
+  const resultLines = running ? 0 : 4;
+  const logRows = Math.max(3, rows - 15 - resultLines);
+  const total = activity.length;
+  const maxScroll = Math.max(0, total - logRows);
+  const scroll = Math.min(logScroll, maxScroll);
+  const end = total - scroll;
+  const startL = Math.max(0, end - logRows);
+  const shown = activity.slice(startL, end);
+
+  return (
+    <Box flexDirection="column" borderStyle="round" borderColor={palette.accent} paddingX={1}>
+      <Text>
+        <Text color={palette.primary} bold>
+          {STATE_ICON[t.state]} {t.id}
+        </Text>
+        <Text color={palette.muted}>
+          {"  "}
+          {idx + 1}/{count} · {t.subagent_type}
+        </Text>
+      </Text>
+      <Text color={palette.muted}>
+        <Hint k="→" label="close" palette={palette} />
+        <Hint k="↑/↓" label="scroll" palette={palette} />
+        {running ? <Hint k="s" label="stop" palette={palette} /> : <Hint k="r" label="resume" palette={palette} />}
+        <Hint k="R" label="restart" palette={palette} />
+        <Hint k="q" label="close" palette={palette} />
+      </Text>
+
+      {/* Stable status — NOT streaming: state, what it's doing (as text), and
+          the numbers (tools · tokens · seconds). */}
+      <Box marginTop={1}>
+        <Text color={col} bold>
+          {STATE_LABEL[t.state]}
+        </Text>
+        {t.awaiting_permission ? <Text color={palette.accent}>  ⚠ needs approval</Text> : null}
+      </Box>
+      <Box>
+        <Text color={palette.muted}>now    </Text>
+        <Text color={palette.assistant} wrap="truncate-end">
+          {t.error ? <Text color={palette.toolErr}>{t.error}</Text> : running ? t.current : "finished"}
+        </Text>
+      </Box>
+      <Box>
+        <Text color={palette.muted}>stats  </Text>
+        <Text color={palette.assistant}>
+          {t.tool_count} tools <Text color={palette.muted}>·</Text> {fmtTok(t.input_tokens ?? 0)}/
+          {fmtTok(t.output_tokens ?? 0)} tok <Text color={palette.muted}>·</Text> {Math.round(t.elapsed)}s
+        </Text>
+      </Box>
+
+      <Box marginTop={1}>
+        <Text color={palette.muted}>task   </Text>
+        <Box flexGrow={1}>
+          <Text color={palette.assistant} wrap="wrap">
+            {t.description}
+          </Text>
+        </Box>
+      </Box>
+
+      {/* Activity — the scrollable record of everything the agent has done. */}
+      <Box marginTop={1}>
+        <Text color={palette.muted}>activity</Text>
+        {total > logRows ? (
+          <Text color={palette.muted}>
+            {`  ${startL + 1}–${end}/${total}`}
+            {startL > 0 ? "  ↑more" : ""}
+            {end < total ? "  ↓more" : ""}
+          </Text>
+        ) : null}
+      </Box>
+      <Box flexDirection="column" borderStyle="round" borderColor={palette.muted} paddingX={1}>
+        {total === 0 ? (
+          <Text color={palette.muted}>{running ? "starting…" : "(no tool activity)"}</Text>
+        ) : (
+          shown.map((ln, i) => (
+            <Text
+              key={startL + i}
+              color={ln.startsWith("✗") ? palette.toolErr : palette.assistant}
+              wrap="truncate-end"
+            >
+              {ln}
+            </Text>
+          ))
+        )}
+      </Box>
+
+      {/* Result — only once finished; never streamed while running. */}
+      {!running && t.preview ? (
+        <Box flexDirection="column" marginTop={1}>
+          <Text color={palette.muted}>result</Text>
+          {t.preview
+            .split("\n")
+            .slice(-resultLines)
+            .map((ln, li) => (
+              <Text key={li} color={palette.assistant} wrap="truncate-end">
+                {ln || " "}
+              </Text>
+            ))}
+        </Box>
+      ) : null}
+    </Box>
+  );
+}
+
 // On-demand near-full-screen task manager. Two views that share one selection:
 //   • LIST   — every subagent as a compact row; ↑/↓ moves, ← opens the selected.
 //   • DETAIL — exactly one subagent, fully expanded (one at a time); → closes it.
@@ -68,11 +205,20 @@ function Hint({ k, label, palette }: { k: string; label: string; palette: Palett
 export function Dashboard({ tasks, palette, rows, onClose, onControl }: Props) {
   const [sel, setSel] = useState(0);
   const [open, setOpen] = useState(false);
+  const [logScroll, setLogScroll] = useState(0); // lines scrolled UP from the tail
   const idx = tasks.length ? Math.min(sel, tasks.length - 1) : 0;
   const opened = open && tasks.length > 0; // never "open" an empty list
   const t = tasks.length ? tasks[idx] : undefined;
 
-  const move = (d: number) => setSel((s) => Math.max(0, Math.min(tasks.length - 1, s + d)));
+  const move = (d: number) => {
+    setSel((s) => Math.max(0, Math.min(tasks.length - 1, s + d)));
+    setLogScroll(0);
+  };
+  const openTask = () => {
+    if (!tasks.length) return;
+    setLogScroll(0); // enter at the tail — the latest activity
+    setOpen(true);
+  };
   // State-aware controls: stop only while active; resume only once finished
   // (resuming a RUNNING task would restart its run); restart always.
   const control = (input: string) => {
@@ -84,11 +230,11 @@ export function Dashboard({ tasks, palette, rows, onClose, onControl }: Props) {
 
   useInput((input, key) => {
     if (opened) {
-      // Detail view: → (or esc) closes back to the list; ↑/↓ still switches
-      // which agent is open, so you can page through them one at a time.
+      // Detail view: → / esc / q closes; ↑/↓ SCROLL the activity log (older ↑,
+      // newer ↓) so you can read through everything the agent has done.
       if (key.rightArrow || key.escape || input === "q") setOpen(false);
-      else if (key.upArrow || input === "k") move(-1);
-      else if (key.downArrow || input === "j") move(1);
+      else if (key.upArrow || input === "k") setLogScroll((s) => s + 1);
+      else if (key.downArrow || input === "j") setLogScroll((s) => Math.max(0, s - 1));
       else control(input);
       return;
     }
@@ -96,91 +242,14 @@ export function Dashboard({ tasks, palette, rows, onClose, onControl }: Props) {
     if (key.escape || input === "q") onClose();
     else if (key.upArrow || input === "k") move(-1);
     else if (key.downArrow || input === "j") move(1);
-    else if (key.leftArrow || key.return) {
-      if (tasks.length) setOpen(true);
-    } else control(input);
+    else if (key.leftArrow || key.return) openTask();
+    else control(input);
   });
 
   // ── DETAIL VIEW ─────────────────────────────────────────────────────
   if (opened && t) {
-    const col = STATE_COLOR[t.state](palette);
-    const previewLines = Math.max(4, rows - 18);
     return (
-      <Box flexDirection="column" borderStyle="round" borderColor={palette.accent} paddingX={1}>
-        <Text>
-          <Text color={palette.primary} bold>
-            {STATE_ICON[t.state]} {t.id}
-          </Text>
-          <Text color={palette.muted}>
-            {"  "}
-            {idx + 1}/{tasks.length} · {t.subagent_type}
-          </Text>
-        </Text>
-        <Text color={palette.muted}>
-          <Hint k="→" label="close" palette={palette} />
-          <Hint k="↑/↓" label="prev/next agent" palette={palette} />
-          {isActive(t.state) ? <Hint k="s" label="stop" palette={palette} /> : <Hint k="r" label="resume" palette={palette} />}
-          <Hint k="R" label="restart" palette={palette} />
-          <Hint k="q" label="close" palette={palette} />
-        </Text>
-
-        <Box marginTop={1}>
-          <Text color={col} bold>
-            {STATE_LABEL[t.state]}
-          </Text>
-          <Text color={palette.muted}>
-            {"   "}
-            {t.tool_count} tools · {clock(t.elapsed)} elapsed
-            {t.awaiting_permission ? <Text color={palette.accent}>  ⚠ needs approval</Text> : null}
-          </Text>
-        </Box>
-
-        <Box marginTop={1}>
-          <Text color={palette.muted}>task  </Text>
-          <Box flexGrow={1}>
-            <Text color={palette.assistant} wrap="wrap">
-              {t.description}
-            </Text>
-          </Box>
-        </Box>
-
-        <Box marginTop={1}>
-          <Text color={palette.muted}>now   </Text>
-          <Text color={palette.assistant}>
-            {t.current}
-            {t.error ? <Text color={palette.toolErr}> — {t.error}</Text> : null}
-          </Text>
-        </Box>
-
-        {t.recent_tools?.length ? (
-          <Box>
-            <Text color={palette.muted}>tools </Text>
-            <Box flexGrow={1}>
-              <Text color={palette.tool} wrap="truncate-end">
-                {t.recent_tools.join(" → ")}
-              </Text>
-            </Box>
-          </Box>
-        ) : null}
-
-        {t.preview ? (
-          <Box flexDirection="column" marginTop={1} borderStyle="round" borderColor={palette.muted} paddingX={1}>
-            <Text color={palette.muted}>output</Text>
-            {t.preview
-              .split("\n")
-              .slice(-previewLines)
-              .map((ln, li) => (
-                <Text key={li} color={palette.assistant} wrap="truncate-end">
-                  {ln || " "}
-                </Text>
-              ))}
-          </Box>
-        ) : (
-          <Box marginTop={1}>
-            <Text color={palette.muted}>(no output yet)</Text>
-          </Box>
-        )}
-      </Box>
+      <TaskDetail task={t} idx={idx} count={tasks.length} palette={palette} rows={rows} logScroll={logScroll} />
     );
   }
 

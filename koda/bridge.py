@@ -355,6 +355,8 @@ class Bridge:
         d = task.summary.to_json()
         d["recent_tools"] = list(task.tool_log[-10:])
         d["preview"] = (task.final_text or "")[-400:]
+        # Full-ish scrollable record of what the agent did (dashboard detail view).
+        d["activity"] = list(task.activity[-300:])
         return d
 
     def _on_task_update(self, task: Any, done: bool) -> None:

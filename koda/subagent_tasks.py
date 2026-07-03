@@ -40,6 +40,7 @@ from koda.agent_api import (
     TextDelta,
     ToolResult,
     ToolStart,
+    Usage,
 )
 
 _log = logging.getLogger("koda.subagent_tasks")
@@ -90,6 +91,8 @@ class TaskSummary:
     updated_at: float = 0.0
     error: str = ""
     awaiting_permission: bool = False
+    input_tokens: int = 0
+    output_tokens: int = 0
 
     def to_json(self) -> dict[str, Any]:
         elapsed = (self.updated_at or self.started_at) - self.started_at if self.started_at else 0.0
@@ -104,6 +107,8 @@ class TaskSummary:
             "elapsed": round(elapsed, 1),
             "error": self.error,
             "awaiting_permission": self.awaiting_permission,
+            "input_tokens": self.input_tokens,
+            "output_tokens": self.output_tokens,
         }
 
 
@@ -116,6 +121,10 @@ class BackgroundTask:
     summary: TaskSummary
     final_text: str = ""
     tool_log: list[str] = field(default_factory=list)
+    # Human-readable, chronological log of what the agent did (one line per tool
+    # call, error-annotated). The dashboard scrolls this — it is the record of
+    # "what is done", separate from the live streaming text.
+    activity: list[str] = field(default_factory=list)
     _task: asyncio.Task | None = None
     _pending_perm: PermissionRequest | None = None
     # Last emitted change-key — lets _emit drop no-op updates (token streaming
@@ -126,6 +135,19 @@ class BackgroundTask:
 # Callback the registry fires whenever a task's summary changes, and again with
 # ``done=True`` when a task finishes (so the bridge can post a notification).
 UpdateCb = Callable[[BackgroundTask, bool], Awaitable[None] | None]
+
+
+def _arg_hint(args: dict[str, Any]) -> str:
+    """A short, human-readable target for a tool call (path, command, query…)
+    so the activity log reads like ``edit_file(koda/bridge.py)`` instead of a
+    bare tool name."""
+    if not isinstance(args, dict):
+        return ""
+    for k in ("path", "file_path", "filename", "command", "cmd", "pattern", "query", "url", "description"):
+        v = args.get(k)
+        if isinstance(v, str) and v.strip():
+            return " ".join(v.split())[:48]
+    return ""
 
 
 class BackgroundTaskRegistry:
@@ -237,8 +259,11 @@ class BackgroundTaskRegistry:
         task.adapter = self._factory(model=self._model, thread_id=thread_id)
         task.final_text = ""
         task.tool_log.clear()
+        task.activity.clear()
         task.summary.tool_count = 0
         task.summary.reply_chars = 0
+        task.summary.input_tokens = 0
+        task.summary.output_tokens = 0
         task.summary.started_at = self._clock()
         task.summary.error = ""
         preamble = ROLE_PREAMBLES.get(task.subagent_type, ROLE_PREAMBLES["general-purpose"])
@@ -303,10 +328,20 @@ class BackgroundTaskRegistry:
             async for ev in task.adapter.stream(message, []):
                 if isinstance(ev, ToolStart):
                     task.summary.tool_count += 1
-                    task.summary.current = f"{ev.name}(…)"
+                    hint = _arg_hint(ev.arguments)
+                    label = f"{ev.name}({hint})" if hint else ev.name
+                    task.summary.current = label
                     task.tool_log.append(ev.name)
+                    task.activity.append(f"→ {label}")
                 elif isinstance(ev, ToolResult):
                     task.summary.current = "thinking…"
+                    if ev.is_error and task.activity:
+                        task.activity[-1] = "✗ " + task.activity[-1][2:]
+                elif isinstance(ev, Usage):
+                    # Usage may arrive cumulatively mid-stream — take the max so a
+                    # late smaller snapshot can't shrink the reported totals.
+                    task.summary.input_tokens = max(task.summary.input_tokens, ev.input_tokens)
+                    task.summary.output_tokens = max(task.summary.output_tokens, ev.output_tokens)
                 elif isinstance(ev, TextDelta):
                     task.final_text += ev.content
                     task.summary.reply_chars = len(task.final_text)
@@ -354,6 +389,8 @@ class BackgroundTaskRegistry:
             task.summary.tool_count,
             task.summary.awaiting_permission,
             task.summary.reply_chars // 400,
+            len(task.activity),
+            task.summary.output_tokens // 200,
         )
         if not done and key == task._last_emit_key:
             return
