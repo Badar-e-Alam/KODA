@@ -17,38 +17,44 @@ koda --model ollama:llama3.1            # local model
 ## Project Structure
 
 ```
-koda/                    # Main package
-  __main__.py            # CLI entry point, arg parsing, logging
-  app.py                 # KodaApp (TUI, subclass of DeepAgentsApp)
-  agents/deep.py         # LangGraph agent factory (create_koda_agent)
+koda/                    # Main Python package (agent backend)
+  __main__.py            # CLI entry point: launches the inline UI, or one-shot
+  bridge.py              # NDJSON/stdio backend that drives the inline (Ink) UI
+  modes.py               # Permission modes (default/accept-edits/plan) — shared
+  subagent_tasks.py      # Background async-subagent registry (dashboard)
+  subagent_tools.py      # Agent-facing async-subagent tools
   session.py             # SessionTree (JSONL-based branching history)
   conversation_log.py    # Markdown session logs
   provider_models.py     # Model discovery + caching (Ollama, LM Studio, etc.)
   summarizer.py          # Branch summarization via LangChain
-  tree_widget.py         # /tree command modal
-  widgets.py             # KodaBanner ASCII art
-tests/                   # pytest + Textual async UI tests
+koda-ink/                # Inline UI — TypeScript + Ink (the interactive frontend)
+  src/cli.tsx            # Ink entry; bin/koda-ink.mjs launches it via tsx
+  src/components/        # Dashboard, Input, etc.
+tests/                   # pytest (bridge, sessions, subagent tasks)
 examples/                # fastapi_agent.py (HTTP/SSE backend example)
 docs/prompts/            # System prompts and tool-loop docs
 agent_workspace/skills/  # Custom tool skills
 ```
 
+The **only** interactive frontend is the inline Ink UI (`koda-ink/`), which
+needs Node ≥18. Python's `koda/__main__.py` execs the Node launcher for
+interactive sessions; `koda --prompt "…"` runs fully in-process (no Node).
+
 ## Tech Stack
 
-- **Python 3.13** (`.python-version`)
-- **deepagents-cli** / **deepagents** - TUI framework + LangGraph agent orchestration
+- **Python 3.13** (`.python-version`) — agent backend
+- **Node ≥18** + **TypeScript** + **Ink** — the inline terminal UI (`koda-ink/`)
+- **deepagents-cli** / **deepagents** - LangGraph agent orchestration
 - **langchain-core** - LLM abstractions
-- **textual** - TUI widgets
 - **httpx** - Async HTTP client
 - **hatchling** - Build system
 
 ## Running Tests
 
 ```bash
-pytest tests/
+pytest tests/                       # Python backend
+cd koda-ink && npm run typecheck    # Inline UI type check
 ```
-
-Tests use Textual's `run_test()` pilot for async UI testing.
 
 ## Environment
 

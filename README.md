@@ -68,7 +68,7 @@ else is pluggable.
 
 | Area | What you get |
 |------|--------------|
-| **TUI** | Textual-based terminal UI with slash-command menu, `@`-file autocomplete, thinking indicator, live tool-call rendering, and a resizable session sidebar |
+| **UI** | Inline terminal UI (TypeScript + Ink, needs Node ≥18) that lives in your shell's normal scrollback — native select/copy, clickable links — with a slash-command menu, `@`-file autocomplete, thinking indicator, live tool-call rendering, and a background-subagents dashboard |
 | **Sessions** | JSONL session tree with **in-place branching** (`/tree`), sidebar for switch/delete/restore, auto-generated markdown transcripts |
 | **Agents** | Two built-in agents — the **[KODA Coding Agent](coding_agent/)** (default) and a lightweight **deep** loop — or plug in your own with `--agent mypkg.build` |
 | **Models** | Anthropic · OpenAI · Google · Ollama · LM Studio · any OpenAI-compatible endpoint. Model discovery cached (24h TTL) for instant `/model` switching |
@@ -244,9 +244,9 @@ Model lists are discovered on first use and cached at `~/.koda/models/`
 koda/
   __main__.py              CLI entry point + --agent resolution
   agent_api.py             KodaAgent Protocol + AgentEvent union
-  tui/app.py               Main Textual application
-  tui/stream.py            Event-stream rendering
-  adapters/coding_agent.py Wires the default KODA Coding Agent into the TUI
+  bridge.py                NDJSON/stdio backend that drives the inline (Ink) UI
+  subagent_tasks.py        Background async-subagent registry (dashboard)
+  adapters/coding_agent.py Wires the default KODA Coding Agent into the bridge
   adapters/deep.py         Built-in deepagents/LangGraph factory
   adapters/langgraph.py    LangGraph graph → KodaAgent wrapper
   adapters/anthropic.py    Reference raw-SDK adapter
@@ -262,7 +262,8 @@ examples/
   fastapi_agent.py         HTTP/SSE service example
   koda_agent/              Full-featured custom-agent example
   hermes_agent/            Planner/executor example
-tests/                     pytest + Textual async UI tests
+koda-ink/                  Inline UI (TypeScript + Ink) — the interactive frontend
+tests/                     pytest (bridge, sessions, subagent tasks)
 docs/prompts/              System prompts + tool-loop reference notes
 .github/                   CI workflow, issue & PR templates
 ```
@@ -292,7 +293,7 @@ guidelines.
 
 KODA stands on the shoulders of:
 
-- [Textual](https://github.com/Textualize/textual) — the TUI framework
+- [Ink](https://github.com/vadimdemedes/ink) — the React-for-CLIs framework behind the inline UI
 - [LangGraph](https://github.com/langchain-ai/langgraph) and
   [deepagents](https://github.com/langchain-ai/deepagents) — default agent loop
 - [Jina AI](https://jina.ai) — web search and reader APIs
