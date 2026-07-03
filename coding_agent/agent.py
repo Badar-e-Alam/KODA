@@ -103,6 +103,37 @@ def _thread_id_for(root: Path) -> str:
     return hashlib.sha256(str(root.resolve()).encode("utf-8")).hexdigest()[:16]
 
 
+def _load_async_subagents(root: Path) -> list[dict]:
+    """Optional REMOTE async subagents from ``<root>/.koda/async_subagents.json``.
+
+    Entries follow deepagents' official ``AsyncSubAgent`` spec
+    (https://docs.langchain.com/oss/python/deepagents/async-subagents):
+    ``[{"name", "description", "graph_id", "url"?, "headers"?}]``. When
+    present they're passed straight to ``create_deep_agent``, whose
+    ``AsyncSubAgentMiddleware`` provides the official
+    ``start_async_task`` / ``check_async_task`` / … tools backed by an Agent
+    Protocol server (LangGraph Platform or self-hosted). KODA's in-process
+    equivalents (``koda/subagent_tools.py``) are removed in that case so the
+    tool names don't collide. Without the file, the in-process variants serve
+    the same five-tool API locally.
+    """
+    cfg = root / ".koda" / "async_subagents.json"
+    if not cfg.is_file():
+        return []
+    try:
+        import json
+
+        specs = json.loads(cfg.read_text())
+    except Exception:
+        return []
+    if not isinstance(specs, list):
+        return []
+    return [
+        s for s in specs
+        if isinstance(s, dict) and s.get("name") and s.get("description") and s.get("graph_id")
+    ]
+
+
 async def build_agent(
     *,
     model: str | None = None,
@@ -162,6 +193,21 @@ async def build_agent(
     mcp_tools = await load_mcp_tools(root)
     all_tools = list(EXTRA_TOOLS) + mcp_tools
 
+    # Remote async subagents (official deepagents transport) — when configured,
+    # the AsyncSubAgentMiddleware owns start_async_task/…, so drop KODA's
+    # in-process versions of those tool names.
+    async_specs = _load_async_subagents(root)
+    if async_specs:
+        try:
+            from koda.subagent_tools import ASYNC_TASK_TOOL_NAMES
+
+            all_tools = [
+                t for t in all_tools
+                if getattr(t, "name", "") not in ASYNC_TASK_TOOL_NAMES
+            ]
+        except Exception:
+            pass
+
     graph = create_deep_agent(
         model=resolved_model,
         backend=backend,
@@ -205,9 +251,11 @@ async def build_agent(
         # ``koda/tools/permissions.py`` so they stay in one place.
         interrupt_on=_perms.INTERRUPT_ON,
         # Specialist subagents (explore / plan / edit) the main agent
-        # dispatches via the built-in ``task`` tool. See
-        # ``coding_agent/subagents.py`` for prompts + tool subsets.
-        subagents=SUBAGENTS,
+        # dispatches via the built-in ``task`` tool, plus any configured
+        # REMOTE async subagents (identified by their ``graph_id`` field and
+        # routed to AsyncSubAgentMiddleware). See ``coding_agent/subagents.py``
+        # and ``_load_async_subagents`` above.
+        subagents=list(SUBAGENTS) + async_specs,
         name="coding_agent",
     )
     # Stash the aiosqlite Connection on the graph so the adapter can

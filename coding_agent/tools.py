@@ -1047,6 +1047,20 @@ def ask_user(question: str, options: list[str] | None = None) -> str:
     return _ask.ask(question, options or [])
 
 
+def _background_subagent_tools():
+    """Background-subagent control tools (spawn_task / task_status / …).
+
+    They degrade to an "unavailable" message unless a registry is bound (only
+    the inline bridge binds one), so they're harmless to expose in every build.
+    """
+    try:
+        from koda.subagent_tools import SUBAGENT_TASK_TOOLS
+
+        return SUBAGENT_TASK_TOOLS
+    except Exception:  # pragma: no cover - never break tool assembly
+        return []
+
+
 EXTRA_TOOLS = [
     think,
     multi_edit,
@@ -1062,6 +1076,7 @@ EXTRA_TOOLS = [
     bash_output,
     kill_bash,
     ask_user,
+    *_background_subagent_tools(),
 ]
 
 
