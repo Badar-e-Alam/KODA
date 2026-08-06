@@ -36,7 +36,7 @@ dependencies = [
     "tavily-python>=0.5",
     "ollama>=0.4",
     "langchain-openai>=1.1.12",
-    "langgraph-checkpoint-sqlite>=3.1.0",
+    "langgraph-checkpoint-sqlite>=3.1.1",
     # MCP — lets the agent consume Model Context Protocol servers
     # (e.g. Context7 for up-to-date library docs) as LangGraph tools.
     "langchain-mcp-adapters>=0.3,<0.4",
